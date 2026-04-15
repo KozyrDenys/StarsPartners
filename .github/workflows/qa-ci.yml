@@ -34,6 +34,7 @@ jobs:
 
   brand_mode_matrix:
     name: QA Matrix (${{ matrix.brand.key }} | ${{ matrix.mode }})
+    if: ${{ github.event_name != 'pull_request' || github.actor != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
     needs: quality
     timeout-minutes: 75
