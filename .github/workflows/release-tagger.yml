@@ -1,0 +1,101 @@
+name: Release Tagger
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Version bump type'
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+      dry_run:
+        description: 'Only calculate and print next tag (without creating it)'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+permissions:
+  contents: write
+
+jobs:
+  create_semver_tag:
+    name: Create SemVer tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Calculate next tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          latest="$(git tag --list 'v*' --sort=-v:refname | head -n 1)"
+          if [[ -z "${latest}" ]]; then
+            major=0
+            minor=1
+            patch=0
+            latest="v0.0.0"
+          else
+            stripped="${latest#v}"
+            IFS='.' read -r major minor patch <<<"${stripped}"
+            major="${major:-0}"
+            minor="${minor:-0}"
+            patch="${patch:-0}"
+          fi
+
+          bump="${{ inputs.bump }}"
+          case "${bump}" in
+            patch)
+              patch=$((patch + 1))
+              ;;
+            minor)
+              minor=$((minor + 1))
+              patch=0
+              ;;
+            major)
+              major=$((major + 1))
+              minor=0
+              patch=0
+              ;;
+            *)
+              echo "Unsupported bump type: ${bump}"
+              exit 1
+              ;;
+          esac
+
+          next_tag="v${major}.${minor}.${patch}"
+          echo "latest=${latest}" >>"${GITHUB_OUTPUT}"
+          echo "next_tag=${next_tag}" >>"${GITHUB_OUTPUT}"
+          echo "Calculated next tag: ${next_tag} (from ${latest}, bump=${bump})"
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run == 'true' }}
+        run: |
+          echo "Dry run mode is enabled. Tag will not be created."
+          echo "Latest tag: ${{ steps.version.outputs.latest }}"
+          echo "Next tag: ${{ steps.version.outputs.next_tag }}"
+
+      - name: Create and push tag
+        if: ${{ inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          next_tag="${{ steps.version.outputs.next_tag }}"
+          git tag -a "${next_tag}" -m "Release ${next_tag}"
+          git push origin "${next_tag}"
+          echo "Tag pushed: ${next_tag}"

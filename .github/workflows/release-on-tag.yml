@@ -1,0 +1,53 @@
+name: Release On Tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish (example: v0.1.0)'
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: write
+
+jobs:
+  publish_release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=${tag}" >>"${GITHUB_OUTPUT}"
+          echo "Release tag: ${tag}"
+
+      - name: Verify tag exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --tags --force
+          git rev-parse "${{ steps.meta.outputs.tag }}" >/dev/null
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          generate_release_notes: true
+          make_latest: true

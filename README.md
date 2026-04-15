@@ -314,7 +314,20 @@ npm run qa:all:sharded:casino:1of2
 npm run qa:all:sharded:casino:2of2
 npm run qa:localization:all:desktop:full:shard1
 npm run qa:localization:all:desktop:full:shard2
+
+# release/versioning (GitHub Actions)
+# 1) Run "Release Tagger" workflow and choose patch/minor/major
+# 2) New vX.Y.Z tag will trigger "Release On Tag" workflow automatically
 ```
+
+## Release flow (автоматическая версия и релиз)
+
+1. В GitHub Actions запусти workflow `Release Tagger`.
+2. Выбери `bump`: `patch`, `minor` или `major`.
+3. Workflow создаст и запушит новый тег `vX.Y.Z`.
+4. По пушу тега автоматически стартует `Release On Tag`.
+5. `Release On Tag` публикует GitHub Release с auto-generated release notes.
+6. Для ручной публикации существующего тега можно запустить `Release On Tag` через `workflow_dispatch` и передать `tag`.
 
 Если запускаете Allure не через npm scripts, добавьте Java в `PATH`:
 
