@@ -22,6 +22,7 @@ on:
           - 'true'
 
 permissions:
+  actions: write
   contents: write
 
 jobs:
@@ -99,3 +100,13 @@ jobs:
           git tag -a "${next_tag}" -m "Release ${next_tag}"
           git push origin "${next_tag}"
           echo "Tag pushed: ${next_tag}"
+
+      - name: Trigger Release On Tag workflow
+        if: ${{ inputs.dry_run != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          next_tag="${{ steps.version.outputs.next_tag }}"
+          gh workflow run "Release On Tag" --ref "${{ github.ref_name }}" -f tag="${next_tag}"
+          echo "Triggered Release On Tag for ${next_tag}"
