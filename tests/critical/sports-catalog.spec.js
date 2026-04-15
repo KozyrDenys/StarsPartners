@@ -178,7 +178,10 @@ async function readSportsScrollState(page) {
       return {
         surface: 'window',
         top: Number(window.scrollY || 0),
-        maxTop: Math.max(0, Number((doc && doc.scrollHeight) || 0) - Number(window.innerHeight || 0)),
+        maxTop: Math.max(
+          0,
+          Number((doc && doc.scrollHeight) || 0) - Number(window.innerHeight || 0)
+        ),
       };
     })
     .catch(() => ({ surface: 'window', top: 0, maxTop: 0 }));
@@ -211,7 +214,10 @@ async function scrollSportsSurface(page, amount = 820) {
         moved: Number(window.scrollY || 0) > before,
         before,
         after: Number(window.scrollY || 0),
-        maxTop: Math.max(0, Number(document.documentElement?.scrollHeight || 0) - Number(window.innerHeight || 0)),
+        maxTop: Math.max(
+          0,
+          Number(document.documentElement?.scrollHeight || 0) - Number(window.innerHeight || 0)
+        ),
       };
     }, amount)
     .catch(() => ({ surface: 'window', moved: false, before: 0, after: 0, maxTop: 0 }));

@@ -17,10 +17,9 @@ async function main() {
     );
   });
 
-  const total = Number(
-    page && typeof page.totalElements !== 'undefined' ? page.totalElements : 0
-  );
-  const latest = Array.isArray(page && page.content) && page.content.length > 0 ? page.content[0] : null;
+  const total = Number(page && typeof page.totalElements !== 'undefined' ? page.totalElements : 0);
+  const latest =
+    Array.isArray(page && page.content) && page.content.length > 0 ? page.content[0] : null;
 
   console.log(`MailSlurp OK: inboxes=${total}`);
   if (latest) {

@@ -146,7 +146,8 @@ async function warmupRoutes(page, options = {}) {
   const selectors = Array.isArray(options.selectors) ? options.selectors : ['#app, #__nuxt'];
   const auto = options.auto === true;
   const autoBypass = options.autoBypass !== false;
-  const timeoutMs = Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 45_000;
+  const timeoutMs =
+    Number.isFinite(options.timeoutMs) && options.timeoutMs > 0 ? options.timeoutMs : 45_000;
   const strict = options.strict === true;
 
   for (const rawRoute of routes) {
@@ -205,7 +206,9 @@ async function warmupRoutes(page, options = {}) {
   const rawWarmupRoutes = routesArg
     ? String(routesArg).slice('--routes='.length)
     : process.env.PW_SAVE_STATE_WARMUP_ROUTES || '';
-  const warmupRoutesList = uniqueList(splitCsv(rawWarmupRoutes).map(normalizeWarmupRoute).filter(Boolean));
+  const warmupRoutesList = uniqueList(
+    splitCsv(rawWarmupRoutes).map(normalizeWarmupRoute).filter(Boolean)
+  );
   const warmupTimeoutParsed = Number.parseInt(process.env.PW_SAVE_STATE_WARMUP_TIMEOUT || '45', 10);
   const warmupTimeoutMs =
     Number.isFinite(warmupTimeoutParsed) && warmupTimeoutParsed > 0

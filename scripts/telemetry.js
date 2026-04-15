@@ -10,7 +10,9 @@ let sentryEnabled = false;
 let tracerProvider = null;
 
 function envBool(name, fallback = false) {
-  const raw = String(process.env[name] || '').trim().toLowerCase();
+  const raw = String(process.env[name] || '')
+    .trim()
+    .toLowerCase();
   if (!raw) return fallback;
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on';
 }

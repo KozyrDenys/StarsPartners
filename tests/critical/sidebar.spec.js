@@ -816,11 +816,7 @@ async function openLanguageDropdown(page, trigger) {
 
 async function resolveLanguageTrigger(page, preferredLabels = []) {
   const labelQueue = Array.from(
-    new Set(
-      (preferredLabels || [])
-        .map((item) => compactText(item || ''))
-        .filter(Boolean)
-    )
+    new Set((preferredLabels || []).map((item) => compactText(item || '')).filter(Boolean))
   );
 
   for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -2298,8 +2294,7 @@ test.describe('Sidebar Matrix', () => {
             code: option.code,
             status: challenge ? 'blocked' : 'failed',
             reason:
-              challenge ||
-              `Language trigger should show selected locale ${selected.selectedText}.`,
+              challenge || `Language trigger should show selected locale ${selected.selectedText}.`,
             afterLabel,
             cookies,
             bodySample,

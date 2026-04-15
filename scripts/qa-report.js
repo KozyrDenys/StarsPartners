@@ -412,7 +412,11 @@ function normalizeReason(value, limit = TOP_REASON_TEXT_LIMIT) {
   const compactRaw = pipedChunks.length >= 2 ? `${pipedChunks[0]} ...` : raw;
   const lowered = compactRaw.toLowerCase();
 
-  if (/cloudflare|cf_chl|__cf_chl|just a moment|challenge url detected|challenge text visible/.test(lowered)) {
+  if (
+    /cloudflare|cf_chl|__cf_chl|just a moment|challenge url detected|challenge text visible/.test(
+      lowered
+    )
+  ) {
     return 'Cloudflare/WAF challenge gate';
   }
   if (/captcha/.test(lowered)) {
@@ -1045,8 +1049,11 @@ function summarizeDepositArtifact(payload) {
   const uiCoverageAvailable =
     payload && typeof payload.uiCoverageAvailable === 'boolean'
       ? payload.uiCoverageAvailable
-      : Number(payload && payload.paymentMethodTilesDiscoveredCount ? payload.paymentMethodTilesDiscoveredCount : 0) >
-          0;
+      : Number(
+          payload && payload.paymentMethodTilesDiscoveredCount
+            ? payload.paymentMethodTilesDiscoveredCount
+            : 0
+        ) > 0;
   const apiCoverageAvailable =
     payload && typeof payload.apiCoverageAvailable === 'boolean'
       ? payload.apiCoverageAvailable
@@ -1063,7 +1070,10 @@ function summarizeDepositArtifact(payload) {
     submitVisible: Boolean(payload && payload.submitVisible),
     submitEnabled: Boolean(payload && payload.submitEnabled),
     source: oneLine((payload && payload.source) || ''),
-    sourceMode: oneLine((payload && payload.sourceMode) || resolveCoverageMode(uiCoverageAvailable, apiCoverageAvailable)),
+    sourceMode: oneLine(
+      (payload && payload.sourceMode) ||
+        resolveCoverageMode(uiCoverageAvailable, apiCoverageAvailable)
+    ),
     uiCoverageAvailable,
     apiCoverageAvailable,
     results: realResults,
@@ -1090,7 +1100,8 @@ function summarizeDepositInventory(payload) {
     uiCategories: Array.isArray(uiInventory.uniqueCategories) ? uiInventory.uniqueCategories : [],
     uiTilesCount: Number(uiInventory.totalTiles || 0),
     sourceMode: oneLine(
-      (payload && payload.sourceMode) || resolveCoverageMode(uiCoverageAvailable, apiCoverageAvailable)
+      (payload && payload.sourceMode) ||
+        resolveCoverageMode(uiCoverageAvailable, apiCoverageAvailable)
     ),
     uiCoverageAvailable,
     apiCoverageAvailable,
@@ -1133,8 +1144,7 @@ const signalTotals = getSignalTotals(tests);
 const authStateHealth = readJson(authStateHealthArtifactPath);
 const kpiValidation = readJson(kpiValidationArtifactPath);
 const runStatusBase = getRunStatus(totals);
-const runStatus =
-  kpiValidation && kpiValidation.valid === false ? 'FAILED_KPI' : runStatusBase;
+const runStatus = kpiValidation && kpiValidation.valid === false ? 'FAILED_KPI' : runStatusBase;
 const failed = tests.filter((t) => isFailureStatus(t.status));
 const executionMode = String(process.env.QA_EXECUTION_MODE || process.env.PW_PROJECT_MATRIX || '')
   .trim()
@@ -1210,7 +1220,10 @@ const topSectionsByBlocked = [...sectionSummary]
   .slice(0, 3);
 const runIssueTopReasons = topReasons(
   tests.filter(
-    (test) => isFailureStatus(test.status) || hasAnnotation(test, 'blocked') || hasAnnotation(test, 'provider-blocked')
+    (test) =>
+      isFailureStatus(test.status) ||
+      hasAnnotation(test, 'blocked') ||
+      hasAnnotation(test, 'provider-blocked')
   ),
   3
 );
@@ -1424,7 +1437,10 @@ const depositFallbackRowsMd = depositInventorySummary.apiFallbackAttempts.length
         `| ${escapeMdCell(attempt.currency || '-')} | ${escapeMdCell(
           attempt.status || '-'
         )} | ${escapeMdCell(attempt.itemsCount || 0)} | ${escapeMdCell(
-          truncateText(normalizeReason(attempt.error || attempt.bodyPreview || '-'), NOTE_TEXT_LIMIT)
+          truncateText(
+            normalizeReason(attempt.error || attempt.bodyPreview || '-'),
+            NOTE_TEXT_LIMIT
+          )
         )} |`
     )
   : ['| - | - | - | - |'];
@@ -1814,7 +1830,12 @@ const depositMd =
 const depositCoverageMd = (() => {
   const inventoryBlocked = depositInventoryCoverageBlocked;
   const methodsBlocked = depositMethodCoverageBlocked;
-  const overallState = inventoryBlocked && methodsBlocked ? 'blocked' : inventoryBlocked || methodsBlocked ? 'partial' : 'ready';
+  const overallState =
+    inventoryBlocked && methodsBlocked
+      ? 'blocked'
+      : inventoryBlocked || methodsBlocked
+        ? 'partial'
+        : 'ready';
   const reasons = [
     inventoryBlocked ? `Inventory: ${depositInventoryCoverageReason}` : '',
     methodsBlocked ? `Methods: ${depositMethodCoverageReason}` : '',
@@ -2161,7 +2182,10 @@ const reportTocItems = [
 const reportTocHtml = `
   <nav class="toc" aria-label="Report sections">
     ${reportTocItems
-      .map((item) => `<a class="toc-link" href="${escapeHtml(item.href)}">${escapeHtml(item.label)}</a>`)
+      .map(
+        (item) =>
+          `<a class="toc-link" href="${escapeHtml(item.href)}">${escapeHtml(item.label)}</a>`
+      )
       .join('')}
   </nav>
 `;
@@ -2732,7 +2756,12 @@ const depositHtml =
 const depositCoverageHtml = (() => {
   const inventoryBlocked = depositInventoryCoverageBlocked;
   const methodsBlocked = depositMethodCoverageBlocked;
-  const overallState = inventoryBlocked && methodsBlocked ? 'blocked' : inventoryBlocked || methodsBlocked ? 'partial' : 'ready';
+  const overallState =
+    inventoryBlocked && methodsBlocked
+      ? 'blocked'
+      : inventoryBlocked || methodsBlocked
+        ? 'partial'
+        : 'ready';
   const reasons = [
     inventoryBlocked ? `Inventory: ${depositInventoryCoverageReason}` : '',
     methodsBlocked ? `Methods: ${depositMethodCoverageReason}` : '',
@@ -2764,19 +2793,31 @@ const depositCoverageHtml = (() => {
             { label: 'Blocked Reason', value: reasons || '-' },
             {
               label: 'API Coverage Available',
-              value: blockedAwareBool(depositInventorySummary.apiCoverageAvailable, inventoryBlocked),
+              value: blockedAwareBool(
+                depositInventorySummary.apiCoverageAvailable,
+                inventoryBlocked
+              ),
             },
             {
               label: 'UI Coverage Available',
-              value: blockedAwareBool(depositInventorySummary.uiCoverageAvailable, inventoryBlocked),
+              value: blockedAwareBool(
+                depositInventorySummary.uiCoverageAvailable,
+                inventoryBlocked
+              ),
             },
             {
               label: 'API Categories',
-              value: blockedAwareCount(depositInventorySummary.apiCategories.length, inventoryBlocked),
+              value: blockedAwareCount(
+                depositInventorySummary.apiCategories.length,
+                inventoryBlocked
+              ),
             },
             {
               label: 'UI Categories',
-              value: blockedAwareCount(depositInventorySummary.uiCategories.length, inventoryBlocked),
+              value: blockedAwareCount(
+                depositInventorySummary.uiCategories.length,
+                inventoryBlocked
+              ),
             },
             {
               label: 'Methods Discovered',
