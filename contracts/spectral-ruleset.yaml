@@ -1,0 +1,12 @@
+extends:
+  - spectral:oas
+
+rules:
+  operation-operationId:
+    severity: warn
+  operation-description:
+    severity: warn
+  no-$ref-siblings:
+    severity: warn
+  oas3-valid-media-example:
+    severity: off

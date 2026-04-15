@@ -1,0 +1,41 @@
+node_modules
+test-results
+playwright-report
+tests/ai
+
+Autotest report
+Autotest report/**
+artifacts
+artifacts/**
+allure-results
+allure-report
+.lighthouseci
+
+analyze/runs
+analyze/out
+analyze/pageInfo.full.json
+analyze/pageInfo.json
+analyze/page.html
+
+projects/**/Autotest report
+projects/**/Autotest report/**
+projects/**/Autotest report_legacy
+projects/**/Autotest report_legacy/**
+projects/**/Autotest report-baseline-check
+projects/**/Autotest report-baseline-check/**
+projects/**/artifacts
+projects/**/artifacts/**
+projects/**/test-results
+projects/**/test-results/**
+projects/**/analyze
+projects/**/analyze/**
+projects/dashboard
+projects/dashboard/**
+
+storageState.json
+projects/**/storageState.json
+--auto
+
+core
+*.core
+qemu_chrome_*.core

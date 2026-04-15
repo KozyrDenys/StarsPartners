@@ -1,0 +1,80 @@
+const { test, expect } = require('@playwright/test');
+const { assertNotCloudflare, dismissOverlays } = require('../helpers/gt-utils');
+
+const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
+const STRICT_403_MODE = process.env.PW_PRECHECK_STRICT_403 === '1';
+const KNOWN_NON_CRITICAL_403 = [/\/server\/api\/languages\/thook\/?(\?|$)/i];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function splitBlocked403(urls) {
+  const unique = [
+    ...new Set((urls || []).map((item) => String(item || '').trim()).filter(Boolean)),
+  ];
+  if (STRICT_403_MODE) {
+    return { critical: unique, ignored: [] };
+  }
+  const ignored = [];
+  const critical = [];
+  for (const url of unique) {
+    if (KNOWN_NON_CRITICAL_403.some((re) => re.test(url))) ignored.push(url);
+    else critical.push(url);
+  }
+  return { critical, ignored };
+}
+
+test('GT Precheck: no Cloudflare/403 on critical resources', async ({ page }, testInfo) => {
+  test.setTimeout(90000);
+  const blocked = [];
+
+  page.on('response', (resp) => {
+    try {
+      if (resp.status() !== 403) return;
+      const url = resp.url();
+      if (/\/_nuxt\//i.test(url) || /\/api\//i.test(url)) {
+        blocked.push(url);
+      }
+    } catch {
+      // ignore
+    }
+  });
+
+  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
+
+  try {
+    await assertNotCloudflare(page);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Cloudflare challenge detected';
+    throw new Error(`PRECHECK_BLOCKED: ${msg}`);
+  }
+
+  await dismissOverlays(page);
+
+  const appRoot = page.locator('#app, #__nuxt').first();
+  try {
+    await appRoot.waitFor({ state: 'visible', timeout: 30000 });
+  } catch {
+    throw new Error('PRECHECK_BLOCKED: App root not visible (possible WAF/403).');
+  }
+
+  await sleep(2000);
+
+  const blocked403 = splitBlocked403(blocked);
+  if (blocked403.ignored.length > 0) {
+    testInfo.annotations.push({
+      type: 'partial',
+      description: `Ignored known non-critical 403 resources: ${blocked403.ignored
+        .slice(0, 5)
+        .join(' | ')}`,
+    });
+  }
+
+  if (blocked403.critical.length) {
+    const sample = blocked403.critical.slice(0, 5).join(' | ');
+    throw new Error(`PRECHECK_BLOCKED: 403 on critical resources: ${sample}`);
+  }
+
+  expect(true).toBeTruthy();
+});

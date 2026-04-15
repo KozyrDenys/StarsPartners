@@ -1,0 +1,29 @@
+userName: ${BROWSERSTACK_USERNAME}
+accessKey: ${BROWSERSTACK_ACCESS_KEY}
+framework: playwright
+
+platforms:
+  - os: OS X
+    osVersion: Sonoma
+    browserName: chrome
+    browserVersion: latest
+  - os: ios
+    osVersion: "17"
+    deviceName: iPhone 15
+
+browserstackLocal: false
+parallelsPerPlatform: 1
+projectName: qa-assistant
+buildName: qa-assistant-${BUILD_ID}
+buildIdentifier: "#${DATE_TIME}"
+debug: true
+networkLogs: true
+consoleLogs: info
+testObservability: true
+testObservabilityOptions:
+  projectName: qa-assistant
+  buildName: qa-assistant-${BUILD_ID}
+
+playwrightConfigOptions:
+  reporter:
+    - line

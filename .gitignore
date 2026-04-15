@@ -1,0 +1,44 @@
+node_modules/
+
+# local secrets
+.env
+!.env.example
+
+# macOS
+.DS_Store
+
+# playwright artifacts
+test-results/
+playwright-report/
+blob-report/
+allure-results/
+allure-report/
+storageState.json
+--auto
+.lighthouseci/
+
+# generated analysis artifacts
+analyze/runs/
+analyze/out/
+analyze/page.html
+analyze/page.png
+analyze/pageInfo.json
+analyze/pageInfo.full.json
+analyze/qa-report.md
+analyze/qa-report.html
+qa-report.md
+qa-report.html
+artifacts/
+
+# logs
+*.log
+
+# runtime / generated project artifacts
+projects/
+Autotest report/
+log/
+
+# crash dumps
+core
+*.core
+qemu_chrome_*.core

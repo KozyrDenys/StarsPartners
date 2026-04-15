@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/knip/schema.json",
+  "entry": [
+    "scripts/**/*.js",
+    "tests/**/*.js",
+    "analyze/**/*.js",
+    "analyze.js",
+    "generate/**/*.js",
+    "generate-test.js",
+    "test.js",
+    ".lighthouserc.js"
+  ],
+  "project": ["**/*.js"],
+  "exclude": [
+    "types",
+    "nsExports",
+    "nsTypes",
+    "enumMembers",
+    "namespaceMembers",
+    "duplicates",
+    "catalog"
+  ],
+  "ignoreBinaries": ["yq", "k6", "magick"],
+  "ignoreDependencies": [
+    "dotenv",
+    "@stoplight/spectral-cli",
+    "allure-playwright",
+    "eslint-config-prettier",
+    "lighthouse",
+    "pixelmatch",
+    "pngjs",
+    "tsx",
+    "zod"
+  ],
+  "ignoreIssues": {
+    "tests/helpers/api-contract-checks.js": ["exports"],
+    "tests/helpers/brand-capabilities.js": ["exports"],
+    "tests/helpers/gmail-api.js": ["exports"],
+    "tests/helpers/project-paths.js": ["exports"],
+    "tests/helpers/registration-data.js": ["exports"],
+    "tests/helpers/sidebar-items.js": ["exports"],
+    "tests/helpers/signup-api-fallback.js": ["exports"]
+  }
+}

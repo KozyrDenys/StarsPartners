@@ -1,0 +1,36 @@
+name: qa-stack
+
+services:
+  zap-baseline:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    profiles: ['zap']
+    working_dir: /workspace
+    volumes:
+      - ../..:/workspace
+    environment:
+      TARGET_URL: ${BASE_URL:-https://gt.bet/}
+      ZAP_OUT_DIR: ${ZAP_OUT_DIR:-artifacts/zap}
+    entrypoint: ['/bin/sh', '-lc']
+    command:
+      [
+        'mkdir -p "/workspace/$${ZAP_OUT_DIR}" && /zap/zap.sh -cmd -quickurl "$${TARGET_URL}" -quickout "/workspace/$${ZAP_OUT_DIR}/zap-baseline-compose.html"',
+      ]
+
+  lighthouse:
+    image: mcr.microsoft.com/playwright:v1.58.0-jammy
+    profiles: ['lighthouse']
+    working_dir: /workspace
+    shm_size: 1gb
+    volumes:
+      - ../..:/workspace
+    environment:
+      BASE_URL: ${BASE_URL:-https://gt.bet}
+      CHROME_PATH: ${LHCI_CHROME_PATH:-/ms-playwright/chromium-1208/chrome-linux/chrome}
+    command:
+      [
+        'npx',
+        'lhci',
+        'collect',
+        '--config=.lighthouserc.js',
+        '--collect.settings.chromeFlags=--headless=new --no-sandbox --disable-dev-shm-usage --disable-gpu --no-zygote',
+      ]
