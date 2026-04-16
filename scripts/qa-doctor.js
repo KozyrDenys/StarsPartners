@@ -15,6 +15,23 @@ const navigationTimeoutMs = toPositiveInt(process.env.QA_DOCTOR_NAV_TIMEOUT_MS, 
 const supportedNodeMajors = parseNodeMajors(process.env.QA_NODE_LTS_MAJORS || '20,22');
 
 const checks = [];
+const shellCandidates = [
+  process.env.QA_DOCTOR_SHELL,
+  process.env.SHELL,
+  '/bin/bash',
+  '/usr/bin/bash',
+  '/bin/zsh',
+]
+  .map((item) => String(item || '').trim())
+  .filter(Boolean);
+const shellPath =
+  shellCandidates.find((candidate) => {
+    try {
+      return fs.existsSync(candidate);
+    } catch {
+      return false;
+    }
+  }) || '/bin/bash';
 const extraPathEntries = (() => {
   const items = [];
   const homeDir = process.env.HOME || '';
@@ -46,7 +63,7 @@ function parseNodeMajors(value) {
 }
 
 function runShell(command) {
-  return spawnSync('/bin/zsh', ['-lc', command], {
+  return spawnSync(shellPath, ['-lc', command], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     env: {
@@ -138,6 +155,28 @@ function checkNodeVersion() {
 }
 
 function checkPlaywrightCli() {
+  const localCliCandidate = path.join(process.cwd(), 'node_modules', '.bin', 'playwright');
+  if (fs.existsSync(localCliCandidate)) {
+    const direct = spawnSync(localCliCandidate, ['--version'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        PATH: mergedPath,
+      },
+    });
+    if (direct.status === 0) {
+      addCheck({
+        id: 'playwright-cli',
+        name: 'Playwright CLI',
+        status: 'pass',
+        severity: 'critical',
+        message: String(direct.stdout || '').trim() || 'Playwright CLI is available.',
+      });
+      return;
+    }
+  }
+
   const result = runShell('npx playwright --version');
   if (result.status !== 0) {
     addCheck({
@@ -146,7 +185,7 @@ function checkPlaywrightCli() {
       status: 'fail',
       severity: 'critical',
       message: 'Playwright CLI is not available.',
-      details: String(result.stderr || result.stdout || '').trim(),
+      details: `${String(result.stderr || result.stdout || '').trim()} | shell=${shellPath}`,
     });
     return;
   }

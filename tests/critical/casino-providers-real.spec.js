@@ -10,7 +10,8 @@ const {
   waitForUiSettled,
 } = require('../helpers/gt-utils');
 const { getBaselineProviders } = require('../helpers/provider-baseline');
-const { applyAuthTokenCookie } = require('../helpers/signup-api-fallback');
+const { createRegistrationData } = require('../helpers/registration-data');
+const { applyAuthTokenCookie, registerPlayerViaApi } = require('../helpers/signup-api-fallback');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const BASE_ORIGIN = new URL(BASE_URL).origin;
@@ -52,6 +53,12 @@ const AUTH_RECOVERY_INPUT_CANDIDATES = [
   path.join(PROJECT_TEST_RESULTS_DIR, 'registration-data.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'last-manual-login-player.json'),
 ];
+const AUTH_RECOVERY_OUTPUT_PATHS = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-data-current-run.json'),
+  path.join(PROJECT_ARTIFACTS_DIR, 'last-registered-player.json'),
+  path.join(PROJECT_TEST_RESULTS_DIR, 'registration-data.json'),
+];
+const PROVIDER_SIGNUP_BOOTSTRAP_ENABLED = process.env.PW_PROVIDER_SIGNUP_BOOTSTRAP !== '0';
 const PROVIDER_PROFILE = String(process.env.PW_PROVIDER_PROFILE || 'smoke')
   .trim()
   .toLowerCase();
@@ -200,6 +207,149 @@ function readJson(filePath) {
   }
 }
 
+function createProviderBootstrapEmailSuffix() {
+  const shardTag = `${PROVIDER_SHARD_INDEX}${PROVIDER_SHARD_TOTAL > 1 ? `s${PROVIDER_SHARD_TOTAL}` : ''}`;
+  const runTag = oneLine(process.env.GITHUB_RUN_ID || process.env.QA_RUN_ID || '')
+    .replace(/[^a-z0-9]/gi, '')
+    .slice(-4)
+    .toLowerCase();
+  const timeTag = Date.now().toString(36).slice(-4);
+  return `p${shardTag}${runTag}${timeTag}`.slice(0, 8);
+}
+
+function writeProviderBootstrapRegistration(data, signupResult) {
+  const token =
+    signupResult &&
+    signupResult.body &&
+    typeof signupResult.body.token === 'string' &&
+    signupResult.body.token.length >= 10
+      ? signupResult.body.token
+      : '';
+  if (!token) return false;
+
+  const payload = {
+    source: 'tests/critical/casino-providers-real.spec.js',
+    generatedAt: new Date().toISOString(),
+    email: data.email,
+    loginEmail: data.email,
+    password: data.password,
+    authToken: token,
+    manualLoginReady: false,
+    loginValidationStatus: 'provider-bootstrap-token-only',
+    loginValidationMethod: 'signup-api-bootstrap',
+    loginValidationReason:
+      'Provider suite bootstrap created an auth token for authorized casino checks.',
+    lastLoginCheckStatus: 'provider-bootstrap-token-only',
+    lastLoginCheckMethod: 'signup-api-bootstrap',
+    lastLoginCheckReason:
+      'Provider suite bootstrap created an auth token for authorized casino checks.',
+    brand: BASE_HOSTNAME,
+  };
+
+  let wrote = false;
+  for (const outPath of AUTH_RECOVERY_OUTPUT_PATHS) {
+    try {
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      fs.writeFileSync(outPath, JSON.stringify(payload, null, 2), 'utf8');
+      wrote = true;
+    } catch {
+      // best-effort write
+    }
+  }
+  return wrote;
+}
+
+function summarizeSignupFailure(result) {
+  if (!result || typeof result !== 'object') return 'signup bootstrap returned empty response';
+  const status = Number(result.status || 0);
+  const errorCode = oneLine(result.body && result.body.errorCode);
+  const errorMessage = oneLine(result.body && result.body.errorMessage);
+  const cdpCode = oneLine(
+    result.cdpFallback && result.cdpFallback.body && result.cdpFallback.body.errorCode
+  );
+  const cdpMessage = oneLine(
+    result.cdpFallback && result.cdpFallback.body && result.cdpFallback.body.errorMessage
+  );
+  return [
+    `status=${status || 0}`,
+    errorCode ? `errorCode=${errorCode}` : '',
+    errorMessage ? `errorMessage=${errorMessage}` : '',
+    cdpCode ? `cdpError=${cdpCode}` : '',
+    cdpMessage ? `cdpMessage=${cdpMessage}` : '',
+  ]
+    .filter(Boolean)
+    .join(', ');
+}
+
+async function bootstrapAuthTokenViaSignup(browser, testInfo, triggerReason = '') {
+  if (!PROVIDER_SIGNUP_BOOTSTRAP_ENABLED) {
+    return {
+      ok: false,
+      reason: 'Provider signup bootstrap is disabled by PW_PROVIDER_SIGNUP_BOOTSTRAP=0.',
+    };
+  }
+
+  const data = createRegistrationData({
+    emailSuffix: createProviderBootstrapEmailSuffix(),
+  });
+  const context = await browser.newContext({
+    viewport: { width: 1365, height: 900 },
+    ignoreHTTPSErrors: true,
+  });
+
+  try {
+    const page = await context.newPage();
+    const signupResult = await registerPlayerViaApi({
+      page,
+      data,
+      baseUrl: BASE_URL,
+    }).catch((error) => ({
+      ok: false,
+      status: 0,
+      body: {
+        errorCode: 'SIGNUP_BOOTSTRAP_EXCEPTION',
+        errorMessage: oneLine(error && error.message ? error.message : error),
+      },
+    }));
+
+    const token =
+      signupResult &&
+      signupResult.ok &&
+      signupResult.body &&
+      typeof signupResult.body.token === 'string'
+        ? oneLine(signupResult.body.token)
+        : '';
+
+    if (!token || token.length < 10) {
+      return {
+        ok: false,
+        reason: `Provider signup bootstrap failed: ${summarizeSignupFailure(signupResult)}.`,
+      };
+    }
+
+    writeProviderBootstrapRegistration(data, signupResult);
+
+    if (testInfo) {
+      testInfo.annotations.push({
+        type: 'auth-recovery',
+        description: `Recovered provider auth token via signup API bootstrap (${data.email}), trigger=${oneLine(triggerReason) || 'n/a'}.`,
+      });
+    }
+
+    return {
+      ok: true,
+      tokenArtifact: {
+        sourcePath: 'signup-api-bootstrap',
+        token,
+        email: data.email,
+        validationStatus: 'provider-bootstrap-token-only',
+      },
+    };
+  } finally {
+    await closeContextSafe(context, 8_000);
+  }
+}
+
 function extractAuthTokenArtifact() {
   for (const filePath of AUTH_RECOVERY_INPUT_CANDIDATES) {
     const payload = readJson(filePath);
@@ -222,11 +372,22 @@ function extractAuthTokenArtifact() {
 }
 
 async function recoverAuthStateFromArtifactToken(browser, testInfo, triggerReason = '') {
-  const tokenArtifact = extractAuthTokenArtifact();
+  let tokenArtifact = extractAuthTokenArtifact();
+  let signupBootstrapReason = '';
+  if (!tokenArtifact) {
+    const signupBootstrap = await bootstrapAuthTokenViaSignup(browser, testInfo, triggerReason);
+    if (signupBootstrap && signupBootstrap.ok && signupBootstrap.tokenArtifact) {
+      tokenArtifact = signupBootstrap.tokenArtifact;
+    } else {
+      signupBootstrapReason = oneLine(signupBootstrap && signupBootstrap.reason);
+    }
+  }
+
   if (!tokenArtifact) {
     return {
       ok: false,
-      reason: 'Registration artifacts do not contain a reusable auth token.',
+      reason:
+        signupBootstrapReason || 'Registration artifacts do not contain a reusable auth token.',
       authStatePath: null,
       userPreferencesStatus: 0,
     };
