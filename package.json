@@ -42,6 +42,7 @@
     "qa:all:smoke": "PW_PROVIDER_PROFILE=smoke node scripts/qa-all.js",
     "qa:all:extended": "PW_PROVIDER_PROFILE=extended node scripts/qa-all.js",
     "qa:all:nightly": "PW_PROVIDER_PROFILE=nightly PW_NIGHTLY_ROUTE=1 PW_INCLUDE_NIGHTLY_EXTRAS=1 PW_INCLUDE_A11Y=1 PW_INCLUDE_VISUAL=1 PW_CONTRACT_CHECKS=1 PW_WS_CAPTURE=1 node scripts/qa-all.js",
+    "qa:bootstrap:auth": "npx playwright test tests/critical/signup-api-success.spec.js tests/critical/login-auth.spec.js --project=desktop --reporter=line --workers=1",
     "qa:all:matrix": "PW_PROJECT_MATRIX=desktop,mobile node scripts/qa-all.js",
     "qa:contracts": "PW_CONTRACT_CHECKS=1 npx playwright test tests/critical/auth-payment-contract.spec.js --reporter=line --workers=1",
     "qa:all:brands:desktop": "node scripts/qa-brand-run.js --brand=all --mode=desktop",

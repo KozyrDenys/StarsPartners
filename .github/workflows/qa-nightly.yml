@@ -10,8 +10,110 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  nightly_auth_bootstrap:
+    name: Nightly Auth Bootstrap (${{ matrix.brand.slug }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        brand:
+          - key: gt
+            slug: gt.bet
+          - key: likes
+            slug: likes.bet
+          - key: booms
+            slug: booms.bet
+          - key: nix
+            slug: nix.bet
+          - key: starzino
+            slug: starzino.com
+          - key: igo
+            slug: igo.bet
+          - key: chacha
+            slug: chacha.bet
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium webkit
+
+      - name: Run nightly auth bootstrap (registration + login)
+        env:
+          BASE_URL: https://${{ matrix.brand.slug }}
+          QA_PROJECT_ROOT: projects/${{ matrix.brand.slug }}
+          QA_PROJECT_SLUG: ${{ matrix.brand.slug }}
+          QA_TEST_RESULTS_DIR: projects/${{ matrix.brand.slug }}/test-results
+          QA_ARTIFACTS_DIR: projects/${{ matrix.brand.slug }}/artifacts
+          QA_AUTOTEST_REPORT_DIR: projects/${{ matrix.brand.slug }}/Autotest report/bootstrap
+          QA_ANALYZE_DIR: projects/${{ matrix.brand.slug }}/analyze
+          PW_STORAGE_STATE: projects/${{ matrix.brand.slug }}/storageState.json
+          PW_PROJECT_MATRIX: desktop
+          PW_PRECHECK_PROJECT_MATRIX: desktop
+          PW_BROWSER: chromium
+          PW_HEADED: '0'
+          PW_LOGIN_REQUIRE_REGISTERED: '1'
+          PW_LOGIN_USE_ENV: '0'
+          PW_LOGIN_ALLOW_SHARED_PLAYER: '0'
+          PW_SIGNUP_VALIDATE_SIGNIN: '1'
+          PW_SIGNUP_VALIDATE_SIGNIN_TIMEOUT_MS: '120000'
+        run: npm run qa:bootstrap:auth
+
+      - name: Normalize auth-state files
+        run: |
+          set -euo pipefail
+          brand_root="projects/${{ matrix.brand.slug }}"
+          artifacts_dir="${brand_root}/artifacts"
+          mkdir -p "${brand_root}" "${artifacts_dir}"
+
+          if [[ ! -f "${brand_root}/storageState.json" ]]; then
+            for candidate in \
+              "${artifacts_dir}/profile-auth-state.json" \
+              "${artifacts_dir}/site-coverage-auth-state.json" \
+              "${artifacts_dir}/button-sweep-auth-state.json"; do
+              if [[ -f "${candidate}" ]]; then
+                cp "${candidate}" "${brand_root}/storageState.json"
+                echo "storageState restored from ${candidate}"
+                break
+              fi
+            done
+          fi
+
+          if [[ ! -f "${brand_root}/storageState.json" ]]; then
+            echo "::warning::nightly auth bootstrap did not produce storageState for ${{ matrix.brand.slug }}."
+          fi
+
+      - name: Upload nightly auth bootstrap artifacts (${{ matrix.brand.slug }})
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-auth-${{ matrix.brand.slug }}
+          if-no-files-found: warn
+          path: |
+            projects/${{ matrix.brand.slug }}/storageState.json
+            projects/${{ matrix.brand.slug }}/artifacts/registration-data-current-run.json
+            projects/${{ matrix.brand.slug }}/artifacts/last-registered-player.json
+            projects/${{ matrix.brand.slug }}/artifacts/last-manual-login-player.json
+            projects/${{ matrix.brand.slug }}/artifacts/profile-auth-state.json
+            projects/${{ matrix.brand.slug }}/artifacts/site-coverage-auth-state.json
+            projects/${{ matrix.brand.slug }}/artifacts/button-sweep-auth-state.json
+            projects/${{ matrix.brand.slug }}/test-results/registration-data.json
+
   nightly_full_matrix:
     name: Nightly Full (${{ matrix.brand.key }} | ${{ matrix.mode }})
+    if: ${{ always() }}
+    needs: nightly_auth_bootstrap
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -49,6 +151,38 @@ jobs:
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium webkit
+
+      - name: Download nightly auth bootstrap artifact
+        id: nightly_auth_bootstrap_download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: nightly-auth-${{ matrix.brand.slug }}
+          path: .
+
+      - name: Normalize auth-state files for nightly full
+        run: |
+          set -euo pipefail
+          brand_root="projects/${{ matrix.brand.slug }}"
+          artifacts_dir="${brand_root}/artifacts"
+          mkdir -p "${brand_root}" "${artifacts_dir}"
+
+          if [[ ! -f "${brand_root}/storageState.json" ]]; then
+            for candidate in \
+              "${artifacts_dir}/profile-auth-state.json" \
+              "${artifacts_dir}/site-coverage-auth-state.json" \
+              "${artifacts_dir}/button-sweep-auth-state.json"; do
+              if [[ -f "${candidate}" ]]; then
+                cp "${candidate}" "${brand_root}/storageState.json"
+                echo "storageState restored from ${candidate}"
+                break
+              fi
+            done
+          fi
+
+          if [[ ! -f "${brand_root}/storageState.json" ]]; then
+            echo "::warning::No bootstrap storageState found for ${{ matrix.brand.slug }} (${{ matrix.mode }})."
+          fi
 
       - name: Run deep nightly QA matrix entry
         env:
@@ -91,6 +225,8 @@ jobs:
 
   nightly_providers_matrix:
     name: Nightly Providers (${{ matrix.brand.slug }} | shard ${{ matrix.shard }}/2)
+    if: ${{ always() }}
+    needs: nightly_auth_bootstrap
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -129,6 +265,38 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium webkit
 
+      - name: Download nightly auth bootstrap artifact
+        id: nightly_auth_bootstrap_download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: nightly-auth-${{ matrix.brand.slug }}
+          path: .
+
+      - name: Normalize auth-state files for nightly providers
+        run: |
+          set -euo pipefail
+          brand_root="projects/${{ matrix.brand.slug }}"
+          artifacts_dir="${brand_root}/artifacts"
+          mkdir -p "${brand_root}" "${artifacts_dir}"
+
+          if [[ ! -f "${brand_root}/storageState.json" ]]; then
+            for candidate in \
+              "${artifacts_dir}/profile-auth-state.json" \
+              "${artifacts_dir}/site-coverage-auth-state.json" \
+              "${artifacts_dir}/button-sweep-auth-state.json"; do
+              if [[ -f "${candidate}" ]]; then
+                cp "${candidate}" "${brand_root}/storageState.json"
+                echo "storageState restored from ${candidate}"
+                break
+              fi
+            done
+          fi
+
+          if [[ ! -f "${brand_root}/storageState.json" ]]; then
+            echo "::warning::No bootstrap storageState found for ${{ matrix.brand.slug }} (providers shard ${{ matrix.shard }})."
+          fi
+
       - name: Run providers matrix entry
         env:
           PW_PROVIDER_PROFILE: 'extended'
@@ -155,6 +323,8 @@ jobs:
 
   nightly_localization_matrix:
     name: Nightly Localization (${{ matrix.brand.key }} | ${{ matrix.mode }} | shard ${{ matrix.shard }}/2)
+    if: ${{ always() }}
+    needs: nightly_auth_bootstrap
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -194,6 +364,38 @@ jobs:
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium webkit
 
+      - name: Download nightly auth bootstrap artifact
+        id: nightly_auth_bootstrap_download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: nightly-auth-${{ matrix.brand.slug }}
+          path: .
+
+      - name: Normalize auth-state files for nightly localization
+        run: |
+          set -euo pipefail
+          brand_root="projects/${{ matrix.brand.slug }}"
+          artifacts_dir="${brand_root}/artifacts"
+          mkdir -p "${brand_root}" "${artifacts_dir}"
+
+          if [[ ! -f "${brand_root}/storageState.json" ]]; then
+            for candidate in \
+              "${artifacts_dir}/profile-auth-state.json" \
+              "${artifacts_dir}/site-coverage-auth-state.json" \
+              "${artifacts_dir}/button-sweep-auth-state.json"; do
+              if [[ -f "${candidate}" ]]; then
+                cp "${candidate}" "${brand_root}/storageState.json"
+                echo "storageState restored from ${candidate}"
+                break
+              fi
+            done
+          fi
+
+          if [[ ! -f "${brand_root}/storageState.json" ]]; then
+            echo "::warning::No bootstrap storageState found for ${{ matrix.brand.slug }} (${{ matrix.mode }} shard ${{ matrix.shard }})."
+          fi
+
       - name: Run localization matrix entry
         env:
           PW_LOCALIZATION_MAX_LANGS: '0'
@@ -218,6 +420,8 @@ jobs:
 
   nightly_sports_matrix:
     name: Nightly Sports (${{ matrix.brand.key }} | shard ${{ matrix.shard }}/2)
+    if: ${{ always() }}
+    needs: nightly_auth_bootstrap
     runs-on: ubuntu-latest
     timeout-minutes: 75
     strategy:
@@ -255,6 +459,38 @@ jobs:
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium webkit
+
+      - name: Download nightly auth bootstrap artifact
+        id: nightly_auth_bootstrap_download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: nightly-auth-${{ matrix.brand.slug }}
+          path: .
+
+      - name: Normalize auth-state files for nightly sports
+        run: |
+          set -euo pipefail
+          brand_root="projects/${{ matrix.brand.slug }}"
+          artifacts_dir="${brand_root}/artifacts"
+          mkdir -p "${brand_root}" "${artifacts_dir}"
+
+          if [[ ! -f "${brand_root}/storageState.json" ]]; then
+            for candidate in \
+              "${artifacts_dir}/profile-auth-state.json" \
+              "${artifacts_dir}/site-coverage-auth-state.json" \
+              "${artifacts_dir}/button-sweep-auth-state.json"; do
+              if [[ -f "${candidate}" ]]; then
+                cp "${candidate}" "${brand_root}/storageState.json"
+                echo "storageState restored from ${candidate}"
+                break
+              fi
+            done
+          fi
+
+          if [[ ! -f "${brand_root}/storageState.json" ]]; then
+            echo "::warning::No bootstrap storageState found for ${{ matrix.brand.slug }} (sports shard ${{ matrix.shard }})."
+          fi
 
       - name: Run sports shard
         env:
