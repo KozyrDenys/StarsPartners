@@ -116,7 +116,11 @@ function runLocalization({
   linguisticMaxTextChars,
   linguisticTimeout,
   linguisticApi,
+  suiteTimeout,
   shardArg,
+  targetLocales,
+  strictBlocked,
+  inventoryOnly = false,
   browser = 'webkit',
   dryRun = false,
 }) {
@@ -157,7 +161,10 @@ function runLocalization({
     env.PW_LOCALIZATION_LINGUISTIC_TIMEOUT_MS = String(linguisticTimeout);
   }
   if (linguisticApi !== undefined) env.PW_LOCALIZATION_LINGUISTIC_API = String(linguisticApi);
+  if (suiteTimeout !== undefined) env.PW_LOCALIZATION_SUITE_TIMEOUT_MS = String(suiteTimeout);
   if (shardArg) env.PW_PLAYWRIGHT_SHARD = String(shardArg);
+  if (targetLocales) env.PW_LOCALIZATION_TARGET_LOCALES = String(targetLocales);
+  if (strictBlocked !== undefined) env.PW_LOCALIZATION_STRICT_BLOCKED = String(strictBlocked);
 
   const args = [
     'playwright',
@@ -166,6 +173,10 @@ function runLocalization({
     '--reporter=line',
     '--workers=1',
   ];
+  if (inventoryOnly) {
+    args.push('--grep');
+    args.push('P0 Localization inventory');
+  }
   if (shardArg) args.push(`--shard=${shardArg}`);
 
   if (dryRun) {
@@ -191,6 +202,14 @@ function runLocalization({
       console.log(`PW_LOCALIZATION_LINGUISTIC_TIMEOUT_MS=${linguisticTimeout}`);
     }
     if (linguisticApi !== undefined) console.log(`PW_LOCALIZATION_LINGUISTIC_API=${linguisticApi}`);
+    if (suiteTimeout !== undefined) {
+      console.log(`PW_LOCALIZATION_SUITE_TIMEOUT_MS=${suiteTimeout}`);
+    }
+    if (targetLocales) console.log(`PW_LOCALIZATION_TARGET_LOCALES=${targetLocales}`);
+    if (strictBlocked !== undefined) {
+      console.log(`PW_LOCALIZATION_STRICT_BLOCKED=${strictBlocked}`);
+    }
+    if (inventoryOnly) console.log('Localization scope: inventory only (P0)');
     if (shardArg) console.log(`PW_PLAYWRIGHT_SHARD=${shardArg}`);
     console.log(`PW_BROWSER=${browser}`);
     console.log(`> npx ${args.join(' ')}`);
@@ -226,6 +245,14 @@ function runLocalization({
       console.log(`PW_LOCALIZATION_LINGUISTIC_TIMEOUT_MS=${linguisticTimeout}`);
     }
     if (linguisticApi !== undefined) console.log(`PW_LOCALIZATION_LINGUISTIC_API=${linguisticApi}`);
+    if (suiteTimeout !== undefined) {
+      console.log(`PW_LOCALIZATION_SUITE_TIMEOUT_MS=${suiteTimeout}`);
+    }
+    if (targetLocales) console.log(`PW_LOCALIZATION_TARGET_LOCALES=${targetLocales}`);
+    if (strictBlocked !== undefined) {
+      console.log(`PW_LOCALIZATION_STRICT_BLOCKED=${strictBlocked}`);
+    }
+    if (inventoryOnly) console.log('Localization scope: inventory only (P0)');
     if (shardArg) console.log(`PW_PLAYWRIGHT_SHARD=${shardArg}`);
 
     const child = spawn('npx', args, {
@@ -307,6 +334,26 @@ async function main() {
     Number.isFinite(linguisticTimeout) && linguisticTimeout > 0 ? linguisticTimeout : undefined;
   const linguisticApi = String(args['linguistic-api'] || '').trim();
   const normalizedLinguisticApi = linguisticApi ? linguisticApi : undefined;
+  const suiteTimeout = Number.parseInt(
+    String(args['suite-timeout'] || process.env.PW_LOCALIZATION_SUITE_TIMEOUT_MS || ''),
+    10
+  );
+  const normalizedSuiteTimeout =
+    Number.isFinite(suiteTimeout) && suiteTimeout > 0 ? suiteTimeout : undefined;
+  const targetLocales = String(args['target-locales'] || '').trim();
+  const normalizedTargetLocales = targetLocales || undefined;
+  const strictBlockedRaw = String(args['strict-blocked'] || '').trim().toLowerCase();
+  const normalizedStrictBlocked =
+    strictBlockedRaw === ''
+      ? undefined
+      : ['1', 'true', 'yes', 'on'].includes(strictBlockedRaw)
+        ? '1'
+        : ['0', 'false', 'no', 'off'].includes(strictBlockedRaw)
+          ? '0'
+          : undefined;
+  const inventoryOnly = ['1', 'true', 'yes', 'on'].includes(
+    String(args['inventory-only'] || '').trim().toLowerCase()
+  );
   const browser = String(args.browser || process.env.PW_BROWSER || 'webkit')
     .trim()
     .toLowerCase();
@@ -354,7 +401,11 @@ async function main() {
         linguisticMaxTextChars: normalizedLinguisticMaxTextChars,
         linguisticTimeout: normalizedLinguisticTimeout,
         linguisticApi: normalizedLinguisticApi,
+        suiteTimeout: normalizedSuiteTimeout,
         shardArg: normalizedShard,
+        targetLocales: normalizedTargetLocales,
+        strictBlocked: normalizedStrictBlocked,
+        inventoryOnly,
         browser: normalizedBrowser,
         dryRun,
       });

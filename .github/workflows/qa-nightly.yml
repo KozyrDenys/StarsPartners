@@ -1,8 +1,6 @@
 name: QA Nightly
 
 on:
-  schedule:
-    - cron: '30 1 * * *'
   workflow_dispatch:
 
 concurrency:

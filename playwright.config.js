@@ -20,6 +20,7 @@ const browserName = ['chromium', 'firefox', 'webkit'].includes(requestedBrowser)
 const headedRequested = process.env.PW_HEADED === '1' || process.env.HEADLESS === '0';
 const slowMo = Number.parseInt(process.env.PW_SLOWMO || '0', 10);
 const userAgent = process.env.PW_USER_AGENT || undefined;
+const locale = process.env.PW_LOCALE || 'en-US';
 const testOutputDir = process.env.QA_TEST_RESULTS_DIR || path.join(process.cwd(), 'test-results');
 const reportJsonOutputFile = path.join(testOutputDir, 'report.json');
 const DESKTOP_VIEWPORT = { width: 1365, height: 900 };
@@ -119,6 +120,7 @@ module.exports = defineConfig({
 
   use: {
     baseURL: process.env.BASE_URL || 'https://gt.bet',
+    locale,
     browserName,
     ...(storageStatePath ? { storageState: storageStatePath } : {}),
     headless: !headedRequested,

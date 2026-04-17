@@ -176,7 +176,7 @@ test('Live chat destructive: guest sends "test" and receives support reply', asy
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1100 },
     ignoreHTTPSErrors: true,
-    locale: 'en-US',
+    locale: process.env.PW_LOCALE || 'en-US',
   });
 
   const page = await context.newPage();

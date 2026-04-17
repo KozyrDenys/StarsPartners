@@ -11,6 +11,7 @@ const {
   detectCloudflare,
   dismissOverlays,
   markBlocked,
+  tryAutoBypassCloudflare,
   waitForUiSettled,
 } = require('../helpers/gt-utils');
 
@@ -76,6 +77,15 @@ function sleep(ms) {
 }
 
 const LOCALIZATION_MAX_LANGS = parseLocaleLimit(process.env.PW_LOCALIZATION_MAX_LANGS || '0');
+const LOCALIZATION_TARGET_LOCALES = String(process.env.PW_LOCALIZATION_TARGET_LOCALES || '')
+  .split(',')
+  .map((item) => mapLocaleCodeToMarkers(item) || normalizeLocaleCode(item))
+  .filter(Boolean);
+const LOCALIZATION_STRICT_BLOCKED = ['1', 'true', 'on', 'yes'].includes(
+  String(process.env.PW_LOCALIZATION_STRICT_BLOCKED || '0')
+    .trim()
+    .toLowerCase()
+);
 const ROUTE_DISCOVERY_MAX = toPositiveInt(process.env.PW_LOCALIZATION_ROUTE_MAX || '40', 40);
 const ROUTE_DISCOVERY_CLICK_STEPS = toPositiveInt(
   process.env.PW_LOCALIZATION_ROUTE_CLICKS || '14',
@@ -114,6 +124,10 @@ const LOCALIZATION_NAV_TIMEOUT_MS = toPositiveInt(
 const LOCALIZATION_SETTLE_WAIT_MS = toPositiveInt(
   process.env.PW_LOCALIZATION_SETTLE_WAIT_MS || '800',
   800
+);
+const LOCALIZATION_SUITE_TIMEOUT_MS = toPositiveInt(
+  process.env.PW_LOCALIZATION_SUITE_TIMEOUT_MS || '720000',
+  720000
 );
 const LANGUAGE_TRIGGER_SELECTORS = [
   '[data-testid="locale-switcher"]',
@@ -223,7 +237,7 @@ let languageInventory = null;
 test.describe.configure({ mode: 'serial' });
 
 test.describe(`Localization: authorized language matrix for ${BRAND_HOST}`, () => {
-  test.setTimeout(3600000);
+  test.setTimeout(LOCALIZATION_SUITE_TIMEOUT_MS);
 
   test('P0 Localization inventory: detect all available language options', async ({
     browser,
@@ -254,6 +268,7 @@ test.describe(`Localization: authorized language matrix for ${BRAND_HOST}`, () =
         payload.blocked = true;
         payload.reason = opened.reason || 'unknown';
         await attachAndWrite(testInfo, 'localization-language-inventory.json', payload);
+        failIfStrictBlocked(testInfo, payload.reason || 'Home route blocked before language scan.');
         return;
       }
 
@@ -267,6 +282,7 @@ test.describe(`Localization: authorized language matrix for ${BRAND_HOST}`, () =
           payload.blocked = true;
           payload.reason = authState.reason;
           await attachAndWrite(testInfo, 'localization-language-inventory.json', payload);
+          failIfStrictBlocked(testInfo, payload.reason || 'Authorized session is unavailable.');
           return;
         }
       }
@@ -288,6 +304,7 @@ test.describe(`Localization: authorized language matrix for ${BRAND_HOST}`, () =
         payload.blocked = true;
         payload.reason = controlResolution.reason || 'Language control detection failed.';
         await attachAndWrite(testInfo, 'localization-language-inventory.json', payload);
+        failIfStrictBlocked(testInfo, payload.reason || 'Language control detection failed.');
         return;
       }
       const control = controlResolution.value;
@@ -299,6 +316,7 @@ test.describe(`Localization: authorized language matrix for ${BRAND_HOST}`, () =
         payload.blocked = true;
         payload.reason = 'Language control is not visible for authorized player.';
         await attachAndWrite(testInfo, 'localization-language-inventory.json', payload);
+        failIfStrictBlocked(testInfo, payload.reason);
         return;
       }
 
@@ -337,6 +355,7 @@ test.describe(`Localization: authorized language matrix for ${BRAND_HOST}`, () =
       };
       await attachAndWrite(testInfo, 'localization-matrix.json', payload);
       markBlocked(testInfo, 'Language inventory is missing. Run P0 localization inventory first.');
+      failIfStrictBlocked(testInfo, payload.reason);
       return;
     }
 
@@ -347,6 +366,7 @@ test.describe(`Localization: authorized language matrix for ${BRAND_HOST}`, () =
       authStatePath: authStatePath || '',
       mode: languageInventory.mode,
       inventoryCount: languageInventory.options.length,
+      targetLocales: LOCALIZATION_TARGET_LOCALES.slice(),
       maxLanguages: Number.isFinite(LOCALIZATION_MAX_LANGS) ? LOCALIZATION_MAX_LANGS : 'all',
       routeLimit: ROUTE_DISCOVERY_MAX,
       linguistic: {
@@ -363,14 +383,37 @@ test.describe(`Localization: authorized language matrix for ${BRAND_HOST}`, () =
     const allOptions = dedupeLanguageOptions(languageInventory.options || []);
     const supported = allOptions.filter((item) => item.code && LANGUAGE_MARKERS[item.code]);
     const candidatePool = supported.length ? supported : allOptions;
+    const targetPool = LOCALIZATION_TARGET_LOCALES.length
+      ? candidatePool.filter((item) => {
+          const rawCode = item.code || item.value || item.rawCode || '';
+          const normalized = normalizeLocaleCode(rawCode);
+          const mapped = mapLocaleCodeToMarkers(rawCode) || normalized;
+          return (
+            LOCALIZATION_TARGET_LOCALES.includes(mapped) ||
+            LOCALIZATION_TARGET_LOCALES.includes(normalized)
+          );
+        })
+      : candidatePool;
     const candidates = Number.isFinite(LOCALIZATION_MAX_LANGS)
-      ? candidatePool.slice(0, LOCALIZATION_MAX_LANGS)
-      : candidatePool.slice();
+      ? targetPool.slice(0, LOCALIZATION_MAX_LANGS)
+      : targetPool.slice();
 
-    if (candidatePool.length > candidates.length) {
+    if (LOCALIZATION_TARGET_LOCALES.length && !targetPool.length) {
+      markBlocked(
+        testInfo,
+        `No localization options matched requested locales: ${LOCALIZATION_TARGET_LOCALES.join(', ')}.`
+      );
+      payload.blocked = true;
+      payload.reason = `Requested locales not found: ${LOCALIZATION_TARGET_LOCALES.join(', ')}`;
+      await attachAndWrite(testInfo, 'localization-matrix.json', payload);
+      failIfStrictBlocked(testInfo, payload.reason);
+      return;
+    }
+
+    if (targetPool.length > candidates.length) {
       testInfo.annotations.push({
         type: 'partial',
-        description: `Localization matrix scope limited to ${candidates.length}/${candidatePool.length} locales by PW_LOCALIZATION_MAX_LANGS.`,
+        description: `Localization matrix scope limited to ${candidates.length}/${targetPool.length} locales by PW_LOCALIZATION_MAX_LANGS.`,
       });
     }
 
@@ -379,6 +422,7 @@ test.describe(`Localization: authorized language matrix for ${BRAND_HOST}`, () =
       payload.blocked = true;
       payload.reason = 'No locale options found.';
       await attachAndWrite(testInfo, 'localization-matrix.json', payload);
+      failIfStrictBlocked(testInfo, payload.reason);
       return;
     }
 
@@ -483,7 +527,17 @@ test.describe(`Localization: authorized language matrix for ${BRAND_HOST}`, () =
 
     if (blockedLocales === payload.locales.length) {
       markBlocked(testInfo, `Localization matrix blocked for all locales (${blockedLocales}).`);
+      failIfStrictBlocked(
+        testInfo,
+        `Localization matrix blocked for all locales (${blockedLocales}).`
+      );
       return;
+    }
+
+    if (LOCALIZATION_STRICT_BLOCKED && blockedLocales > 0) {
+      throw new Error(
+        `LOCALIZATION_STRICT_BLOCKED: ${blockedLocales}/${payload.locales.length} locale checks were blocked.`
+      );
     }
 
     if (partialLocales > 0) {
@@ -1006,9 +1060,22 @@ async function attachAndWrite(testInfo, name, payload) {
   testInfo.annotations.push({ type: 'artifact', description: artifactPath });
 }
 
+function failIfStrictBlocked(testInfo, reason) {
+  if (!LOCALIZATION_STRICT_BLOCKED) return;
+  const message = compactText(reason || 'Localization step was blocked.');
+  testInfo.annotations.push({ type: 'strict-blocked', description: message });
+  throw new Error(`LOCALIZATION_STRICT_BLOCKED: ${message}`);
+}
+
 async function openRoute(page, route, options = {}) {
   const targetUrl = new URL(route, BASE_URL).toString();
-  const maxAttempts = toPositiveInt(options.maxAttempts || '1', 1);
+  const autoBypassEnabled = process.env.PW_AUTO_BYPASS_CF !== '0';
+  const defaultAttempts = autoBypassEnabled ? 2 : 1;
+  const maxAttempts = toPositiveInt(options.maxAttempts || String(defaultAttempts), defaultAttempts);
+  const autoBypassTimeoutMs = toPositiveInt(
+    process.env.PW_AUTO_BYPASS_CF_TIMEOUT_MS || '22000',
+    22000
+  );
   const navigationTimeoutMs = toPositiveInt(
     options.navigationTimeoutMs || LOCALIZATION_NAV_TIMEOUT_MS,
     LOCALIZATION_NAV_TIMEOUT_MS
@@ -1071,6 +1138,21 @@ async function openRoute(page, route, options = {}) {
       Number(status || 0) === 403;
 
     result.attempts.push({ attempt, status, url, title, reason });
+
+    if (challengeLike && autoBypassEnabled) {
+      const bypass = await tryAutoBypassCloudflare(page, autoBypassTimeoutMs).catch(() => ({
+        resolved: false,
+        attemptedInteraction: false,
+      }));
+      if (bypass && bypass.resolved) {
+        await waitForUiSettled(page, settleWaitMs).catch(() => null);
+        await dismissOverlays(page).catch(() => null);
+        continue;
+      }
+      if (bypass && bypass.attemptedInteraction && !reason) {
+        reason = 'Cloudflare challenge detected (auto-bypass attempted).';
+      }
+    }
 
     if (!challengeLike || attempt === maxAttempts) {
       result.status = status;

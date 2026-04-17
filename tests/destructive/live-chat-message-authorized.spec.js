@@ -228,7 +228,7 @@ test('Live chat destructive: authorized player sends message and sees chat activ
     storageState: authStatePath,
     viewport: { width: 1440, height: 1100 },
     ignoreHTTPSErrors: true,
-    locale: 'en-US',
+    locale: process.env.PW_LOCALE || 'en-US',
   });
 
   const page = await context.newPage();

@@ -1725,7 +1725,7 @@ test.describe('Sidebar Matrix', () => {
 
     const context = await browser.newContext(
       getSidebarContextOptions({
-        locale: 'en-US',
+        locale: process.env.PW_LOCALE || 'en-US',
       })
     );
 
@@ -2146,7 +2146,7 @@ test.describe('Sidebar Matrix', () => {
 
     const baselineContext = await browser.newContext(
       getSidebarContextOptions({
-        locale: 'en-US',
+        locale: process.env.PW_LOCALE || 'en-US',
       })
     );
 
@@ -2206,7 +2206,7 @@ test.describe('Sidebar Matrix', () => {
     for (const option of targetOptions) {
       const context = await browser.newContext(
         getSidebarContextOptions({
-          locale: 'en-US',
+          locale: process.env.PW_LOCALE || 'en-US',
         })
       );
 

@@ -631,6 +631,7 @@ module.exports = {
   maybeSkipWaf,
   openLoginModal,
   openSignupModal,
+  tryAutoBypassCloudflare,
   waitForHomeContent,
   waitForUiSettled,
 };
