@@ -937,7 +937,8 @@ function evaluateRunKpis(summary) {
   );
   const providerApplicable = providerResults.length > 0 || Boolean(phases.casino);
   const providerAllBlockedByChallenge =
-    providerResults.length > 0 && providerResults.every((row) => isProviderRowChallengeBlocked(row));
+    providerResults.length > 0 &&
+    providerResults.every((row) => isProviderRowChallengeBlocked(row));
   pushCheck({
     id: 'provider-passed',
     label: 'Provider real-launch passed count',
@@ -1578,7 +1579,9 @@ async function runSuiteWithRetry({
   const summary = collectRunSummary();
   const kpi = evaluateRunKpis(summary);
   if (kpi && kpi.waivers && kpi.waivers.wafGraceApplied) {
-    console.log(`\nℹ️  KPI WAF grace applied: ${kpi.waivers.wafGraceReason || 'Cloudflare/WAF-dominated run.'}`);
+    console.log(
+      `\nℹ️  KPI WAF grace applied: ${kpi.waivers.wafGraceReason || 'Cloudflare/WAF-dominated run.'}`
+    );
   }
   if (!kpi.valid) {
     console.log('\n❌ KPI validation failed. Run is marked invalid.');

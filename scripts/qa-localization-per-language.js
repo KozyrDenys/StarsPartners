@@ -70,7 +70,9 @@ function ensureDir(dirPath) {
 }
 
 function boolFrom(input, fallback = false) {
-  const raw = String(input || '').trim().toLowerCase();
+  const raw = String(input || '')
+    .trim()
+    .toLowerCase();
   if (!raw) return fallback;
   if (['1', 'true', 'yes', 'on'].includes(raw)) return true;
   if (['0', 'false', 'no', 'off'].includes(raw)) return false;
@@ -164,7 +166,13 @@ async function runSaveState({ cwd, brand, mode, paths, dryRun = false }) {
 function readInventory(localizationDir) {
   const inventoryPath = path.join(localizationDir, 'localization-language-inventory.json');
   if (!fs.existsSync(inventoryPath)) {
-    return { path: inventoryPath, locales: [], rawCount: 0, blocked: true, reason: 'missing inventory file' };
+    return {
+      path: inventoryPath,
+      locales: [],
+      rawCount: 0,
+      blocked: true,
+      reason: 'missing inventory file',
+    };
   }
 
   try {
@@ -226,10 +234,7 @@ function readInventoryWithFallback(paths, mode) {
 
 function copyLocaleArtifacts(paths, locale) {
   const localeTag = normalizeLocaleCode(locale) || String(locale || 'unknown').toLowerCase();
-  const files = [
-    'localization-language-inventory.json',
-    'localization-matrix.json',
-  ];
+  const files = ['localization-language-inventory.json', 'localization-matrix.json'];
 
   for (const name of files) {
     const src = path.join(paths.localizationDir, name);
@@ -263,7 +268,8 @@ async function runLocalization({
   if (strictBlocked !== undefined) args.push(`--strict-blocked=${strictBlocked ? '1' : '0'}`);
   if (inventoryOnly) args.push('--inventory-only=1');
   if (Number.isFinite(maxLangs)) args.push(`--max-langs=${maxLangs}`);
-  if (Number.isFinite(suiteTimeout) && suiteTimeout > 0) args.push(`--suite-timeout=${suiteTimeout}`);
+  if (Number.isFinite(suiteTimeout) && suiteTimeout > 0)
+    args.push(`--suite-timeout=${suiteTimeout}`);
 
   if (dryRun) {
     console.log(`> node ${args.join(' ')}`);

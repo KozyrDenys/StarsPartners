@@ -342,7 +342,9 @@ async function main() {
     Number.isFinite(suiteTimeout) && suiteTimeout > 0 ? suiteTimeout : undefined;
   const targetLocales = String(args['target-locales'] || '').trim();
   const normalizedTargetLocales = targetLocales || undefined;
-  const strictBlockedRaw = String(args['strict-blocked'] || '').trim().toLowerCase();
+  const strictBlockedRaw = String(args['strict-blocked'] || '')
+    .trim()
+    .toLowerCase();
   const normalizedStrictBlocked =
     strictBlockedRaw === ''
       ? undefined
@@ -352,7 +354,9 @@ async function main() {
           ? '0'
           : undefined;
   const inventoryOnly = ['1', 'true', 'yes', 'on'].includes(
-    String(args['inventory-only'] || '').trim().toLowerCase()
+    String(args['inventory-only'] || '')
+      .trim()
+      .toLowerCase()
   );
   const browser = String(args.browser || process.env.PW_BROWSER || 'webkit')
     .trim()

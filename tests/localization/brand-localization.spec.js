@@ -1071,7 +1071,10 @@ async function openRoute(page, route, options = {}) {
   const targetUrl = new URL(route, BASE_URL).toString();
   const autoBypassEnabled = process.env.PW_AUTO_BYPASS_CF !== '0';
   const defaultAttempts = autoBypassEnabled ? 2 : 1;
-  const maxAttempts = toPositiveInt(options.maxAttempts || String(defaultAttempts), defaultAttempts);
+  const maxAttempts = toPositiveInt(
+    options.maxAttempts || String(defaultAttempts),
+    defaultAttempts
+  );
   const autoBypassTimeoutMs = toPositiveInt(
     process.env.PW_AUTO_BYPASS_CF_TIMEOUT_MS || '22000',
     22000
