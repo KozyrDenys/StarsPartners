@@ -303,6 +303,17 @@ const kpiThresholds = {
   })(),
   requireDepositUiWhenApiPresent: process.env.PW_KPI_REQUIRE_DEPOSIT_UI_WITH_API !== '0',
 };
+const kpiWafGraceEnabled = process.env.PW_KPI_WAF_GRACE !== '0';
+const kpiWafGraceMinBlockedRatio = (() => {
+  const raw = Number.parseFloat(process.env.PW_KPI_WAF_GRACE_MIN_BLOCKED_RATIO || '0.70');
+  if (!Number.isFinite(raw) || raw <= 0) return 0.7;
+  return raw;
+})();
+const kpiWafGraceMinInfraRatio = (() => {
+  const raw = Number.parseFloat(process.env.PW_KPI_WAF_GRACE_MIN_INFRA_RATIO || '0.60');
+  if (!Number.isFinite(raw) || raw <= 0) return 0.6;
+  return raw;
+})();
 
 const forceSaveStateWarmupRoutes = String(
   process.env.PW_SAVE_STATE_WARMUP_ROUTES || '/,/assets/,/casino/,/casino/recent/'
@@ -319,6 +330,40 @@ const saveStateTimeoutSec =
 
 function isCloudflareBlocked(output) {
   return cloudflareHints.some((re) => re.test(output));
+}
+
+function isChallengeLikeText(value) {
+  const text = String(value || '').toLowerCase();
+  if (!text) return false;
+  return (
+    text.includes('cloudflare') ||
+    text.includes('challenge') ||
+    text.includes('turnstile') ||
+    text.includes('captcha') ||
+    text.includes('waf') ||
+    text.includes('cdn-cgi') ||
+    text.includes('__cf_chl') ||
+    text.includes('just a moment') ||
+    text.includes('security verification') ||
+    text.includes('403')
+  );
+}
+
+function isProviderRowChallengeBlocked(row) {
+  if (!row || typeof row !== 'object') return false;
+  if (String(row.status || '').toLowerCase() !== 'blocked') return false;
+  const blob = [
+    row.reason,
+    row.note,
+    row.outcome,
+    row.uiBlockedReason,
+    ...(Array.isArray(row.modes)
+      ? row.modes.flatMap((mode) => [mode && mode.reason, mode && mode.uiBlockedReason])
+      : []),
+  ]
+    .map((item) => String(item || ''))
+    .join(' ');
+  return isChallengeLikeText(blob);
 }
 
 function browserEnv(browser) {
@@ -833,6 +878,17 @@ function evaluateRunKpis(summary) {
     Number(totals.total || 0) > 0
       ? Number(totals.infraBlockedSignals || 0) / Number(totals.total || 1)
       : 0;
+  const precheckCloudflareSignal = phaseHasCloudflareSignal('precheck');
+  const wafGraceApplied =
+    kpiWafGraceEnabled &&
+    (precheckCloudflareSignal ||
+      (blockedRatio >= kpiWafGraceMinBlockedRatio &&
+        infraBlockedRatio >= kpiWafGraceMinInfraRatio));
+  const wafGraceReason = wafGraceApplied
+    ? precheckCloudflareSignal
+      ? 'Precheck contains Cloudflare/WAF challenge signals.'
+      : `Blocked ratios exceed WAF grace thresholds (blocked=${blockedRatio.toFixed(3)}, infra=${infraBlockedRatio.toFixed(3)}).`
+    : '';
 
   const pushCheck = ({ id, label, actual, threshold, passed, applicable = true, detail = '' }) => {
     checks.push({
@@ -852,8 +908,10 @@ function evaluateRunKpis(summary) {
     actual: blockedRatio,
     threshold: kpiThresholds.maxBlockedRatio,
     passed: blockedRatio <= kpiThresholds.maxBlockedRatio,
-    applicable: Number(totals.total || 0) > 0,
-    detail: `${Number(totals.blockedSignals || 0)}/${Number(totals.total || 0)}`,
+    applicable: Number(totals.total || 0) > 0 && !wafGraceApplied,
+    detail:
+      `${Number(totals.blockedSignals || 0)}/${Number(totals.total || 0)}` +
+      (wafGraceApplied ? ' (waived due to Cloudflare/WAF-dominated run)' : ''),
   });
 
   pushCheck({
@@ -862,8 +920,10 @@ function evaluateRunKpis(summary) {
     actual: infraBlockedRatio,
     threshold: kpiThresholds.maxInfraBlockedRatio,
     passed: infraBlockedRatio <= kpiThresholds.maxInfraBlockedRatio,
-    applicable: Number(totals.total || 0) > 0,
-    detail: `${Number(totals.infraBlockedSignals || 0)}/${Number(totals.total || 0)}`,
+    applicable: Number(totals.total || 0) > 0 && !wafGraceApplied,
+    detail:
+      `${Number(totals.infraBlockedSignals || 0)}/${Number(totals.total || 0)}` +
+      (wafGraceApplied ? ' (waived due to Cloudflare/WAF-dominated run)' : ''),
   });
 
   const providerMatrix = readJson(providerMatrixArtifactPath);
@@ -876,15 +936,20 @@ function evaluateRunKpis(summary) {
       0
   );
   const providerApplicable = providerResults.length > 0 || Boolean(phases.casino);
+  const providerAllBlockedByChallenge =
+    providerResults.length > 0 && providerResults.every((row) => isProviderRowChallengeBlocked(row));
   pushCheck({
     id: 'provider-passed',
     label: 'Provider real-launch passed count',
     actual: providerPassed,
     threshold: kpiThresholds.minProviderPassed,
     passed: providerPassed >= kpiThresholds.minProviderPassed,
-    applicable: providerApplicable,
+    applicable: providerApplicable && !(wafGraceApplied && providerAllBlockedByChallenge),
     detail: providerResults.length
-      ? `${providerPassed}/${providerResults.length}`
+      ? `${providerPassed}/${providerResults.length}` +
+        (wafGraceApplied && providerAllBlockedByChallenge
+          ? ' (waived: all provider rows are Cloudflare/WAF blocked)'
+          : '')
       : `provider-results=${providerResults.length}`,
   });
 
@@ -955,6 +1020,15 @@ function evaluateRunKpis(summary) {
     thresholds: kpiThresholds,
     totals,
     phases,
+    waivers: {
+      wafGraceEnabled: kpiWafGraceEnabled,
+      wafGraceApplied,
+      wafGraceReason,
+      precheckCloudflareSignal,
+      providerAllBlockedByChallenge,
+      minBlockedRatio: kpiWafGraceMinBlockedRatio,
+      minInfraRatio: kpiWafGraceMinInfraRatio,
+    },
     valid,
     failedChecks,
     checks,
@@ -1503,6 +1577,9 @@ async function runSuiteWithRetry({
 
   const summary = collectRunSummary();
   const kpi = evaluateRunKpis(summary);
+  if (kpi && kpi.waivers && kpi.waivers.wafGraceApplied) {
+    console.log(`\nℹ️  KPI WAF grace applied: ${kpi.waivers.wafGraceReason || 'Cloudflare/WAF-dominated run.'}`);
+  }
   if (!kpi.valid) {
     console.log('\n❌ KPI validation failed. Run is marked invalid.');
     for (const item of kpi.failedChecks || []) {

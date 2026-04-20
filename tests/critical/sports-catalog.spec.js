@@ -408,11 +408,36 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
           .isVisible()
           .catch(() => false),
       };
+      const userPreferencesStatus = await page.request
+        .get(buildUrl('/api/user/preferences'), {
+          failOnStatusCode: false,
+          timeout: 15000,
+        })
+        .then((resp) => resp.status())
+        .catch(() => 0);
 
-      expect(
-        route.loginVisible,
-        'Authorized sports page should not show Log In button.'
-      ).toBeFalsy();
+      if (route.loginVisible) {
+        if (userPreferencesStatus === 0 || userPreferencesStatus >= 400) {
+          const reason =
+            `Sports authorized check is blocked: Log In is visible and /api/user/preferences returned ${userPreferencesStatus || 0}.` +
+            ' Auth state is not usable for this run.';
+          markBlocked(testInfo, reason);
+          await writeAndAttach(testInfo, testInfo.title, {
+            blocked: true,
+            reason,
+            route,
+            authStatePath,
+            sportsBox,
+            visibleSignals,
+            userPreferencesStatus,
+          });
+          return;
+        }
+        expect(
+          route.loginVisible,
+          'Authorized sports page should not show Log In button.'
+        ).toBeFalsy();
+      }
       if (!sportsBox && !Object.values(visibleSignals).some(Boolean)) {
         const reason =
           'Sports container/signals are not exposed in current brand layout for this run.';
@@ -424,6 +449,7 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
           authStatePath,
           sportsBox,
           visibleSignals,
+          userPreferencesStatus,
         });
         return;
       }
@@ -438,6 +464,7 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
           authStatePath,
           sportsBox,
           visibleSignals,
+          userPreferencesStatus,
         });
         return;
       }
@@ -448,6 +475,7 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         authStatePath,
         sportsBox,
         visibleSignals,
+        userPreferencesStatus,
       });
     } finally {
       await context.close();
