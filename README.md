@@ -169,6 +169,18 @@ npm run qa:all:chacha:mobile
 # полный прогон всех брендов отдельно по desktop и mobile
 npm run qa:all:brands:desktop
 npm run qa:all:brands:mobile
+# разделенные прогоны (core/providers) по всем брендам
+npm run qa:all:brands:desktop:core
+npm run qa:all:brands:mobile:core
+npm run qa:all:brands:desktop:providers
+npm run qa:all:brands:mobile:providers
+# session prep перед full-run (manual headed challenge/login)
+npm run qa:session:prep:all:desktop
+npm run qa:session:prep:all:mobile
+# пример на одном бренде
+npm run qa:session:prep:gt:mobile
+npm run qa:all:gt:mobile:core
+npm run qa:all:gt:mobile:providers
 # dry-run (проверка матрицы брендов/путей без запуска тестов)
 node scripts/qa-brand-run.js --brand=all --mode=desktop --dry-run=1
 node scripts/qa-brand-run.js --brand=all --mode=mobile --dry-run=1
@@ -368,6 +380,25 @@ PW_REQUIRE_HEADED_LOGIN_BEFORE_RUN=1 npm run qa:all
 # строгий режим: остановить ран, если pre-login не удался
 PW_REQUIRE_HEADED_LOGIN_BEFORE_RUN=1 PW_REQUIRE_HEADED_LOGIN_STRICT=1 npm run qa:all
 ```
+
+Для повышения стабильности против anti-bot в локальных прогонах:
+
+```bash
+# 1) подготовить session/state вручную (один раз перед прогоном)
+npm run qa:session:prep:gt:desktop
+
+# 2) выполнить full core-run
+npm run qa:all:gt:desktop:core
+
+# 3) отдельно выполнить providers-run на уже прогретой сессии
+npm run qa:all:gt:desktop:providers
+```
+
+Что включено в этом режиме:
+
+- `saveState` использует persistent browser profile (`projects/<brand>/.pw-profile/<mode>`), чтобы лучше удерживать challenge/session cookies.
+- После успешного headed pre-login `qa:all` не делает лишний auto-refresh перед precheck (чтобы не перезатирать свежую сессию).
+- На challenge-сигнал запускается `challenge-aware rerun` (refresh + retry с backoff), затем прогон продолжается с диагностикой blocked/infra-blocked.
 
 В CI авто-refresh `storageState` пропускается, чтобы не зависать на challenge.
 

@@ -19,6 +19,8 @@ const brandSlug =
     .toLowerCase()
     .replace(/[^a-z0-9.-]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'brand';
+const softPrecheckMode =
+  process.env.QA_SOFT_PRECHECK_MODE === '1' || process.env.PW_PRECHECK_SOFT === '1';
 const reportDir = projectPaths.testResultsDir;
 const artifactsDir = path.join(projectPaths.artifactsDir, 'phase-reports');
 const reportPath = path.join(reportDir, 'report.json');
@@ -493,21 +495,53 @@ function isFailureStatus(status) {
 }
 
 function getStatusTotals(tests) {
+  const failedTests = tests.filter((t) => isFailureStatus(t.status));
+  const failedInfraBlocked = failedTests.filter((t) =>
+    (t.annotations || []).some((ann) => String(ann.type || '').toLowerCase() === 'infra-blocked')
+  ).length;
+  const failedProductBlocked = failedTests.filter((t) =>
+    (t.annotations || []).some((ann) => String(ann.type || '').toLowerCase() === 'product-blocked')
+  ).length;
+  const failedUnclassified = failedTests.filter((t) => {
+    const hasInfra = (t.annotations || []).some(
+      (ann) => String(ann.type || '').toLowerCase() === 'infra-blocked'
+    );
+    const hasProduct = (t.annotations || []).some(
+      (ann) => String(ann.type || '').toLowerCase() === 'product-blocked'
+    );
+    return !hasInfra && !hasProduct;
+  }).length;
+
   return {
     total: tests.length,
     passed: tests.filter((t) => t.status === 'passed').length,
-    failed: tests.filter((t) => isFailureStatus(t.status)).length,
+    failed: failedTests.length,
+    failedInfraBlocked,
+    failedProductBlocked,
+    failedUnclassified,
     skipped: tests.filter((t) => t.status === 'skipped').length,
     flaky: tests.filter((t) => t.status === 'flaky').length,
   };
 }
 
 function getRunStatus(totals) {
-  if (totals.failed > 0) return 'FAILED';
+  if (totals.failed > 0) {
+    const infraOnlyFailure =
+      Number(totals.failedInfraBlocked || 0) === Number(totals.failed || 0) &&
+      Number(totals.failedProductBlocked || 0) === 0 &&
+      Number(totals.failedUnclassified || 0) === 0;
+    return infraOnlyFailure ? 'INFRA_BLOCKED' : 'FAILED';
+  }
   if (totals.total === 0) return 'NO_TESTS';
   if (totals.flaky > 0) return 'PASSED_WITH_FLAKY';
   if (totals.skipped > 0) return 'PASSED_WITH_SKIPS';
   return 'PASSED';
+}
+
+function isSoftPrecheckFailure(test) {
+  if (!softPrecheckMode) return false;
+  if (!test || typeof test !== 'object') return false;
+  return String(test.phase || '').toLowerCase() === 'precheck' && isFailureStatus(test.status);
 }
 
 function statusRank(status) {
@@ -695,6 +729,18 @@ function blockedAwareList(items, blocked) {
   return '-';
 }
 
+function uniqueStrings(items) {
+  const seen = new Set();
+  const values = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    const value = oneLine(item || '');
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    values.push(value);
+  }
+  return values;
+}
+
 function blockedAwareBool(value, blocked) {
   if (blocked) return 'N/A (blocked)';
   return value ? 'yes' : 'no';
@@ -805,7 +851,10 @@ function attachmentLinksHtml(attachments) {
 }
 
 function runStatusBadgeClass(status) {
-  if (status === 'FAILED' || status === 'FAILED_KPI') return 'badge-failed';
+  if (status === 'FAILED' || status === 'FAILED_KPI' || status === 'INVALID_RUN')
+    return 'badge-failed';
+  if (status === 'INFRA_BLOCKED') return 'badge-skipped';
+  if (status === 'WAF_DEGRADED') return 'badge-skipped';
   if (status === 'PASSED') return 'badge-passed';
   if (status.startsWith('PASSED_WITH')) return 'badge-skipped';
   return 'badge-default';
@@ -1054,6 +1103,21 @@ function summarizeDepositArtifact(payload) {
     payload && typeof payload.apiCoverageAvailable === 'boolean'
       ? payload.apiCoverageAvailable
       : Boolean(payload && payload.apiFallback && payload.apiFallback.resolved);
+  const discoveredMethods = uniqueStrings(
+    Array.isArray(payload && payload.paymentMethodsDiscovered)
+      ? payload.paymentMethodsDiscovered
+      : Array.isArray(payload && payload.paymentMethodTilesDiscovered)
+        ? payload.paymentMethodTilesDiscovered
+        : realResults.map((item) => item.method)
+  );
+  const checkedMethods = uniqueStrings(
+    Array.isArray(payload && payload.paymentMethodsChecked)
+      ? payload.paymentMethodsChecked
+      : realResults.map((item) => item.method)
+  );
+  const readyMethods = uniqueStrings(
+    realResults.filter((item) => item.surfaceReady).map((item) => item.method)
+  );
   return {
     discoveredCount,
     checkedCount,
@@ -1072,6 +1136,9 @@ function summarizeDepositArtifact(payload) {
     ),
     uiCoverageAvailable,
     apiCoverageAvailable,
+    discoveredMethods,
+    checkedMethods,
+    readyMethods,
     results: realResults,
   };
 }
@@ -1139,9 +1206,30 @@ const totals = getStatusTotals(tests);
 const signalTotals = getSignalTotals(tests);
 const authStateHealth = readJson(authStateHealthArtifactPath);
 const kpiValidation = readJson(kpiValidationArtifactPath);
-const runStatusBase = getRunStatus(totals);
-const runStatus = kpiValidation && kpiValidation.valid === false ? 'FAILED_KPI' : runStatusBase;
 const failed = tests.filter((t) => isFailureStatus(t.status));
+const softPrecheckFailureTests = failed.filter((test) => isSoftPrecheckFailure(test));
+const effectiveFailedCount = failed.length - softPrecheckFailureTests.length;
+const runStatusBase = getRunStatus({
+  ...totals,
+  failed: Math.max(0, effectiveFailedCount),
+});
+function resolveKpiRunStatus(baseStatus, kpi) {
+  if (!kpi || kpi.valid !== false) return baseStatus;
+  const failedChecks = Array.isArray(kpi.failedChecks) ? kpi.failedChecks : [];
+  const wafSignals = [
+    kpi.waivers && kpi.waivers.wafGraceApplied,
+    kpi.waivers && kpi.waivers.precheckCloudflareSignal,
+    failedChecks.some((item) =>
+      /waf|cloudflare|challenge|blocked-ratio|infra-blocked|precheck-waf/i.test(
+        `${item && item.id ? item.id : ''} ${item && item.detail ? item.detail : ''}`
+      )
+    ),
+  ].some(Boolean);
+
+  if (baseStatus === 'PASSED' && wafSignals) return 'WAF_DEGRADED';
+  return 'INVALID_RUN';
+}
+const runStatus = resolveKpiRunStatus(runStatusBase, kpiValidation);
 const executionMode = String(process.env.QA_EXECUTION_MODE || process.env.PW_PROJECT_MATRIX || '')
   .trim()
   .toLowerCase();
@@ -1205,6 +1293,8 @@ const sectionSummary = [...sectionMap.entries()]
 
 const blockedRatio = Number(signalTotals.blocked || 0) / Math.max(1, Number(totals.total || 0));
 const failedRatio = Number(totals.failed || 0) / Math.max(1, Number(totals.total || 0));
+const effectiveFailedRatio =
+  Number(Math.max(0, effectiveFailedCount || 0)) / Math.max(1, Number(totals.total || 0));
 const topSectionsByBlocked = [...sectionSummary]
   .map((section) => ({
     section: section.section,
@@ -1225,11 +1315,19 @@ const runIssueTopReasons = topReasons(
 );
 const quickHighlights = [];
 quickHighlights.push(
-  `Run status: ${runStatus}. Failed: ${totals.failed}/${totals.total} (${formatPercent(failedRatio, 1)}).`
+  `Run status: ${runStatus}. Hard failed: ${Math.max(0, effectiveFailedCount)}/${totals.total} (${formatPercent(
+    effectiveFailedRatio,
+    1
+  )}).`
 );
 quickHighlights.push(
   `Blocked signals: ${signalTotals.blocked}/${totals.total} (${formatPercent(blockedRatio, 1)}).`
 );
+if (softPrecheckMode && softPrecheckFailureTests.length > 0) {
+  quickHighlights.push(
+    `Soft precheck mode active: ${softPrecheckFailureTests.length} precheck failure(s) were carried as non-blocking diagnostics.`
+  );
+}
 if (topSectionsByBlocked.length) {
   quickHighlights.push(
     `Most blocked section: ${topSectionsByBlocked[0].section} (${topSectionsByBlocked[0].blocked}/${topSectionsByBlocked[0].total}).`
@@ -1638,6 +1736,20 @@ const depositCoverageMd = (() => {
     .map((item) => item.method)
     .filter(Boolean)
     .slice(0, 8);
+  const availableMethods = depositSummary.discoveredMethods.length
+    ? depositSummary.discoveredMethods
+    : depositSummary.checkedMethods;
+  const availableMethodsMd = availableMethods.length
+    ? [
+        '',
+        '### Available Deposit Methods',
+        '',
+        '| # | Method |',
+        '| --- | --- |',
+        ...availableMethods.map((method, index) => `| ${index + 1} | ${escapeMdCell(method)} |`),
+        '',
+      ]
+    : [];
 
   return [
     '## Deposit Coverage',
@@ -1663,6 +1775,8 @@ const depositCoverageMd = (() => {
     `| UI Categories (preview) | ${escapeMdCell(blockedAwareList(uiCategoriesPreview, inventoryBlocked))} |`,
     `| Ready Methods (preview) | ${escapeMdCell(blockedAwareList(readyMethodsPreview, methodsBlocked))} |`,
     `| Checked Methods (preview) | ${escapeMdCell(blockedAwareList(checkedMethodsPreview, methodsBlocked))} |`,
+    `| Available Methods Source | ${escapeMdCell(depositSummary.sourceMode || '-')} |`,
+    ...availableMethodsMd,
     '',
   ].join('\n');
 })();
@@ -2236,6 +2350,34 @@ const depositCoverageHtml = (() => {
     .map((item) => item.method)
     .filter(Boolean)
     .slice(0, 8);
+  const availableMethods = depositSummary.discoveredMethods.length
+    ? depositSummary.discoveredMethods
+    : depositSummary.checkedMethods;
+  const availableMethodsHtml = availableMethods.length
+    ? `
+        <h3>Available Deposit Methods</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Method</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${availableMethods
+              .map(
+                (method, index) => `
+                  <tr>
+                    <td>${index + 1}</td>
+                    <td>${escapeHtml(method)}</td>
+                  </tr>
+                `
+              )
+              .join('')}
+          </tbody>
+        </table>
+      `
+    : '';
 
   return `
       <section id="deposit-coverage">
@@ -2317,7 +2459,11 @@ const depositCoverageHtml = (() => {
           <div class="key">Checked Methods (preview)</div><div class="val">${escapeHtml(
             blockedAwareList(checkedMethodsPreview, methodsBlocked)
           )}</div>
+          <div class="key">Available Methods Source</div><div class="val">${escapeHtml(
+            depositSummary.sourceMode || '-'
+          )}</div>
         </div>
+        ${availableMethodsHtml}
       </section>
     `;
 })();

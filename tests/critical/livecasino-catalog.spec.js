@@ -8,6 +8,7 @@ const {
   markBlocked,
   waitForUiSettled,
 } = require('../helpers/gt-utils');
+const { pickBestAuthStatePath } = require('../helpers/auth-state');
 const { createWsCapture } = require('../helpers/ws-capture');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
@@ -24,12 +25,23 @@ const LIVE_GAMES_MIN = Math.max(
   1,
   Math.min(LIVE_GAMES_TARGET, Number.parseInt(process.env.PW_LIVE_GAMES_MIN || '1', 10) || 1)
 );
+const EXPLICIT_STORAGE_STATE_PATH = process.env.PW_STORAGE_STATE
+  ? path.resolve(String(process.env.PW_STORAGE_STATE))
+  : '';
+const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
+  ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
+  : '';
 const AUTH_STATE_CANDIDATES = [
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
+  path.join(PROJECT_ARTIFACTS_DIR, 'auth-state.json'),
+  EXPLICIT_STORAGE_STATE_PATH,
+  PROJECT_ROOT_STORAGE_STATE_PATH,
   path.join(process.cwd(), 'storageState.json'),
-];
+]
+  .filter(Boolean)
+  .filter((candidate, index, all) => all.indexOf(candidate) === index);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -48,10 +60,7 @@ function toSlug(value) {
 }
 
 function pickAuthStatePath() {
-  for (const filePath of AUTH_STATE_CANDIDATES) {
-    if (fs.existsSync(filePath)) return filePath;
-  }
-  return null;
+  return pickBestAuthStatePath(AUTH_STATE_CANDIDATES);
 }
 
 async function writeAndAttach(testInfo, name, payload) {
@@ -326,6 +335,7 @@ async function collectVisibleProviders(scope) {
 }
 
 async function toggleFirstProvider(scope) {
+  const page = typeof scope.page === 'function' ? scope.page() : scope;
   const rows = scope.locator(
     '.t-games-filters-block.providers .t-checkbox, .t-games-select__checkbox .t-checkbox'
   );
@@ -356,7 +366,7 @@ async function toggleFirstProvider(scope) {
       .trim();
 
     await row.click({ timeout: 5000 }).catch(() => null);
-    await waitForUiSettled(scope.page(), 900);
+    await waitForUiSettled(page, 900);
 
     const isChecked = await row
       .evaluate((node) => {

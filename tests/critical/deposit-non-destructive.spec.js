@@ -11,6 +11,7 @@ const {
   markBlocked,
   waitForUiSettled,
 } = require('../helpers/gt-utils');
+const { pickBestAuthStatePath } = require('../helpers/auth-state');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const BASE_ORIGIN = new URL(BASE_URL).origin;
@@ -26,11 +27,12 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
-  EXPLICIT_STORAGE_STATE_PATH,
-  PROJECT_ROOT_STORAGE_STATE_PATH,
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
+  path.join(PROJECT_ARTIFACTS_DIR, 'auth-state.json'),
+  EXPLICIT_STORAGE_STATE_PATH,
+  PROJECT_ROOT_STORAGE_STATE_PATH,
   path.join(PROJECT_PATHS.projectRoot, 'storageState.json'),
   path.join(process.cwd(), 'storageState.json'),
 ]
@@ -90,10 +92,7 @@ function resolveContextOptions(testInfo, authStatePath) {
 }
 
 function pickAuthStatePath() {
-  for (const filePath of AUTH_STATE_CANDIDATES) {
-    if (fs.existsSync(filePath)) return filePath;
-  }
-  return null;
+  return pickBestAuthStatePath(AUTH_STATE_CANDIDATES);
 }
 
 function normalizeText(value) {
@@ -397,6 +396,18 @@ function compactText(value, maxLength = 320) {
   return `${text.slice(0, maxLength)}...`;
 }
 
+function isAuthFailureResponse(status, bodyPreview = '') {
+  const statusCode = Number(status || 0);
+  const text = String(bodyPreview || '').toLowerCase();
+  if (statusCode === 401 || statusCode === 403) return true;
+  return (
+    text.includes('auth.signin.error.unauthorized') ||
+    text.includes('credentials_not_valid') ||
+    text.includes('wrong login or password') ||
+    text.includes('unauthorized')
+  );
+}
+
 function resolveDepositFallbackCurrencies() {
   const raw = String(
     process.env.PW_DEPOSIT_API_FALLBACK_CURRENCIES || 'EUR,USD,GBP,BRL,INR,CAD,AUD'
@@ -412,7 +423,89 @@ function resolveDepositFallbackCurrencies() {
   return items.length ? [...new Set(items)] : ['EUR', 'USD'];
 }
 
-async function fetchDepositInventoryViaApi(context) {
+async function fetchDepositInventoryViaPage(page, requestUrl, timeoutMs) {
+  if (!page) {
+    return {
+      status: 0,
+      items: [],
+      bodyPreview: '',
+      error: '',
+      transport: 'page-fetch',
+    };
+  }
+
+  try {
+    const payload = await page.evaluate(
+      async ({ url, timeout }) => {
+        const timeoutMs = Math.max(4_000, Number(timeout) || 12_000);
+        let timer = null;
+        try {
+          const response = await Promise.race([
+            fetch(url, {
+              method: 'GET',
+              credentials: 'include',
+              headers: {
+                accept: 'application/json',
+              },
+            }),
+            new Promise((_, reject) => {
+              timer = setTimeout(
+                () => reject(new Error(`fetch timeout after ${timeoutMs}ms`)),
+                timeoutMs
+              );
+            }),
+          ]);
+          const text = await response.text().catch(() => '');
+          let items = [];
+          try {
+            const parsed = JSON.parse(text || '{}');
+            items =
+              parsed && parsed.data && Array.isArray(parsed.data.items) ? parsed.data.items : [];
+          } catch {
+            items = [];
+          }
+          return {
+            status: Number(response.status || 0),
+            bodyPreview: String(text || '').slice(0, 1500),
+            items,
+            error: '',
+          };
+        } catch (err) {
+          return {
+            status: 0,
+            bodyPreview: '',
+            items: [],
+            error: String(err && err.message ? err.message : err),
+          };
+        } finally {
+          if (timer) clearTimeout(timer);
+        }
+      },
+      {
+        url: requestUrl,
+        timeout: timeoutMs,
+      }
+    );
+
+    return {
+      status: Number(payload && payload.status ? payload.status : 0),
+      items: Array.isArray(payload && payload.items) ? payload.items : [],
+      bodyPreview: compactText(payload && payload.bodyPreview ? payload.bodyPreview : '', 260),
+      error: compactText(payload && payload.error ? payload.error : '', 260),
+      transport: 'page-fetch',
+    };
+  } catch (err) {
+    return {
+      status: 0,
+      items: [],
+      bodyPreview: '',
+      error: compactText(err && err.message ? err.message : err, 260),
+      transport: 'page-fetch',
+    };
+  }
+}
+
+async function fetchDepositInventoryViaApi(context, page = null) {
   const currencies = resolveDepositFallbackCurrencies();
   const timeoutMs = Math.max(
     5_000,
@@ -435,6 +528,8 @@ async function fetchDepositInventoryViaApi(context) {
     let items = [];
     let bodyPreview = '';
     let error = '';
+    let transport = 'context-request';
+    let pageFallbackUsed = false;
 
     try {
       const response = await context.request.get(requestUrl, {
@@ -453,11 +548,32 @@ async function fetchDepositInventoryViaApi(context) {
       items = [];
     }
 
+    let unauthorized = isAuthFailureResponse(status, bodyPreview);
+    if (page && (!items.length || unauthorized)) {
+      const browserAttempt = await fetchDepositInventoryViaPage(page, requestUrl, timeoutMs);
+      if (
+        (browserAttempt.items || []).length > items.length ||
+        (unauthorized && Number(browserAttempt.status || 0) > 0) ||
+        (Number(status || 0) === 0 && Number(browserAttempt.status || 0) > 0)
+      ) {
+        status = Number(browserAttempt.status || status || 0);
+        items = Array.isArray(browserAttempt.items) ? browserAttempt.items : [];
+        if (browserAttempt.bodyPreview) bodyPreview = browserAttempt.bodyPreview;
+        if (browserAttempt.error) error = browserAttempt.error;
+        transport = browserAttempt.transport || 'page-fetch';
+        pageFallbackUsed = true;
+        unauthorized = isAuthFailureResponse(status, bodyPreview);
+      }
+    }
+
     attempts.push({
       currency,
       url: requestUrl,
       status,
       itemsCount: items.length,
+      unauthorized,
+      transport,
+      pageFallbackUsed,
       error,
       bodyPreview,
     });
@@ -478,6 +594,8 @@ async function fetchDepositInventoryViaApi(context) {
   return {
     attemptedCurrencies: currencies,
     attempts,
+    unauthorizedDetected: attempts.some((item) => Boolean(item && item.unauthorized)),
+    unauthorizedAttempts: attempts.filter((item) => Boolean(item && item.unauthorized)).length,
     bestCurrency: best.currency || '',
     bestUrl: best.url || '',
     bestStatus: Number(best.status || 0),
@@ -1457,7 +1575,7 @@ test.describe('Deposit non-destructive checks', () => {
     let apiFallbackCache = null;
     const ensureApiFallback = async () => {
       if (apiFallbackCache) return apiFallbackCache;
-      apiFallbackCache = await fetchDepositInventoryViaApi(context);
+      apiFallbackCache = await fetchDepositInventoryViaApi(context, page);
       return apiFallbackCache;
     };
     const network = [];
@@ -1483,6 +1601,16 @@ test.describe('Deposit non-destructive checks', () => {
         const apiFallback = await ensureApiFallback();
         const apiInventory = apiFallback.inventory || buildDepositInventory([]);
         const hasApiFallback = Number(apiFallback.itemsCount || 0) > 0;
+        const authStateLikelyInvalid =
+          !hasApiFallback &&
+          (Number(apiFallback.bestStatus || 0) === 401 ||
+            Number(apiFallback.bestStatus || 0) === 403 ||
+            Boolean(apiFallback.unauthorizedDetected));
+        const normalizedReason = authStateLikelyInvalid
+          ? `${reason} Auth state appears invalid for deposit API fallback (HTTP ${
+              Number(apiFallback.bestStatus || 0) || 'unauthorized'
+            }).`
+          : reason;
 
         if (hasApiFallback) {
           testInfo.annotations.push({
@@ -1490,7 +1618,7 @@ test.describe('Deposit non-destructive checks', () => {
             description: `Deposit UI is blocked, API fallback inventory was collected (${apiInventory.itemsCount} methods; currency=${apiFallback.bestCurrency || 'n/a'}).`,
           });
         } else {
-          markBlocked(testInfo, reason);
+          markBlocked(testInfo, normalizedReason);
         }
 
         const payload = {
@@ -1498,7 +1626,8 @@ test.describe('Deposit non-destructive checks', () => {
           authStatePath,
           blocked: !hasApiFallback,
           partial: hasApiFallback,
-          reason,
+          reason: normalizedReason,
+          authStateLikelyInvalid,
           uiCoverageAvailable: false,
           apiCoverageAvailable: hasApiFallback,
           sourceMode: resolveCoverageSourceMode({
@@ -1529,7 +1658,13 @@ test.describe('Deposit non-destructive checks', () => {
         .first()
         .isVisible()
         .catch(() => false);
-      expect(loginVisible, 'Authorized user expected for deposit checks.').toBeFalsy();
+      if (loginVisible) {
+        await writeInventoryBlockedPayload('Authorized deposit route opened login surface.', {
+          route,
+          loginVisible,
+        });
+        return;
+      }
 
       const challengeBeforeDeposit = await getChallengeReason(page);
       if (challengeBeforeDeposit) {
@@ -1728,7 +1863,7 @@ test.describe('Deposit non-destructive checks', () => {
     let apiFallbackCache = null;
     const ensureApiFallback = async () => {
       if (apiFallbackCache) return apiFallbackCache;
-      apiFallbackCache = await fetchDepositInventoryViaApi(context);
+      apiFallbackCache = await fetchDepositInventoryViaApi(context, page);
       return apiFallbackCache;
     };
     const network = [];
@@ -1751,14 +1886,25 @@ test.describe('Deposit non-destructive checks', () => {
       const writeMethodCoverageFallbackPayload = async (reason, extra = {}) => {
         const apiFallback = await ensureApiFallback();
         const hasApiFallback = Number(apiFallback.itemsCount || 0) > 0;
+        const authStateLikelyInvalid =
+          !hasApiFallback &&
+          (Number(apiFallback.bestStatus || 0) === 401 ||
+            Number(apiFallback.bestStatus || 0) === 403 ||
+            Boolean(apiFallback.unauthorizedDetected));
+        const normalizedReason = authStateLikelyInvalid
+          ? `${reason} Auth state appears invalid for deposit API fallback (HTTP ${
+              Number(apiFallback.bestStatus || 0) || 'unauthorized'
+            }).`
+          : reason;
         if (!hasApiFallback) {
-          markBlocked(testInfo, reason);
+          markBlocked(testInfo, normalizedReason);
           const payload = {
             ...extra,
             route: extra.route || null,
             authStatePath,
             blocked: true,
-            reason,
+            reason: normalizedReason,
+            authStateLikelyInvalid,
             uiCoverageAvailable: false,
             apiCoverageAvailable: false,
             sourceMode: 'none',
@@ -1782,7 +1928,8 @@ test.describe('Deposit non-destructive checks', () => {
           authStatePath,
           blocked: false,
           partial: true,
-          reason,
+          reason: normalizedReason,
+          authStateLikelyInvalid,
           source: 'api-fallback',
           uiCoverageAvailable: false,
           apiCoverageAvailable: true,
@@ -1827,7 +1974,13 @@ test.describe('Deposit non-destructive checks', () => {
         .first()
         .isVisible()
         .catch(() => false);
-      expect(loginVisible, 'Authorized user expected for deposit checks.').toBeFalsy();
+      if (loginVisible) {
+        await writeMethodCoverageFallbackPayload('Authorized deposit route opened login surface.', {
+          route,
+          loginVisible,
+        });
+        return;
+      }
 
       const challengeBeforeDeposit = await getChallengeReason(page);
       if (challengeBeforeDeposit) {

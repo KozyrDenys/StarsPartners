@@ -2,6 +2,9 @@
 
 const { spawnSync } = require('child_process');
 
+// Pact CLI is provided by @pact-foundation/pact-node in this project.
+require.resolve('@pact-foundation/pact-node/package.json');
+
 function required(name) {
   const value = String(process.env[name] || '').trim();
   if (!value) {

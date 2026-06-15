@@ -1,7 +1,7 @@
 const process = require('process');
 const Sentry = require('@sentry/node');
 const { trace } = require('@opentelemetry/api');
-const { Resource } = require('@opentelemetry/resources');
+const { resourceFromAttributes } = require('@opentelemetry/resources');
 const { BatchSpanProcessor } = require('@opentelemetry/sdk-trace-base');
 const { NodeTracerProvider } = require('@opentelemetry/sdk-trace-node');
 const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http');
@@ -46,33 +46,33 @@ function initOtel() {
   if (!endpoint) return false;
 
   const exporterUrl = endpoint.endsWith('/v1/traces') ? endpoint : `${endpoint}/v1/traces`;
+  const spanProcessor = new BatchSpanProcessor(
+    new OTLPTraceExporter({
+      url: exporterUrl,
+      headers: process.env.OTEL_EXPORTER_OTLP_HEADERS
+        ? Object.fromEntries(
+            String(process.env.OTEL_EXPORTER_OTLP_HEADERS || '')
+              .split(',')
+              .map((entry) => entry.trim())
+              .filter(Boolean)
+              .map((entry) => {
+                const idx = entry.indexOf('=');
+                if (idx === -1) return [entry, ''];
+                return [entry.slice(0, idx).trim(), entry.slice(idx + 1).trim()];
+              })
+          )
+        : undefined,
+    })
+  );
+
   tracerProvider = new NodeTracerProvider({
-    resource: new Resource({
+    resource: resourceFromAttributes({
       'service.name': resolveServiceName(),
       'service.namespace': 'qa',
       'deployment.environment': process.env.NODE_ENV || 'qa',
     }),
+    spanProcessors: [spanProcessor],
   });
-  tracerProvider.addSpanProcessor(
-    new BatchSpanProcessor(
-      new OTLPTraceExporter({
-        url: exporterUrl,
-        headers: process.env.OTEL_EXPORTER_OTLP_HEADERS
-          ? Object.fromEntries(
-              String(process.env.OTEL_EXPORTER_OTLP_HEADERS || '')
-                .split(',')
-                .map((entry) => entry.trim())
-                .filter(Boolean)
-                .map((entry) => {
-                  const idx = entry.indexOf('=');
-                  if (idx === -1) return [entry, ''];
-                  return [entry.slice(0, idx).trim(), entry.slice(idx + 1).trim()];
-                })
-            )
-          : undefined,
-      })
-    )
-  );
   tracerProvider.register();
   return true;
 }

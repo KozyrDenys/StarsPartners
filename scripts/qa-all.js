@@ -17,6 +17,14 @@ const includeVisualSuites =
   process.env.PW_VISUAL_REQUIRED === '1' ||
   process.env.PW_INCLUDE_VISUAL === '1' ||
   (process.env.PW_INCLUDE_VISUAL !== '0' && isNightlyRoute);
+const runProfile = String(process.env.PW_RUN_PROFILE || 'full')
+  .trim()
+  .toLowerCase();
+const normalizedRunProfile = ['full', 'core', 'providers'].includes(runProfile)
+  ? runProfile
+  : 'full';
+const providersOnlyPhase =
+  process.env.PW_CASINO_PROVIDERS_ONLY === '1' || normalizedRunProfile === 'providers';
 
 const orderedSuites = [
   {
@@ -73,11 +81,12 @@ const orderedSuites = [
   },
   {
     key: 'casino',
-    label: 'Casino catalog + providers + favorites/history',
-    tests: [
-      'tests/critical/casino-catalog.spec.js',
-      'tests/critical/casino-providers-real.spec.js',
-    ],
+    label: providersOnlyPhase
+      ? 'Casino providers launch + history linkage'
+      : 'Casino catalog + providers + favorites/history',
+    tests: providersOnlyPhase
+      ? ['tests/critical/casino-providers-real.spec.js']
+      : ['tests/critical/casino-catalog.spec.js', 'tests/critical/casino-providers-real.spec.js'],
   },
   {
     key: 'livecasino',
@@ -142,7 +151,19 @@ function parseSuiteSelection(value) {
   );
 }
 
-const suitesOnly = parseSuiteSelection(process.env.PW_SUITES_ONLY || '');
+const profileSuitesOnly = (() => {
+  if (normalizedRunProfile === 'core') {
+    return parseSuiteSelection(
+      'home,registration,auth,profile,deposit,withdraw,sidebar,sports,casino,livecasino,security,contracts'
+    );
+  }
+  if (normalizedRunProfile === 'providers') {
+    return parseSuiteSelection('registration,auth,casino');
+  }
+  return new Set();
+})();
+const envSuitesOnly = parseSuiteSelection(process.env.PW_SUITES_ONLY || '');
+const suitesOnly = envSuitesOnly.size > 0 ? envSuitesOnly : profileSuitesOnly;
 const suitesSkip = parseSuiteSelection(process.env.PW_SUITES_SKIP || '');
 const selectedOrderedSuites = orderedSuites.filter((suite) => {
   const key = String(suite && suite.key ? suite.key : '')
@@ -160,6 +181,14 @@ const destructiveTests = [
 ];
 const precheckTests = ['tests/smoke/gt-precheck.spec.js'];
 const projectPaths = resolveProjectPaths({ cwd: process.cwd() });
+const matrixProfileDir = isMobileMatrix(process.env.PW_PROJECT_MATRIX || 'desktop')
+  ? 'mobile'
+  : 'desktop';
+const defaultSaveStateProfileDir = path.join(
+  projectPaths.projectRoot,
+  '.pw-profile',
+  matrixProfileDir
+);
 const qaRunId = String(
   process.env.QA_RUN_ID ||
     `run-${new Date().toISOString().replace(/[:.]/g, '-')}-${Math.random()
@@ -235,6 +264,9 @@ const qaPathEnv = {
   QA_ANALYZE_DIR: projectPaths.analyzeDir,
   QA_RUN_ID: qaRunId,
   PW_STORAGE_STATE: storageStatePath,
+  PW_RUN_PROFILE: normalizedRunProfile,
+  PW_CASINO_PROVIDERS_ONLY: providersOnlyPhase ? '1' : '0',
+  PW_SAVE_STATE_PROFILE_DIR: process.env.PW_SAVE_STATE_PROFILE_DIR || defaultSaveStateProfileDir,
 };
 
 const crashpadHints = [
@@ -254,6 +286,13 @@ const timeoutHints = [
   /Test timeout of \d+ms exceeded/i,
   /expect\([^)]*\)\.to(BeVisible|BeHidden|BeEnabled|HaveURL)\(\) failed by timeout/i,
 ];
+const providerInfraHints = [
+  /cloudflare|turnstile|captcha|challenge|waf|cdn-cgi|__cf_chl|just a moment|security verification/i,
+  /internet connection appears to be offline|net::err_internet_disconnected|net::err_network_changed/i,
+  /net::err_failed|net::err_timed_out|socket hang up|watchdog timed out/i,
+  /navigation failed|temporarily unavailable|cancelled\/aborted before bootstrap/i,
+];
+const infraOnlyKpiCheckIds = new Set(['blocked-ratio', 'infra-blocked-ratio', 'provider-passed']);
 
 const cloudflareHints = [
   /PRECHECK_BLOCKED/i,
@@ -279,6 +318,38 @@ const mobileStabilizeRerun = process.env.PW_MOBILE_STABILIZE_RERUN !== '0';
 const suitesProjectMatrix = process.env.PW_PROJECT_MATRIX || 'desktop';
 const precheckProjectMatrix = process.env.PW_PRECHECK_PROJECT_MATRIX || 'desktop';
 const runDoctorPreflight = process.env.QA_PREFLIGHT_DOCTOR !== '0';
+const strictValidRun = process.env.PW_VALID_RUN_STRICT === '1';
+const abortOnWafGuard = process.env.PW_ABORT_ON_WAF_GUARD !== '0';
+const suiteRefreshCooldownMs = Math.max(
+  0,
+  Number.parseInt(process.env.PW_SUITE_REFRESH_COOLDOWN_MS || '120000', 10) || 120_000
+);
+const suiteRefreshMax = Math.max(
+  0,
+  (() => {
+    const parsed = Number.parseInt(process.env.PW_SUITE_REFRESH_MAX || '3', 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 3;
+  })()
+);
+const suiteRefreshPhases = (() => {
+  const fallback =
+    'auth,profile,deposit,sidebar,sports,casino,livecasino,security,contracts,nightlyextras,a11y,visual';
+  const set = parseSuiteSelection(process.env.PW_SUITE_REFRESH_PHASES || fallback);
+  return set.size > 0 ? set : parseSuiteSelection(fallback);
+})();
+const challengeRerunMax = Math.max(
+  0,
+  Number.parseInt(process.env.PW_CHALLENGE_RERUNS || '0', 10) || 0
+);
+const challengeRerunBackoffMs = Math.max(
+  0,
+  Number.parseInt(process.env.PW_CHALLENGE_RERUN_BACKOFF_MS || '2500', 10) || 2500
+);
+const challengeRerunPhases = (() => {
+  const fallback = 'auth,profile,deposit,sidebar,sports,casino,livecasino,security,contracts';
+  const set = parseSuiteSelection(process.env.PW_CHALLENGE_RERUN_PHASES || fallback);
+  return set.size > 0 ? set : parseSuiteSelection(fallback);
+})();
 const authStateFreshnessSec = (() => {
   const raw = Number.parseInt(process.env.PW_AUTH_STATE_MAX_AGE_SEC || '14400', 10);
   if (!Number.isFinite(raw) || raw <= 0) return 14400;
@@ -302,8 +373,11 @@ const kpiThresholds = {
     return raw;
   })(),
   requireDepositUiWhenApiPresent: process.env.PW_KPI_REQUIRE_DEPOSIT_UI_WITH_API !== '0',
+  requireDepositCoverage: process.env.PW_KPI_REQUIRE_DEPOSIT_COVERAGE === '1' || strictValidRun,
+  requireProviderCoverage: process.env.PW_KPI_REQUIRE_PROVIDER_COVERAGE === '1' || strictValidRun,
+  requireCleanPrecheck: process.env.PW_KPI_REQUIRE_CLEAN_PRECHECK === '1' || strictValidRun,
 };
-const kpiWafGraceEnabled = process.env.PW_KPI_WAF_GRACE !== '0';
+const kpiWafGraceEnabled = !strictValidRun && process.env.PW_KPI_WAF_GRACE !== '0';
 const kpiWafGraceMinBlockedRatio = (() => {
   const raw = Number.parseFloat(process.env.PW_KPI_WAF_GRACE_MIN_BLOCKED_RATIO || '0.70');
   if (!Number.isFinite(raw) || raw <= 0) return 0.7;
@@ -366,6 +440,23 @@ function isProviderRowChallengeBlocked(row) {
   return isChallengeLikeText(blob);
 }
 
+function isProviderRowInfraBlocked(row) {
+  if (!row || typeof row !== 'object') return false;
+  if (String(row.status || '').toLowerCase() !== 'blocked') return false;
+  const blob = [
+    row.reason,
+    row.note,
+    row.outcome,
+    row.uiBlockedReason,
+    ...(Array.isArray(row.modes)
+      ? row.modes.flatMap((mode) => [mode && mode.reason, mode && mode.uiBlockedReason])
+      : []),
+  ]
+    .map((item) => String(item || ''))
+    .join(' ');
+  return providerInfraHints.some((re) => re.test(blob)) || isChallengeLikeText(blob);
+}
+
 function browserEnv(browser) {
   if (browser === 'webkit') {
     return {
@@ -394,6 +485,10 @@ function buildPlaywrightArgs(tests, options = {}) {
   }
   if (runHeaded) args.push('--headed');
   return args;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function runCommand(bin, args, envOverride = {}) {
@@ -432,6 +527,32 @@ function runPlaywright(args, envOverride = {}) {
 
 function runNodeScript(scriptPath, scriptArgs = [], envOverride = {}) {
   return runCommand('node', [scriptPath, ...scriptArgs], envOverride);
+}
+
+function wafGuardArtifactPath(label) {
+  const safeLabel = String(label || 'guard')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return path.join(projectPaths.artifactsDir, 'waf-guards', `${safeLabel || 'guard'}.json`);
+}
+
+async function runWafGuard({ label, baseUrl, routes = [], depositApi = false, browser = '' }) {
+  const guardLabel = String(label || 'waf-guard');
+  const outPath = wafGuardArtifactPath(guardLabel);
+  const args = [
+    `--label=${guardLabel}`,
+    `--base-url=${baseUrl}`,
+    `--routes=${routes.length ? routes.join(',') : '/,/casino/'}`,
+    `--out=${outPath}`,
+    `--storage-state=${storageStatePath}`,
+  ];
+  if (depositApi) args.push('--deposit-api=1');
+  if (browser) args.push(`--browser=${browser}`);
+
+  console.log(`\n> node scripts/qa-waf-guard.js ${args.join(' ')}`);
+  const result = await runNodeScript(path.join('scripts', 'qa-waf-guard.js'), args);
+  return { ...result, outPath };
 }
 
 function writeJson(filePath, payload) {
@@ -508,6 +629,59 @@ function listAuthStateCandidates() {
     .filter((candidate, index, all) => all.indexOf(candidate) === index);
 }
 
+function compareAuthStateEntries(left, right) {
+  const leftHealthy = Boolean(
+    left && left.exists && left.fresh && left.hasSessionArtifacts && !left.parseError
+  );
+  const rightHealthy = Boolean(
+    right && right.exists && right.fresh && right.hasSessionArtifacts && !right.parseError
+  );
+  if (leftHealthy !== rightHealthy) return leftHealthy ? -1 : 1;
+
+  const leftFreshWithSession = Boolean(
+    left && left.exists && left.fresh && left.hasSessionArtifacts
+  );
+  const rightFreshWithSession = Boolean(
+    right && right.exists && right.fresh && right.hasSessionArtifacts
+  );
+  if (leftFreshWithSession !== rightFreshWithSession) return leftFreshWithSession ? -1 : 1;
+
+  const leftFresh = Boolean(left && left.exists && left.fresh);
+  const rightFresh = Boolean(right && right.exists && right.fresh);
+  if (leftFresh !== rightFresh) return leftFresh ? -1 : 1;
+
+  const leftHasSession = Boolean(left && left.exists && left.hasSessionArtifacts);
+  const rightHasSession = Boolean(right && right.exists && right.hasSessionArtifacts);
+  if (leftHasSession !== rightHasSession) return leftHasSession ? -1 : 1;
+
+  const leftParseError = Boolean(left && left.parseError);
+  const rightParseError = Boolean(right && right.parseError);
+  if (leftParseError !== rightParseError) return leftParseError ? 1 : -1;
+
+  const leftAge = Number.isFinite(left && left.ageSec)
+    ? Number(left.ageSec)
+    : Number.MAX_SAFE_INTEGER;
+  const rightAge = Number.isFinite(right && right.ageSec)
+    ? Number(right.ageSec)
+    : Number.MAX_SAFE_INTEGER;
+  if (leftAge !== rightAge) return leftAge - rightAge;
+
+  const leftSize = Number.isFinite(left && left.sizeBytes) ? Number(left.sizeBytes) : 0;
+  const rightSize = Number.isFinite(right && right.sizeBytes) ? Number(right.sizeBytes) : 0;
+  if (leftSize !== rightSize) return rightSize - leftSize;
+
+  return String(left && left.path ? left.path : '').localeCompare(
+    String(right && right.path ? right.path : '')
+  );
+}
+
+function selectBestAuthStateEntry(entries) {
+  if (!Array.isArray(entries) || entries.length === 0) return null;
+  const existing = entries.filter((item) => item && item.exists);
+  if (existing.length === 0) return null;
+  return [...existing].sort(compareAuthStateEntries)[0] || null;
+}
+
 function runSaveState(baseUrl, options = {}) {
   return new Promise((resolve) => {
     const warmupRoutes = Array.isArray(options.warmupRoutes)
@@ -523,6 +697,10 @@ function runSaveState(baseUrl, options = {}) {
       ...qaPathEnv,
       PW_USE_CHROME_CHANNEL: '1',
       PW_SAVE_STATE_TIMEOUT: String(saveStateTimeoutSec),
+      PW_SAVE_STATE_PERSISTENT:
+        process.env.PW_SAVE_STATE_PERSISTENT || (!process.env.CI ? '1' : '0'),
+      PW_SAVE_STATE_PROFILE_DIR:
+        process.env.PW_SAVE_STATE_PROFILE_DIR || defaultSaveStateProfileDir,
       PW_SAVE_STATE_AUTO_BYPASS: manualMode ? '0' : '1',
       PW_SAVE_STATE_VIEWPORT:
         process.env.PW_SAVE_STATE_VIEWPORT || (mobileMatrixRun ? '390x844' : '1365x900'),
@@ -589,14 +767,7 @@ async function ensureAuthStateHealth({ baseUrl, phase = 'precheck' }) {
   let entries = candidates.map((candidate) =>
     inspectStorageStateFile(candidate, authStateFreshnessSec)
   );
-  const primary = entries.find(
-    (item) => path.resolve(item.path) === path.resolve(storageStatePath)
-  );
-  let selected =
-    primary ||
-    entries.find((item) => item.exists && item.fresh && item.hasSessionArtifacts) ||
-    entries.find((item) => item.exists) ||
-    null;
+  let selected = selectBestAuthStateEntry(entries);
 
   let refreshTriggered = false;
   let refreshReason = '';
@@ -625,11 +796,7 @@ async function ensureAuthStateHealth({ baseUrl, phase = 'precheck' }) {
       entries = candidates.map((candidate) =>
         inspectStorageStateFile(candidate, authStateFreshnessSec)
       );
-      selected =
-        entries.find((item) => path.resolve(item.path) === path.resolve(storageStatePath)) ||
-        entries.find((item) => item.exists && item.fresh && item.hasSessionArtifacts) ||
-        entries.find((item) => item.exists) ||
-        null;
+      selected = selectBestAuthStateEntry(entries);
       console.log(`\n✅ ${phase}: storageState refreshed for auth-state health.`);
     } else {
       console.log(`\n⚠️  ${phase}: storageState refresh failed during auth-state health check.`);
@@ -742,6 +909,28 @@ function summarizePhaseReport(filePath) {
     Number(stats.flaky || 0) +
     Number(stats.skipped || 0);
   const failed = tests.filter((item) => failureStatuses.has(String(item.status || ''))).length;
+  const failedInfraBlockedSignals = tests.filter((item) => {
+    if (!failureStatuses.has(String(item.status || ''))) return false;
+    return (item.annotations || []).some(
+      (ann) => String(ann.type || '').toLowerCase() === 'infra-blocked'
+    );
+  }).length;
+  const failedProductBlockedSignals = tests.filter((item) => {
+    if (!failureStatuses.has(String(item.status || ''))) return false;
+    return (item.annotations || []).some(
+      (ann) => String(ann.type || '').toLowerCase() === 'product-blocked'
+    );
+  }).length;
+  const failedUnclassifiedSignals = tests.filter((item) => {
+    if (!failureStatuses.has(String(item.status || ''))) return false;
+    const hasInfra = (item.annotations || []).some(
+      (ann) => String(ann.type || '').toLowerCase() === 'infra-blocked'
+    );
+    const hasProduct = (item.annotations || []).some(
+      (ann) => String(ann.type || '').toLowerCase() === 'product-blocked'
+    );
+    return !hasInfra && !hasProduct;
+  }).length;
   const blockedSignals = tests.filter((item) =>
     (item.annotations || []).some((ann) => String(ann.type || '').toLowerCase() === 'blocked')
   ).length;
@@ -766,6 +955,9 @@ function summarizePhaseReport(filePath) {
     total,
     passed: Number(stats.expected || 0),
     failed,
+    failedInfraBlockedSignals,
+    failedProductBlockedSignals,
+    failedUnclassifiedSignals,
     skipped: Number(stats.skipped || 0),
     flaky: Number(stats.flaky || 0),
     blockedSignals,
@@ -838,6 +1030,9 @@ function collectRunSummary() {
     total: 0,
     passed: 0,
     failed: 0,
+    failedInfraBlockedSignals: 0,
+    failedProductBlockedSignals: 0,
+    failedUnclassifiedSignals: 0,
     skipped: 0,
     flaky: 0,
     blockedSignals: 0,
@@ -853,6 +1048,9 @@ function collectRunSummary() {
     totals.total += item.total;
     totals.passed += item.passed;
     totals.failed += item.failed;
+    totals.failedInfraBlockedSignals += Number(item.failedInfraBlockedSignals || 0);
+    totals.failedProductBlockedSignals += Number(item.failedProductBlockedSignals || 0);
+    totals.failedUnclassifiedSignals += Number(item.failedUnclassifiedSignals || 0);
     totals.skipped += item.skipped;
     totals.flaky += item.flaky;
     totals.blockedSignals += item.blockedSignals;
@@ -870,6 +1068,9 @@ function evaluateRunKpis(summary) {
   const phases = (summary && summary.phases) || {};
   const totals = (summary && summary.totals) || {};
   const checks = [];
+  const selectedSuiteKeys = new Set(
+    selectedOrderedSuites.map((suite) => String(suite && suite.key ? suite.key : '').toLowerCase())
+  );
   const blockedRatio =
     Number(totals.total || 0) > 0
       ? Number(totals.blockedSignals || 0) / Number(totals.total || 1)
@@ -878,16 +1079,51 @@ function evaluateRunKpis(summary) {
     Number(totals.total || 0) > 0
       ? Number(totals.infraBlockedSignals || 0) / Number(totals.total || 1)
       : 0;
+  const providerSuiteSelected = selectedSuiteKeys.has('casino');
+  const providerMatrix = readJson(providerMatrixArtifactPath);
+  const providerResults = Array.isArray(providerMatrix && providerMatrix.results)
+    ? providerMatrix.results
+    : [];
+  const providerLaunchCapableRows = providerResults.filter(
+    (item) => String(item && item.outcome).toLowerCase() !== 'provider-absent'
+  );
+  const providerLaunchPassed = Number(
+    providerLaunchCapableRows.filter((item) => {
+      const outcome = String(item && item.outcome ? item.outcome : '').toLowerCase();
+      return outcome === 'passed-strong' || outcome === 'passed-weak-surface';
+    }).length
+  );
+  const providerPassed = Number(
+    providerLaunchPassed ||
+      (providerMatrix && providerMatrix.summary
+        ? Number(providerMatrix.summary.passedStrong || 0) +
+          Number(providerMatrix.summary.passedWeakSurface || 0)
+        : 0) ||
+      0
+  );
+  const providerApplicable =
+    providerSuiteSelected && (providerResults.length > 0 || Boolean(phases.casino));
+  const providerAllBlockedByChallenge =
+    providerLaunchCapableRows.length > 0 &&
+    providerLaunchCapableRows.every((row) => isProviderRowChallengeBlocked(row));
+  const providerAllBlockedByInfra =
+    providerLaunchCapableRows.length > 0 &&
+    providerLaunchCapableRows.every((row) => isProviderRowInfraBlocked(row));
+  const providerWafDominated =
+    providerApplicable && (providerAllBlockedByInfra || providerAllBlockedByChallenge);
   const precheckCloudflareSignal = phaseHasCloudflareSignal('precheck');
   const wafGraceApplied =
     kpiWafGraceEnabled &&
     (precheckCloudflareSignal ||
+      providerWafDominated ||
       (blockedRatio >= kpiWafGraceMinBlockedRatio &&
         infraBlockedRatio >= kpiWafGraceMinInfraRatio));
   const wafGraceReason = wafGraceApplied
     ? precheckCloudflareSignal
       ? 'Precheck contains Cloudflare/WAF challenge signals.'
-      : `Blocked ratios exceed WAF grace thresholds (blocked=${blockedRatio.toFixed(3)}, infra=${infraBlockedRatio.toFixed(3)}).`
+      : providerWafDominated
+        ? 'All provider real-launch rows are Cloudflare/WAF infra-blocked.'
+        : `Blocked ratios exceed WAF grace thresholds (blocked=${blockedRatio.toFixed(3)}, infra=${infraBlockedRatio.toFixed(3)}).`
     : '';
 
   const pushCheck = ({ id, label, actual, threshold, passed, applicable = true, detail = '' }) => {
@@ -901,6 +1137,16 @@ function evaluateRunKpis(summary) {
       detail,
     });
   };
+
+  pushCheck({
+    id: 'precheck-waf-clean',
+    label: 'Precheck has no Cloudflare/WAF signal',
+    actual: precheckCloudflareSignal ? 1 : 0,
+    threshold: 0,
+    passed: !precheckCloudflareSignal,
+    applicable: kpiThresholds.requireCleanPrecheck,
+    detail: precheckCloudflareSignal ? 'precheck contains Cloudflare/WAF signal' : 'clean',
+  });
 
   pushCheck({
     id: 'blocked-ratio',
@@ -926,55 +1172,93 @@ function evaluateRunKpis(summary) {
       (wafGraceApplied ? ' (waived due to Cloudflare/WAF-dominated run)' : ''),
   });
 
-  const providerMatrix = readJson(providerMatrixArtifactPath);
-  const providerResults = Array.isArray(providerMatrix && providerMatrix.results)
-    ? providerMatrix.results
-    : [];
-  const providerPassed = Number(
-    (providerMatrix && providerMatrix.summary && providerMatrix.summary.passed) ||
-      providerResults.filter((item) => String(item && item.status) === 'passed').length ||
-      0
-  );
-  const providerApplicable = providerResults.length > 0 || Boolean(phases.casino);
-  const providerAllBlockedByChallenge =
-    providerResults.length > 0 &&
-    providerResults.every((row) => isProviderRowChallengeBlocked(row));
   pushCheck({
     id: 'provider-passed',
     label: 'Provider real-launch passed count',
     actual: providerPassed,
     threshold: kpiThresholds.minProviderPassed,
-    passed: providerPassed >= kpiThresholds.minProviderPassed,
-    applicable: providerApplicable && !(wafGraceApplied && providerAllBlockedByChallenge),
-    detail: providerResults.length
-      ? `${providerPassed}/${providerResults.length}` +
-        (wafGraceApplied && providerAllBlockedByChallenge
-          ? ' (waived: all provider rows are Cloudflare/WAF blocked)'
-          : '')
+    passed:
+      providerPassed >= kpiThresholds.minProviderPassed ||
+      (wafGraceApplied && (providerAllBlockedByInfra || providerAllBlockedByChallenge)),
+    applicable:
+      providerApplicable && (kpiThresholds.requireProviderCoverage || !providerAllBlockedByInfra),
+    detail: providerLaunchCapableRows.length
+      ? `${providerPassed}/${providerLaunchCapableRows.length}` +
+        (providerAllBlockedByInfra
+          ? ' (waived: all provider rows are infra-blocked)'
+          : wafGraceApplied && providerAllBlockedByChallenge
+            ? ' (waived: all provider rows are Cloudflare/WAF blocked)'
+            : '')
       : `provider-results=${providerResults.length}`,
   });
 
   const depositInventory = readJson(depositInventoryArtifactPath);
+  const depositMethods = readJson(depositMethodArtifactPath);
   const depositApiItems = Number(
-    depositInventory && depositInventory.apiInventory && depositInventory.apiInventory.itemsCount
-      ? depositInventory.apiInventory.itemsCount
-      : 0
+    (depositInventory &&
+      depositInventory.apiInventory &&
+      depositInventory.apiInventory.itemsCount) ||
+      (depositInventory &&
+        depositInventory.apiFallback &&
+        depositInventory.apiFallback.inventory &&
+        depositInventory.apiFallback.inventory.itemsCount) ||
+      (depositMethods &&
+        depositMethods.apiFallback &&
+        depositMethods.apiFallback.inventory &&
+        depositMethods.apiFallback.inventory.itemsCount) ||
+      (depositMethods && depositMethods.apiFallback && depositMethods.apiFallback.itemsCount) ||
+      0
   );
   const depositUiTiles = Number(
     depositInventory && depositInventory.uiInventory && depositInventory.uiInventory.totalTiles
       ? depositInventory.uiInventory.totalTiles
       : 0
   );
-  const depositBlocked = Boolean(depositInventory && depositInventory.blocked);
+  const depositBlocked = Boolean(
+    (depositInventory && depositInventory.blocked) || (depositMethods && depositMethods.blocked)
+  );
+  const depositApiOnlyCoverage = Boolean(
+    (depositInventory &&
+      (depositInventory.partial === true || depositInventory.sourceMode === 'api-only')) ||
+    (depositMethods &&
+      (depositMethods.partial === true || depositMethods.sourceMode === 'api-only'))
+  );
   const depositApplicable = kpiThresholds.requireDepositUiWhenApiPresent && depositApiItems > 0;
   pushCheck({
     id: 'deposit-ui-vs-api',
     label: 'Deposit UI coverage present when API has methods',
     actual: depositUiTiles,
     threshold: depositApiItems > 0 ? 1 : 0,
-    passed: depositBlocked ? true : depositUiTiles > 0,
+    passed: depositBlocked || depositApiOnlyCoverage ? true : depositUiTiles > 0,
     applicable: depositApplicable,
-    detail: `apiItems=${depositApiItems}, uiTiles=${depositUiTiles}, blocked=${depositBlocked}`,
+    detail: `apiItems=${depositApiItems}, uiTiles=${depositUiTiles}, blocked=${depositBlocked}, apiOnly=${depositApiOnlyCoverage}`,
+  });
+
+  const depositCoverageApplicable =
+    kpiThresholds.requireDepositCoverage && selectedSuiteKeys.has('deposit');
+  pushCheck({
+    id: 'deposit-methods-discovered',
+    label: 'Deposit methods discovered',
+    actual: depositApiItems,
+    threshold: 1,
+    passed: (!depositBlocked && depositApiItems > 0) || (wafGraceApplied && depositBlocked),
+    applicable: depositCoverageApplicable,
+    detail:
+      `apiItems=${depositApiItems}, uiTiles=${depositUiTiles}, blocked=${depositBlocked}` +
+      (wafGraceApplied && depositBlocked ? ' (waived due to WAF/auth diagnostic mode)' : ''),
+  });
+
+  pushCheck({
+    id: 'deposit-not-blocked',
+    label: 'Deposit surface is not WAF/auth blocked',
+    actual: depositBlocked ? 1 : 0,
+    threshold: 0,
+    passed: !depositBlocked || (wafGraceApplied && depositBlocked),
+    applicable: depositCoverageApplicable,
+    detail:
+      (depositInventory && depositInventory.reason) ||
+      (depositMethods && depositMethods.reason) ||
+      `blocked=${depositBlocked}`,
   });
 
   if (process.env.PW_VISUAL_REQUIRED === '1') {
@@ -1027,6 +1311,7 @@ function evaluateRunKpis(summary) {
       wafGraceReason,
       precheckCloudflareSignal,
       providerAllBlockedByChallenge,
+      providerAllBlockedByInfra,
       minBlockedRatio: kpiWafGraceMinBlockedRatio,
       minInfraRatio: kpiWafGraceMinInfraRatio,
     },
@@ -1036,6 +1321,71 @@ function evaluateRunKpis(summary) {
   };
   writeJson(kpiValidationPath, payload);
   return payload;
+}
+
+function evaluateRunFailureClass({ summary, kpi, firstFailedCode }) {
+  const totals = (summary && summary.totals) || {};
+  const totalFailed = Number(totals.failed || 0);
+  const failedInfraBlocked = Number(totals.failedInfraBlockedSignals || 0);
+  const failedProductBlocked = Number(totals.failedProductBlockedSignals || 0);
+  const failedUnclassified = Number(totals.failedUnclassifiedSignals || 0);
+  const infraOnlyTestFailures =
+    totalFailed > 0 &&
+    failedInfraBlocked === totalFailed &&
+    failedProductBlocked === 0 &&
+    failedUnclassified === 0;
+
+  const failedChecks = Array.isArray(kpi && kpi.failedChecks) ? kpi.failedChecks : [];
+  const infraOnlyKpiFailures =
+    failedChecks.length > 0 &&
+    failedChecks.every((item) => infraOnlyKpiCheckIds.has(String(item && item.id ? item.id : '')));
+
+  const hasTestExitFailure = Number(firstFailedCode || 0) !== 0;
+  const infraBlockedRun =
+    (hasTestExitFailure && infraOnlyTestFailures) ||
+    (!hasTestExitFailure && !kpi.valid && infraOnlyKpiFailures);
+
+  return {
+    totalFailed,
+    failedInfraBlocked,
+    failedProductBlocked,
+    failedUnclassified,
+    infraOnlyTestFailures,
+    infraOnlyKpiFailures,
+    infraBlockedRun,
+  };
+}
+
+function shouldTreatInfraBlockedAsPass() {
+  if (Object.prototype.hasOwnProperty.call(process.env, 'PW_INFRA_BLOCK_AS_PASS')) {
+    return process.env.PW_INFRA_BLOCK_AS_PASS !== '0';
+  }
+  return process.env.CI ? false : true;
+}
+
+function resolveFinalRunStatus({
+  hasSystemFailure,
+  hasFailingOutcome,
+  infraBlockedRun,
+  infraBlockedAsPass,
+  kpi,
+}) {
+  if (hasSystemFailure) return 'FAILED';
+  if (!hasFailingOutcome) return infraBlockedRun ? 'INFRA_BLOCKED' : 'PASSED';
+  if (infraBlockedRun && infraBlockedAsPass) return 'INFRA_BLOCKED';
+
+  const failedChecks = Array.isArray(kpi && kpi.failedChecks) ? kpi.failedChecks : [];
+  const wafSignals = [
+    kpi && kpi.waivers && kpi.waivers.wafGraceApplied,
+    kpi && kpi.waivers && kpi.waivers.precheckCloudflareSignal,
+    failedChecks.some((item) =>
+      /waf|cloudflare|challenge|blocked-ratio|infra-blocked|precheck-waf/i.test(
+        `${item && item.id ? item.id : ''} ${item && item.detail ? item.detail : ''}`
+      )
+    ),
+  ].some(Boolean);
+
+  return wafSignals ? 'WAF_DEGRADED' : 'INVALID_RUN';
 }
 
 function hostSlugFromBaseUrl(baseUrl) {
@@ -1086,7 +1436,7 @@ function collectRunArtifactIndex(baseUrl) {
   };
 }
 
-function captureRunHistory({ baseUrl, runStatus, summary, kpi, authStateHealth }) {
+function captureRunHistory({ baseUrl, runStatus, summary, kpi, authStateHealth, failureClass }) {
   const runSummary = summary || collectRunSummary();
   const phases = runSummary.phases || {};
   const totals = runSummary.totals || {};
@@ -1101,6 +1451,7 @@ function captureRunHistory({ baseUrl, runStatus, summary, kpi, authStateHealth }
     phases,
     totals,
     kpi: kpi || null,
+    failureClass: failureClass || null,
     authStateHealth: authStateHealth || readJson(authStateHealthPath) || null,
     artifacts: collectRunArtifactIndex(baseUrl),
   };
@@ -1256,14 +1607,88 @@ async function runSuiteWithRetry({
   const baseUrl = process.env.BASE_URL || 'https://gt.bet/';
   let activeBrowser = 'chromium';
   let authStateHealthLatest = null;
+  let headedLoginSucceeded = false;
   fs.mkdirSync(projectPaths.projectRoot, { recursive: true });
   fs.mkdirSync(projectPaths.artifactsDir, { recursive: true });
   fs.mkdirSync(projectPaths.testResultsDir, { recursive: true });
   fs.mkdirSync(projectPaths.autotestReportDir, { recursive: true });
   fs.mkdirSync(projectPaths.analyzeDir, { recursive: true });
   console.log(`\nℹ️  Project workspace: ${projectPaths.projectRoot}`);
+  console.log(`ℹ️  Run profile: ${normalizedRunProfile}`);
+  if (providersOnlyPhase) {
+    console.log('ℹ️  Casino suite is providers-only for this run.');
+  }
   console.log(`\nℹ️  Playwright project matrix for ordered suites: ${suitesProjectMatrix}`);
   console.log(`ℹ️  Playwright project matrix for precheck: ${precheckProjectMatrix}`);
+  if (process.env.QA_REPORT_ONLY === '1') {
+    console.log('\nℹ️  QA report-only mode: recalculating KPI/report from existing artifacts.');
+    const summary = collectRunSummary();
+    const kpi = evaluateRunKpis(summary);
+    if (kpi && kpi.waivers && kpi.waivers.wafGraceApplied) {
+      console.log(
+        `\nℹ️  KPI WAF grace applied: ${kpi.waivers.wafGraceReason || 'Cloudflare/WAF-dominated run.'}`
+      );
+    }
+    if (!kpi.valid) {
+      console.log('\n❌ KPI validation failed. Run is marked invalid.');
+      for (const item of kpi.failedChecks || []) {
+        console.log(
+          `   - ${item.label}: actual=${item.actual}, threshold=${item.threshold}, detail=${item.detail || '-'}`
+        );
+      }
+    } else {
+      console.log('\n✅ KPI validation passed.');
+    }
+
+    const report = await runNodeScript(path.join('scripts', 'qa-report.js'));
+    const artifacts = await runNodeScript(path.join('scripts', 'qa-artifacts.js'));
+    const firstFailedCode =
+      Number(summary && summary.totals && summary.totals.failed ? summary.totals.failed : 0) > 0
+        ? 1
+        : 0;
+    const failureClass = evaluateRunFailureClass({
+      summary,
+      kpi,
+      firstFailedCode,
+    });
+    const infraBlockedAsPass = shouldTreatInfraBlockedAsPass();
+    const hasSystemFailure = Number(report.code || 0) !== 0 || Number(artifacts.code || 0) !== 0;
+    const hasFailingOutcome = Number(firstFailedCode || 0) !== 0 || !kpi.valid;
+    const infraBlockedRun = failureClass.infraBlockedRun && !hasSystemFailure && hasFailingOutcome;
+    const runStatus = resolveFinalRunStatus({
+      hasSystemFailure,
+      hasFailingOutcome,
+      infraBlockedRun,
+      infraBlockedAsPass,
+      kpi,
+    });
+    const history = captureRunHistory({
+      baseUrl,
+      runStatus,
+      summary,
+      kpi,
+      failureClass,
+      authStateHealth: readJson(authStateHealthPath) || null,
+    });
+    if (history && history.filePath) {
+      console.log(`\nℹ️  Run history saved: ${history.filePath}`);
+      const logIndex = await runNodeScript(path.join('scripts', 'qa-log-index.js'), [
+        `--run=${history.filePath}`,
+      ]);
+      if (logIndex.code !== 0) {
+        console.log('\n⚠️  Log index update failed, continuing with run exit status.');
+      }
+    }
+    const dashboard = await runNodeScript(path.join('scripts', 'qa-trends-dashboard.js'));
+    if (dashboard.code !== 0) {
+      console.log('\n⚠️  Dashboard generation failed, continuing with run exit status.');
+    }
+
+    if (report.code !== 0) process.exit(report.code);
+    if (artifacts.code !== 0) process.exit(artifacts.code);
+    if (!kpi.valid && !(infraBlockedRun && infraBlockedAsPass)) process.exit(2);
+    process.exit(0);
+  }
   cleanupStaleBrowserProcesses();
   if (runDoctorPreflight) {
     console.log('\n> node scripts/qa-doctor.js --preflight');
@@ -1291,6 +1716,7 @@ async function runSuiteWithRetry({
         manual: true,
       });
       if (headedLoginCode === 0) {
+        headedLoginSucceeded = true;
         console.log('\n✅ Headed pre-login storageState refresh completed.');
       } else {
         const message = '\n⚠️  Headed pre-login storageState refresh failed.';
@@ -1312,21 +1738,27 @@ async function runSuiteWithRetry({
   }
 
   if (autoSaveState && !process.env.CI && forceSaveStateBeforeRun) {
-    const warmupLabel =
-      forceSaveStateWarmupRoutes.length > 0 ? forceSaveStateWarmupRoutes.join(', ') : '(none)';
-    console.log(
-      `\n⚠️  Pre-run Cloudflare prep: refreshing storageState before precheck (warmup: ${warmupLabel}).`
-    );
-    const startupSaveStateCode = await runSaveState(baseUrl, {
-      warmupRoutes: forceSaveStateWarmupRoutes,
-      warmupStrict: false,
-    });
-    if (startupSaveStateCode === 0) {
-      console.log('\n✅ Pre-run storageState refresh completed.');
-    } else {
+    if (headedLoginSucceeded) {
       console.log(
-        '\n⚠️  Pre-run storageState refresh failed; continuing with current session artifacts.'
+        '\nℹ️  Skipping automatic pre-run refresh because headed pre-login already produced a fresh state.'
       );
+    } else {
+      const warmupLabel =
+        forceSaveStateWarmupRoutes.length > 0 ? forceSaveStateWarmupRoutes.join(', ') : '(none)';
+      console.log(
+        `\n⚠️  Pre-run Cloudflare prep: refreshing storageState before precheck (warmup: ${warmupLabel}).`
+      );
+      const startupSaveStateCode = await runSaveState(baseUrl, {
+        warmupRoutes: forceSaveStateWarmupRoutes,
+        warmupStrict: false,
+      });
+      if (startupSaveStateCode === 0) {
+        console.log('\n✅ Pre-run storageState refresh completed.');
+      } else {
+        console.log(
+          '\n⚠️  Pre-run storageState refresh failed; continuing with current session artifacts.'
+        );
+      }
     }
   }
 
@@ -1385,6 +1817,16 @@ async function runSuiteWithRetry({
 
   if (precheck.code !== 0 && !softPrecheck) {
     console.log('\n❌ Precheck failed. Skipping full suite.');
+    const summary = collectRunSummary();
+    const kpi = evaluateRunKpis(summary);
+    if (!kpi.valid) {
+      console.log('\n❌ KPI validation failed at precheck.');
+      for (const item of kpi.failedChecks || []) {
+        console.log(
+          `   - ${item.label}: actual=${item.actual}, threshold=${item.threshold}, detail=${item.detail || '-'}`
+        );
+      }
+    }
     const report = await runNodeScript(path.join('scripts', 'qa-report.js'));
     const artifacts = await runNodeScript(path.join('scripts', 'qa-artifacts.js'));
     if (report.code !== 0) process.exit(report.code);
@@ -1395,6 +1837,7 @@ async function runSuiteWithRetry({
   if (precheck.code !== 0 && softPrecheck) {
     console.log('\n⚠️  Precheck failed, but continuing because PW_PRECHECK_SOFT=1.');
   }
+  const softPrecheckFailed = precheck.code !== 0 && softPrecheck;
 
   if (useAiGeneration) {
     console.log('\n> node analyze/runAll.js');
@@ -1414,7 +1857,30 @@ async function runSuiteWithRetry({
   let firstFailedCode = 0;
   let browserForNextPhase = activeBrowser;
   let providerCasinoRecoveryNeeded = false;
+  let suiteRefreshCount = 0;
+  let suiteRefreshLastAt = 0;
   const mobileMatrixRun = isMobileMatrix(suitesProjectMatrix);
+  let skipOrderedSuites = false;
+
+  if (strictValidRun) {
+    const guard = await runWafGuard({
+      label: 'pre-suite',
+      baseUrl,
+      routes: ['/', '/casino/'],
+      depositApi: true,
+      browser: browserForNextPhase,
+    });
+    if (guard.code !== 0) {
+      firstFailedCode = guard.code || 2;
+      console.log(`\n❌ Strict WAF guard failed before ordered suites. Artifact: ${guard.outPath}`);
+      if (abortOnWafGuard) {
+        skipOrderedSuites = true;
+        console.log(
+          '\nℹ️  Ordered suites will be skipped because PW_ABORT_ON_WAF_GUARD is enabled.'
+        );
+      }
+    }
+  }
 
   if (mobileMatrixRun && precheck.code !== 0 && isCloudflareBlocked(precheck.output || '')) {
     providerCasinoRecoveryNeeded = true;
@@ -1423,23 +1889,70 @@ async function runSuiteWithRetry({
     );
   }
 
-  if (selectedOrderedSuites.length === 0) {
+  const orderedSuitesToRun = skipOrderedSuites ? [] : selectedOrderedSuites;
+
+  if (orderedSuitesToRun.length === 0) {
     console.log(
       '\n⚠️  No ordered suites selected (check PW_SUITES_ONLY/PW_SUITES_SKIP). Continuing with report generation.'
     );
   }
 
-  for (const suite of selectedOrderedSuites) {
+  for (const [suiteIndex, suite] of orderedSuitesToRun.entries()) {
+    const suiteKey = String(suite && suite.key ? suite.key : '')
+      .trim()
+      .toLowerCase();
+    const hasDownstreamSuites = suiteIndex < orderedSuitesToRun.length - 1;
+    const suiteRefreshAllowed = suiteRefreshPhases.has(suiteKey);
+    let suiteRefreshedInThisCycle = false;
+
     if (suite.key === 'registration') {
       resetRegistrationChainArtifacts();
     }
 
     const suiteEnv = { ...(suite.env || {}) };
+    if (strictValidRun && suite.key === 'deposit') {
+      const guard = await runWafGuard({
+        label: 'before-deposit',
+        baseUrl,
+        routes: ['/'],
+        depositApi: true,
+        browser: browserForNextPhase,
+      });
+      if (guard.code !== 0) {
+        firstFailedCode = firstFailedCode || guard.code || 2;
+        console.log(
+          `\n❌ Deposit guard failed; skipping deposit suite because coverage would be invalid. Artifact: ${guard.outPath}`
+        );
+        continue;
+      }
+    }
+
     if (suite.key === 'casino') {
+      if (strictValidRun) {
+        const guard = await runWafGuard({
+          label: 'before-casino',
+          baseUrl,
+          routes: ['/casino/'],
+          depositApi: false,
+          browser: browserForNextPhase,
+        });
+        if (guard.code !== 0) {
+          firstFailedCode = firstFailedCode || guard.code || 2;
+          console.log(
+            `\n❌ Casino guard failed; skipping provider matrix because coverage would be invalid. Artifact: ${guard.outPath}`
+          );
+          continue;
+        }
+      }
+
       suiteEnv.PW_PROVIDER_FAST_FAIL_ON_UI_BLOCKED =
-        suiteEnv.PW_PROVIDER_FAST_FAIL_ON_UI_BLOCKED || '0';
+        suiteEnv.PW_PROVIDER_FAST_FAIL_ON_UI_BLOCKED || (strictValidRun ? '1' : '0');
       suiteEnv.PW_PROVIDER_REQUIRE_HISTORY_MATCH =
         suiteEnv.PW_PROVIDER_REQUIRE_HISTORY_MATCH || '1';
+      if (mobileMatrixRun) {
+        suiteEnv.PW_CHALLENGE_SETTLE_TIMEOUT = suiteEnv.PW_CHALLENGE_SETTLE_TIMEOUT || '20000';
+        suiteEnv.PW_CASINO_OPEN_RETRIES = suiteEnv.PW_CASINO_OPEN_RETRIES || '4';
+      }
 
       authStateHealthLatest = await ensureAuthStateHealth({
         baseUrl,
@@ -1461,6 +1974,9 @@ async function runSuiteWithRetry({
           warmupStrict: false,
         });
         if (recoveryCode === 0) {
+          suiteRefreshCount += 1;
+          suiteRefreshLastAt = Date.now();
+          suiteRefreshedInThisCycle = true;
           console.log('\n✅ Casino pre-recovery storageState refresh completed.');
         } else {
           console.log('\n⚠️  Casino pre-recovery storageState refresh failed; continuing run.');
@@ -1496,8 +2012,60 @@ async function runSuiteWithRetry({
     }
 
     if (
+      suiteCloudflareBlocked &&
+      challengeRerunMax > 0 &&
+      challengeRerunPhases.has(suiteKey) &&
+      autoSaveState &&
+      !process.env.CI &&
+      suite.key !== 'registration'
+    ) {
+      const warmupRoutes =
+        suite.key === 'casino' || suite.key === 'livecasino'
+          ? ['/casino/', '/casino/recent/']
+          : ['/'];
+
+      for (let attempt = 1; attempt <= challengeRerunMax; attempt += 1) {
+        if (!suiteCloudflareBlocked) break;
+        console.log(
+          `\n⚠️  ${suite.label}: challenge-aware rerun ${attempt}/${challengeRerunMax} (refresh + retry).`
+        );
+        const refreshCode = await runSaveState(baseUrl, {
+          warmupRoutes,
+          warmupStrict: false,
+        });
+        if (refreshCode !== 0) {
+          console.log('\n⚠️  Challenge-aware refresh failed; retrying with current state.');
+        } else {
+          suiteRefreshCount += 1;
+          suiteRefreshLastAt = Date.now();
+          suiteRefreshedInThisCycle = true;
+        }
+
+        if (challengeRerunBackoffMs > 0) {
+          await sleep(challengeRerunBackoffMs * attempt);
+        }
+
+        run = await runSuiteWithRetry({
+          tests: suite.tests,
+          label: `${suite.label} [challenge-rerun ${attempt}/${challengeRerunMax}]`,
+          primaryBrowser: browserForNextPhase,
+          fallbackBrowser:
+            browserForNextPhase === 'chromium' && preferWebkitOnCloudflare ? 'webkit' : null,
+          envOverride: suiteEnv,
+          shardArg: suiteShardArg,
+        });
+        snapshotPhaseReport(suite.key);
+        snapshotPhaseTestResults(suite.key);
+        browserForNextPhase = run.browserUsed || browserForNextPhase;
+        suiteCloudflareBlocked =
+          isCloudflareBlocked(run.result.output || '') || phaseHasCloudflareSignal(suite.key);
+      }
+    }
+
+    if (
       mobileMatrixRun &&
       mobileStabilizeRerun &&
+      challengeRerunMax === 0 &&
       suiteCloudflareBlocked &&
       autoSaveState &&
       !process.env.CI &&
@@ -1506,7 +2074,7 @@ async function runSuiteWithRetry({
       const warmupRoutes =
         suite.key === 'casino' || suite.key === 'livecasino'
           ? ['/casino/', '/casino/recent/']
-          : ['/', '/assets/'];
+          : ['/'];
       console.log(
         `\n⚠️  ${suite.label}: mobile stabilization rerun after Cloudflare/WAF signal (refresh + one rerun).`
       );
@@ -1515,6 +2083,9 @@ async function runSuiteWithRetry({
         warmupStrict: false,
       });
       if (stabilizerCode === 0) {
+        suiteRefreshCount += 1;
+        suiteRefreshLastAt = Date.now();
+        suiteRefreshedInThisCycle = true;
         run = await runSuiteWithRetry({
           tests: suite.tests,
           label: `${suite.label} [mobile-stabilize-rerun]`,
@@ -1538,20 +2109,44 @@ async function runSuiteWithRetry({
       suiteCloudflareBlocked &&
       autoSaveState &&
       !process.env.CI &&
-      suite.key !== 'registration'
+      suite.key !== 'registration' &&
+      hasDownstreamSuites &&
+      suiteRefreshAllowed
     ) {
-      const warmupRoutes =
-        suite.key === 'casino' || suite.key === 'livecasino' ? ['/casino/', '/casino/recent/'] : [];
-      console.log(
-        `\n⚠️  ${suite.label}: Cloudflare/WAF signal detected. Refreshing storageState for downstream phases...`
-      );
-      const saveStateCode = await runSaveState(baseUrl, { warmupRoutes, warmupStrict: false });
-      if (saveStateCode === 0) {
-        console.log('\n✅ storageState refreshed successfully.');
-      } else {
+      const nowMs = Date.now();
+      const cooldownLeftMs = Math.max(0, suiteRefreshCooldownMs - (nowMs - suiteRefreshLastAt));
+      if (suiteRefreshedInThisCycle) {
         console.log(
-          '\n⚠️  storageState refresh failed; continuing with current session artifacts.'
+          `\nℹ️  ${suite.label}: downstream refresh skipped (already refreshed in this suite cycle).`
         );
+      } else if (suiteRefreshCount >= suiteRefreshMax) {
+        console.log(
+          `\nℹ️  ${suite.label}: downstream refresh skipped (refresh limit reached: ${suiteRefreshCount}/${suiteRefreshMax}).`
+        );
+      } else if (cooldownLeftMs > 0) {
+        console.log(
+          `\nℹ️  ${suite.label}: downstream refresh skipped by cooldown (${Math.ceil(
+            cooldownLeftMs / 1000
+          )}s left).`
+        );
+      } else {
+        const warmupRoutes =
+          suite.key === 'casino' || suite.key === 'livecasino'
+            ? ['/casino/', '/casino/recent/']
+            : [];
+        console.log(
+          `\n⚠️  ${suite.label}: Cloudflare/WAF signal detected. Refreshing storageState for downstream phases...`
+        );
+        const saveStateCode = await runSaveState(baseUrl, { warmupRoutes, warmupStrict: false });
+        if (saveStateCode === 0) {
+          suiteRefreshCount += 1;
+          suiteRefreshLastAt = Date.now();
+          console.log('\n✅ storageState refreshed successfully.');
+        } else {
+          console.log(
+            '\n⚠️  storageState refresh failed; continuing with current session artifacts.'
+          );
+        }
       }
     }
 
@@ -1594,21 +2189,48 @@ async function runSuiteWithRetry({
     console.log('\n✅ KPI validation passed.');
   }
 
-  const report = await runNodeScript(path.join('scripts', 'qa-report.js'));
+  const report = await runNodeScript(path.join('scripts', 'qa-report.js'), [], {
+    QA_SOFT_PRECHECK_FAILED: softPrecheckFailed ? '1' : '0',
+    QA_SOFT_PRECHECK_MODE: softPrecheck ? '1' : '0',
+  });
   const artifacts = await runNodeScript(path.join('scripts', 'qa-artifacts.js'));
-  const runStatus =
-    firstFailedCode !== 0 ||
-    destructiveResult.code !== 0 ||
-    report.code !== 0 ||
-    artifacts.code !== 0 ||
-    !kpi.valid
-      ? 'FAILED'
-      : 'PASSED';
+  const failureClass = evaluateRunFailureClass({
+    summary,
+    kpi,
+    firstFailedCode,
+  });
+  const infraBlockedAsPass = shouldTreatInfraBlockedAsPass();
+  const hasSystemFailure =
+    Number(destructiveResult.code || 0) !== 0 ||
+    Number(report.code || 0) !== 0 ||
+    Number(artifacts.code || 0) !== 0;
+  const hasFailingOutcome = Number(firstFailedCode || 0) !== 0 || !kpi.valid;
+  const infraBlockedRun = failureClass.infraBlockedRun && !hasSystemFailure && hasFailingOutcome;
+
+  if (infraBlockedRun) {
+    console.log(
+      `\nℹ️  Infra-blocked run classification: failed=${failureClass.totalFailed}, infra-failed=${failureClass.failedInfraBlocked}, product-failed=${failureClass.failedProductBlocked}, unclassified-failed=${failureClass.failedUnclassified}.`
+    );
+    if (infraBlockedAsPass) {
+      console.log(
+        '\nℹ️  PW_INFRA_BLOCK_AS_PASS enabled: infra-only failures are treated as non-fatal.'
+      );
+    }
+  }
+
+  const runStatus = resolveFinalRunStatus({
+    hasSystemFailure,
+    hasFailingOutcome,
+    infraBlockedRun,
+    infraBlockedAsPass,
+    kpi,
+  });
   const history = captureRunHistory({
     baseUrl,
     runStatus,
     summary,
     kpi,
+    failureClass,
     authStateHealth: authStateHealthLatest,
   });
   const historyPath = history && history.filePath ? history.filePath : '';
@@ -1635,9 +2257,10 @@ async function runSuiteWithRetry({
     console.log('\n⚠️  Dashboard generation failed, continuing with run exit status.');
   }
 
-  if (firstFailedCode !== 0) process.exit(firstFailedCode);
+  if (firstFailedCode !== 0 && !(infraBlockedRun && infraBlockedAsPass))
+    process.exit(firstFailedCode);
   if (destructiveResult.code !== 0) process.exit(destructiveResult.code);
   if (report.code !== 0) process.exit(report.code);
   if (artifacts.code !== 0) process.exit(artifacts.code);
-  if (!kpi.valid) process.exit(2);
+  if (!kpi.valid && !(infraBlockedRun && infraBlockedAsPass)) process.exit(2);
 })();

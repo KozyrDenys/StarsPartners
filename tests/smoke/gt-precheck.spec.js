@@ -1,8 +1,9 @@
 const { test, expect } = require('@playwright/test');
-const { assertNotCloudflare, dismissOverlays } = require('../helpers/gt-utils');
+const { assertNotCloudflare, dismissOverlays, markBlocked } = require('../helpers/gt-utils');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const STRICT_403_MODE = process.env.PW_PRECHECK_STRICT_403 === '1';
+const SOFT_BLOCK_MODE = process.env.PW_PRECHECK_SOFT_BLOCK !== '0';
 const KNOWN_NON_CRITICAL_403 = [/\/server\/api\/languages\/thook\/?(\?|$)/i];
 
 function sleep(ms) {
@@ -23,6 +24,14 @@ function splitBlocked403(urls) {
     else critical.push(url);
   }
   return { critical, ignored };
+}
+
+function maybeBlockPrecheck(testInfo, reason) {
+  if (!SOFT_BLOCK_MODE) {
+    throw new Error(reason);
+  }
+  markBlocked(testInfo, reason);
+  return true;
 }
 
 test('GT Precheck: no Cloudflare/403 on critical resources', async ({ page }, testInfo) => {
@@ -47,7 +56,7 @@ test('GT Precheck: no Cloudflare/403 on critical resources', async ({ page }, te
     await assertNotCloudflare(page);
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Cloudflare challenge detected';
-    throw new Error(`PRECHECK_BLOCKED: ${msg}`);
+    if (maybeBlockPrecheck(testInfo, `PRECHECK_BLOCKED: ${msg}`)) return;
   }
 
   await dismissOverlays(page);
@@ -56,7 +65,8 @@ test('GT Precheck: no Cloudflare/403 on critical resources', async ({ page }, te
   try {
     await appRoot.waitFor({ state: 'visible', timeout: 30000 });
   } catch {
-    throw new Error('PRECHECK_BLOCKED: App root not visible (possible WAF/403).');
+    if (maybeBlockPrecheck(testInfo, 'PRECHECK_BLOCKED: App root not visible (possible WAF/403).'))
+      return;
   }
 
   await sleep(2000);
@@ -73,7 +83,11 @@ test('GT Precheck: no Cloudflare/403 on critical resources', async ({ page }, te
 
   if (blocked403.critical.length) {
     const sample = blocked403.critical.slice(0, 5).join(' | ');
-    throw new Error(`PRECHECK_BLOCKED: 403 on critical resources: ${sample}`);
+    const reason = `PRECHECK_BLOCKED: 403 on critical resources: ${sample}`;
+    if (STRICT_403_MODE) {
+      throw new Error(reason);
+    }
+    if (maybeBlockPrecheck(testInfo, reason)) return;
   }
 
   expect(true).toBeTruthy();

@@ -9,6 +9,7 @@ const {
   markBlocked,
   waitForUiSettled,
 } = require('../helpers/gt-utils');
+const { pickBestAuthStatePath } = require('../helpers/auth-state');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const BASE_ORIGIN = new URL(BASE_URL).origin;
@@ -16,12 +17,23 @@ const PROJECT_AUTOTEST_REPORT_DIR =
   process.env.QA_AUTOTEST_REPORT_DIR || path.join(process.cwd(), 'Autotest report');
 const PROJECT_ARTIFACTS_DIR = process.env.QA_ARTIFACTS_DIR || path.join(process.cwd(), 'artifacts');
 const ARTIFACT_DIR = path.join(PROJECT_AUTOTEST_REPORT_DIR, 'withdraw');
+const EXPLICIT_STORAGE_STATE_PATH = process.env.PW_STORAGE_STATE
+  ? path.resolve(String(process.env.PW_STORAGE_STATE))
+  : '';
+const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
+  ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
+  : '';
 const AUTH_STATE_CANDIDATES = [
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
+  path.join(PROJECT_ARTIFACTS_DIR, 'auth-state.json'),
+  EXPLICIT_STORAGE_STATE_PATH,
+  PROJECT_ROOT_STORAGE_STATE_PATH,
   path.join(process.cwd(), 'storageState.json'),
-];
+]
+  .filter(Boolean)
+  .filter((candidate, index, all) => all.indexOf(candidate) === index);
 
 function buildUrl(route) {
   return new URL(route, BASE_ORIGIN).toString();
@@ -34,10 +46,7 @@ function oneLine(value) {
 }
 
 function pickAuthStatePath() {
-  for (const filePath of AUTH_STATE_CANDIDATES) {
-    if (fs.existsSync(filePath)) return filePath;
-  }
-  return null;
+  return pickBestAuthStatePath(AUTH_STATE_CANDIDATES);
 }
 
 function writeArtifact(payload, fileName = 'withdraw-skeleton.json') {

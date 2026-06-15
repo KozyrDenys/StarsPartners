@@ -426,7 +426,9 @@ function buildAudit() {
       const latestRun = runs.length ? runs[runs.length - 1].payload : null;
       const runStatus = oneLine((latestRun && latestRun.runStatus) || 'NO_RUN');
       const totals = (latestRun && latestRun.totals) || {};
-      const failedRuns = runs.filter((item) => oneLine(item.payload.runStatus) === 'FAILED').length;
+      const failedRuns = runs.filter((item) =>
+        ['FAILED', 'INFRA_BLOCKED'].includes(oneLine(item.payload.runStatus))
+      ).length;
 
       const phaseDetails = summarizePhaseReports(phaseReportsDir);
       for (const [reason, count] of phaseDetails.blockedReasons.entries()) {

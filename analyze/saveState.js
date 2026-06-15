@@ -221,19 +221,36 @@ async function warmupRoutes(page, options = {}) {
   const launchOptions = useChromeChannel
     ? { headless: false, channel: 'chrome' }
     : { headless: false };
+  const persistentProfileDir = String(process.env.PW_SAVE_STATE_PROFILE_DIR || '')
+    .trim()
+    .replace(/^~(?=$|\/|\\)/, process.env.HOME || '');
+  const usePersistentContext =
+    process.env.PW_SAVE_STATE_PERSISTENT === '1' && persistentProfileDir.length > 0;
   const parsedViewport = parseViewport(process.env.PW_SAVE_STATE_VIEWPORT || '');
   const contextViewport = parsedViewport || { width: 1365, height: 900 };
   const mobileContext = process.env.PW_SAVE_STATE_IS_MOBILE === '1';
 
-  const browser = await chromium.launch(launchOptions);
-  const context = await browser.newContext({
+  const contextOptions = {
     userAgent: getDefaultUserAgent(),
     locale: process.env.PW_LOCALE || 'en-US',
     viewport: contextViewport,
     isMobile: mobileContext,
     hasTouch: mobileContext,
-  });
-  const page = await context.newPage();
+  };
+
+  let browser = null;
+  let context = null;
+  if (usePersistentContext) {
+    fs.mkdirSync(persistentProfileDir, { recursive: true });
+    context = await chromium.launchPersistentContext(persistentProfileDir, {
+      ...launchOptions,
+      ...contextOptions,
+    });
+  } else {
+    browser = await chromium.launch(launchOptions);
+    context = await browser.newContext(contextOptions);
+  }
+  const page = context.pages()[0] || (await context.newPage());
   const readySelectors = [
     '#app, #__nuxt',
     '[data-testid="signup-button"]',
@@ -248,6 +265,9 @@ async function warmupRoutes(page, options = {}) {
 
   console.log(`\nURL: ${url}`);
   console.log(`Output: ${path.resolve(out)}`);
+  if (usePersistentContext) {
+    console.log(`Profile: ${path.resolve(persistentProfileDir)} (persistent)`);
+  }
 
   if (!auto) {
     if (!process.stdin.isTTY) {
@@ -291,7 +311,10 @@ async function warmupRoutes(page, options = {}) {
   fs.writeFileSync(outPath, JSON.stringify(state, null, 2), 'utf8');
   console.log(`✅ Saved: ${outPath}`);
 
-  await browser.close();
+  await context.close();
+  if (browser) {
+    await browser.close();
+  }
 })().catch((e) => {
   console.error(e);
   process.exit(1);

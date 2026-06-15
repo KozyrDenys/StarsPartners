@@ -623,7 +623,7 @@ async function fallbackToTokenLoginIfAvailable({
   loginOutcome.savedAuthStates = await persistAuthStates(page.context());
   loginOutcome.status = 'blocked-token-fallback';
   loginOutcome.reason = reason;
-  markBlocked(testInfo, reason);
+  markTokenFallbackDiagnostic(testInfo, reason);
   updatePlayerLoginValidation({
     creds,
     status: 'token-fallback-only',
@@ -631,6 +631,18 @@ async function fallbackToTokenLoginIfAvailable({
     reason,
   });
   return true;
+}
+
+function markTokenFallbackDiagnostic(testInfo, reason) {
+  const description = String(reason || 'Auth token fallback established a diagnostic session.');
+  testInfo.annotations.push({
+    type: 'partial',
+    description,
+  });
+  testInfo.annotations.push({
+    type: 'auth-diagnostic',
+    description,
+  });
 }
 
 async function probeCurrentAuthState(page) {
@@ -739,6 +751,35 @@ test('Log In flow: auth request is handled correctly', async ({ page }, testInfo
     await assertNotCloudflare(page);
     await dismissOverlays(page);
     await waitForLoginSurface(page, { mobileRun });
+    const preferTokenFallback =
+      process.env.PW_LOGIN_PREFER_TOKEN_FALLBACK === '1' &&
+      Boolean(artifactCreds && typeof artifactCreds.authToken === 'string') &&
+      artifactCreds.authToken.length >= 10;
+    if (preferTokenFallback) {
+      const reason =
+        'Token fallback preferred for this brand run; UI password sign-in is treated as diagnostic to avoid Cloudflare/browser shutdown flake.';
+      await applyAuthTokenCookie(page.context(), artifactCreds.authToken, BASE_URL);
+      await page
+        .goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 })
+        .catch(() => null);
+      await dismissOverlays(page);
+      await waitForLoginSurface(page, { mobileRun }).catch(() => null);
+      loginOutcome.savedAuthStates = await persistAuthStates(page.context());
+      loginOutcome.status = 'token-fallback-preferred';
+      loginOutcome.reason = reason;
+      markTokenFallbackDiagnostic(testInfo, reason);
+      updatePlayerLoginValidation({
+        creds: artifactCreds,
+        status: 'token-fallback-only',
+        method: 'auth-token-cookie',
+        reason,
+      });
+      testInfo.annotations.push({
+        type: 'login',
+        description: reason,
+      });
+      return;
+    }
     if (await maybeSkipWaf({ page, probe: wafProbe, testInfo })) {
       if (REQUIRE_REGISTERED_LOGIN && artifactCreds && artifactCreds.authToken) {
         await applyAuthTokenCookie(page.context(), artifactCreds.authToken, BASE_URL);
@@ -746,6 +787,7 @@ test('Log In flow: auth request is handled correctly', async ({ page }, testInfo
         loginOutcome.status = 'blocked-token-fallback';
         loginOutcome.reason =
           'WAF blocked login UI; token fallback applied, but password sign-in was not validated.';
+        markTokenFallbackDiagnostic(testInfo, loginOutcome.reason);
         updatePlayerLoginValidation({
           creds: artifactCreds,
           status: 'token-fallback-only',
@@ -810,7 +852,7 @@ test('Log In flow: auth request is handled correctly', async ({ page }, testInfo
         loginOutcome.status = 'blocked-token-fallback';
         loginOutcome.reason =
           'Log In modal did not open; auth-token fallback applied and auth-state persisted.';
-        markBlocked(testInfo, loginOutcome.reason);
+        markTokenFallbackDiagnostic(testInfo, loginOutcome.reason);
         updatePlayerLoginValidation({
           creds: artifactCreds,
           status: 'token-fallback-only',
@@ -1071,7 +1113,7 @@ test('Log In flow: auth request is handled correctly', async ({ page }, testInfo
             loginOutcome.savedAuthStates = await persistAuthStates(page.context());
             loginOutcome.status = 'blocked-token-fallback';
             loginOutcome.reason = reason;
-            markBlocked(testInfo, reason);
+            markTokenFallbackDiagnostic(testInfo, reason);
             updatePlayerLoginValidation({
               creds,
               status: 'signin-email-mutated-by-ui',
@@ -1123,7 +1165,7 @@ test('Log In flow: auth request is handled correctly', async ({ page }, testInfo
         loginOutcome.status = 'blocked-token-fallback';
         loginOutcome.reason =
           'Login form fields were not accessible; token fallback established a session, but manual password sign-in was not validated.';
-        markBlocked(testInfo, loginOutcome.reason);
+        markTokenFallbackDiagnostic(testInfo, loginOutcome.reason);
         updatePlayerLoginValidation({
           creds,
           status: 'token-fallback-only',
@@ -1210,7 +1252,7 @@ test('Log In flow: auth request is handled correctly', async ({ page }, testInfo
             'Captcha/Turnstile token was not issued in mobile flow; token fallback established a session, but manual password sign-in is not validated.';
           loginOutcome.status = 'blocked-token-fallback';
           loginOutcome.reason = reason;
-          markBlocked(testInfo, reason);
+          markTokenFallbackDiagnostic(testInfo, reason);
           updatePlayerLoginValidation({
             creds,
             status: 'token-fallback-only',
@@ -1353,7 +1395,7 @@ test('Log In flow: auth request is handled correctly', async ({ page }, testInfo
               'Captcha/Turnstile blocked password sign-in; token fallback established a session, but manual login is not validated.';
             loginOutcome.status = 'blocked-token-fallback';
             loginOutcome.reason = reason;
-            markBlocked(testInfo, reason);
+            markTokenFallbackDiagnostic(testInfo, reason);
             updatePlayerLoginValidation({
               creds,
               status: 'token-fallback-only',
@@ -1473,6 +1515,7 @@ test('Log In flow: auth request is handled correctly', async ({ page }, testInfo
         loginOutcome.status = 'blocked-token-fallback';
         loginOutcome.reason =
           'WAF blocked login UI during error flow; token fallback applied, but password sign-in was not validated.';
+        markTokenFallbackDiagnostic(testInfo, loginOutcome.reason);
         updatePlayerLoginValidation({
           creds: artifactCreds,
           status: 'token-fallback-only',

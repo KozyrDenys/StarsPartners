@@ -26,7 +26,9 @@ const INFRA_BLOCKED_HINTS = [
   /no auth state|no authorized storage state|auth storage state|storage state is unavailable/i,
   /expected authorized session|\/api\/user\/preferences returned 401|session was not established/i,
   /temporarily unavailable|backend unavailable|transport negotiation failed|watchdog timed out|cancelled\/aborted before bootstrap/i,
+  /target page|context or browser has been closed|browser has been closed|test ended/i,
   /internet connection appears to be offline|net::err_internet_disconnected|net::err_network_changed|socket hang up/i,
+  /net::err_failed|net::err_timed_out|net::err_blocked_by_orb|request failed|navigation failed/i,
   /timed out before/i,
 ];
 
@@ -270,10 +272,59 @@ function formatWafList(list, limit = 5) {
   return list.slice(0, limit).join(' | ');
 }
 
+async function findSignupModal(page, timeoutMs = 500) {
+  const selectors = [
+    '.t-signup-modal',
+    '[data-testid="signup-modal"]',
+    '.t-signup',
+    '[role="dialog"]:has(input):has-text("Sign up")',
+    '[class*="modal" i]:has(input):has-text("Sign up")',
+    '[class*="popup" i]:has(input):has-text("Sign up")',
+    '[class*="dialog" i]:has(input):has-text("Sign up")',
+    '[class*="registration" i]:has(input):has-text("Sign up")',
+    '[class*="signup" i]:has(input):has-text("Sign up")',
+    'form:has(input):has-text("Sign up")',
+  ];
+
+  for (const selector of selectors) {
+    const matches = page.locator(selector);
+    const count = await matches.count().catch(() => 0);
+    const cap = Math.min(count, 10);
+    for (let i = 0; i < cap; i += 1) {
+      const locator = matches.nth(i);
+      const visible = await locator.isVisible({ timeout: timeoutMs }).catch(() => false);
+      if (visible) return locator;
+    }
+  }
+
+  const title = page.getByText(/^sign\s*up$/i).first();
+  const titleVisible = await title.isVisible({ timeout: timeoutMs }).catch(() => false);
+  if (titleVisible) {
+    const ancestor = title
+      .locator(
+        'xpath=ancestor::*[.//input and (.//*[normalize-space()="Sign up" or normalize-space()="Sign Up"])][1]'
+      )
+      .first();
+    const ancestorVisible = await ancestor.isVisible({ timeout: timeoutMs }).catch(() => false);
+    if (ancestorVisible) return ancestor;
+  }
+
+  return null;
+}
+
+async function waitForSignupModal(page, timeoutMs = 5000) {
+  const deadline = Date.now() + Math.max(500, Number(timeoutMs || 0));
+  while (Date.now() < deadline) {
+    const modal = await findSignupModal(page, 250);
+    if (modal) return modal;
+    await page.waitForTimeout(200).catch(() => null);
+  }
+  return null;
+}
+
 async function detectSignupTurnstileStall(page) {
-  const modal = page.locator('.t-signup-modal, [data-testid="signup-modal"], .t-signup').first();
-  const modalVisible = await modal.isVisible({ timeout: 500 }).catch(() => false);
-  if (!modalVisible) return null;
+  const modal = await findSignupModal(page);
+  if (!modal) return null;
 
   const step1Btn = modal
     .locator(
@@ -453,8 +504,74 @@ async function waitForUiSettled(page, timeoutMs = 1500) {
   }
 }
 
+function shouldUsePointerFallback(error) {
+  const message = String((error && error.message) || error || '').toLowerCase();
+  return (
+    message.includes('outside of the viewport') ||
+    message.includes('intercepts pointer events') ||
+    message.includes('not receiving pointer events') ||
+    message.includes('element is detached from the dom')
+  );
+}
+
+async function clickLocatorRobust(page, locator, options = {}) {
+  if (!locator) return false;
+  const timeout = Number.isFinite(options.timeout) && options.timeout > 0 ? options.timeout : 10000;
+  const waitForNavigation = options.waitForNavigation !== false;
+  const settleTimeout = Number.isFinite(options.settleTimeout) ? options.settleTimeout : 2200;
+
+  await locator.scrollIntoViewIfNeeded().catch(() => null);
+  try {
+    await locator.click({ timeout });
+    if (waitForNavigation) {
+      await page.waitForLoadState('domcontentloaded').catch(() => null);
+    }
+    if (settleTimeout > 0) {
+      await waitForUiSettled(page, settleTimeout);
+    }
+    return true;
+  } catch (error) {
+    if (!shouldUsePointerFallback(error)) {
+      throw error;
+    }
+  }
+
+  const box = await locator.boundingBox().catch(() => null);
+  if (box && Number.isFinite(box.x) && Number.isFinite(box.y)) {
+    const viewport = page.viewportSize() || { width: 1365, height: 900 };
+    const x = Math.min(Math.max(box.x + box.width / 2, 2), Math.max(2, viewport.width - 2));
+    const y = Math.min(Math.max(box.y + box.height / 2, 2), Math.max(2, viewport.height - 2));
+    await page.mouse.move(x, y, { steps: 6 }).catch(() => null);
+    await page.mouse.click(x, y, { delay: 80 }).catch(() => null);
+    if (waitForNavigation) {
+      await page.waitForLoadState('domcontentloaded').catch(() => null);
+    }
+    if (settleTimeout > 0) {
+      await waitForUiSettled(page, settleTimeout);
+    }
+    return true;
+  }
+
+  const domClicked = await locator
+    .evaluate((node) => {
+      if (!node || typeof node.click !== 'function') return false;
+      node.click();
+      return true;
+    })
+    .catch(() => false);
+  if (!domClicked) {
+    return false;
+  }
+  if (waitForNavigation) {
+    await page.waitForLoadState('domcontentloaded').catch(() => null);
+  }
+  if (settleTimeout > 0) {
+    await waitForUiSettled(page, settleTimeout);
+  }
+  return true;
+}
+
 async function openSignupModal(page, opts = {}) {
-  const modal = page.locator('.t-signup-modal, [data-testid="signup-modal"], .t-signup').first();
   const errorToast = page.getByText(/something went wrong/i).first();
   const retryOnError = opts.retryOnError !== false;
   const maxAttempts = opts.attempts || 3;
@@ -470,19 +587,20 @@ async function openSignupModal(page, opts = {}) {
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     await dismissOverlays(page);
+    const alreadyOpen = await findSignupModal(page);
+    if (alreadyOpen) return alreadyOpen;
     for (const selector of triggers) {
       const btn = page.locator(selector).first();
       try {
         if (await btn.isVisible()) {
           await btn.click();
           await Promise.any([
-            modal.waitFor({ state: 'visible', timeout: 2000 }),
+            waitForSignupModal(page, 5000),
             errorToast.waitFor({ state: 'visible', timeout: 2000 }),
             waitForUiSettled(page, 2000),
           ]).catch(() => null);
-          if (await modal.isVisible().catch(() => false)) {
-            return modal;
-          }
+          const opened = await waitForSignupModal(page, 5000);
+          if (opened) return opened;
           if (await errorToast.isVisible().catch(() => false)) {
             if (!retryOnError) {
               throw new Error(
@@ -631,6 +749,7 @@ module.exports = {
   maybeSkipWaf,
   openLoginModal,
   openSignupModal,
+  clickLocatorRobust,
   tryAutoBypassCloudflare,
   waitForHomeContent,
   waitForUiSettled,

@@ -10,6 +10,7 @@ const {
   waitForUiSettled,
   waitForHomeContent,
 } = require('../helpers/gt-utils');
+const { pickBestAuthStatePath } = require('../helpers/auth-state');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const PROJECT_AUTOTEST_REPORT_DIR =
@@ -23,11 +24,12 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
-  EXPLICIT_STORAGE_STATE_PATH,
-  PROJECT_ROOT_STORAGE_STATE_PATH,
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
+  path.join(PROJECT_ARTIFACTS_DIR, 'auth-state.json'),
+  EXPLICIT_STORAGE_STATE_PATH,
+  PROJECT_ROOT_STORAGE_STATE_PATH,
   path.join(process.cwd(), 'storageState.json'),
 ]
   .filter(Boolean)
@@ -41,10 +43,7 @@ const LIVE_CHAT_IFRAME_SELECTOR =
   'iframe[title*="livechat" i], iframe[src*="livechat" i], iframe[src*="lc.chat" i], iframe[name*="chat-widget" i]';
 
 function pickAuthStatePath() {
-  for (const filePath of AUTH_STATE_CANDIDATES) {
-    if (fs.existsSync(filePath)) return filePath;
-  }
-  return null;
+  return pickBestAuthStatePath(AUTH_STATE_CANDIDATES);
 }
 
 function compactText(value) {

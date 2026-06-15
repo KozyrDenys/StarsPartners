@@ -19,7 +19,6 @@ const browserName = ['chromium', 'firefox', 'webkit'].includes(requestedBrowser)
   : 'chromium';
 const headedRequested = process.env.PW_HEADED === '1' || process.env.HEADLESS === '0';
 const slowMo = Number.parseInt(process.env.PW_SLOWMO || '0', 10);
-const userAgent = process.env.PW_USER_AGENT || undefined;
 const locale = process.env.PW_LOCALE || 'en-US';
 const testOutputDir = process.env.QA_TEST_RESULTS_DIR || path.join(process.cwd(), 'test-results');
 const reportJsonOutputFile = path.join(testOutputDir, 'report.json');
@@ -54,6 +53,32 @@ function parseProjectMatrix(value) {
 }
 
 const projectMatrix = parseProjectMatrix(process.env.PW_PROJECT_MATRIX || 'desktop');
+function readCdpMetaUserAgent(storagePath) {
+  if (!storagePath) return '';
+  try {
+    const metaPath = `${path.resolve(storagePath)}.cdp-meta.json`;
+    if (!fs.existsSync(metaPath)) return '';
+    const payload = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    return String((payload && payload.userAgent) || '').trim();
+  } catch {
+    return '';
+  }
+}
+
+function resolveUserAgent() {
+  if (process.env.PW_USER_AGENT) return process.env.PW_USER_AGENT;
+  const cdpUserAgent = readCdpMetaUserAgent(configuredStorageState);
+  if (!cdpUserAgent) return undefined;
+
+  const mobileOnly = projectMatrix.length === 1 && projectMatrix[0] === 'mobile';
+  const desktopOnly = projectMatrix.length === 1 && projectMatrix[0] === 'desktop';
+  const looksMobile = /mobile|iphone|ipad|android/i.test(cdpUserAgent);
+  if (mobileOnly) return looksMobile ? cdpUserAgent : undefined;
+  if (desktopOnly) return looksMobile ? undefined : cdpUserAgent;
+  return undefined;
+}
+
+const userAgent = resolveUserAgent();
 const chromiumArmPath = (() => {
   try {
     const root = path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright');
@@ -104,6 +129,8 @@ if (process.env.PW_REPORT_ALLURE === '1') {
 if (process.env.PW_REPORT_REPORTPORTAL === '1') {
   const rp = require('./reportportal.config');
   if (rp && rp.endpoint && (rp.apiKey || rp.token) && rp.project) {
+    // Explicit resolve keeps dependency tracking tools aware of this optional reporter.
+    require.resolve('@reportportal/agent-js-playwright');
     reporters.push(['@reportportal/agent-js-playwright', rp]);
   } else {
     console.warn(
