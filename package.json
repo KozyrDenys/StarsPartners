@@ -289,7 +289,7 @@
     "browserstack-node-sdk": "^1.70.2",
     "dependency-cruiser": "^18.4.0",
     "eslint": "^10.11.0",
-    "eslint-plugin-playwright": "^2.12.0",
+    "eslint-plugin-playwright": "^2.12.1",
     "husky": "^9.1.7",
     "knip": "^6.37.0",
     "languagedetect": "^2.0.0",
