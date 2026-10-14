@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 
 test('GT opens with saved session', async ({ page }) => {
   await page.goto('/', { waitUntil: 'domcontentloaded' });

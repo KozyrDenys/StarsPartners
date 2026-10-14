@@ -23,12 +23,19 @@ const CLOUD_FLARE_CHALLENGE_FRAME_SELECTOR =
 
 const INFRA_BLOCKED_HINTS = [
   /cloudflare|turnstile|captcha|challenge|waf|cdn-cgi|__cf_chl|token page|forbidden|403/i,
+  /geo restriction|cannot be accessed in |region not restricted|proxy service or vpn|http 423/i,
   /no auth state|no authorized storage state|auth storage state|storage state is unavailable/i,
   /expected authorized session|\/api\/user\/preferences returned 401|session was not established/i,
-  /temporarily unavailable|backend unavailable|transport negotiation failed|watchdog timed out|cancelled\/aborted before bootstrap/i,
+  /temporarily unavailable|backend unavailable|transport negotiation failed|cancelled\/aborted before bootstrap/i,
   /target page|context or browser has been closed|browser has been closed|test ended/i,
   /internet connection appears to be offline|net::err_internet_disconnected|net::err_network_changed|socket hang up/i,
-  /net::err_failed|net::err_timed_out|net::err_blocked_by_orb|request failed|navigation failed/i,
+  /net::err_failed|net::err_timed_out|net::err_blocked_by_orb|request failed/i,
+  /openapi schema was not found|contract (?:schema|specification|configuration) (?:is )?(?:missing|unavailable)|provide qa_(?:auth|payment)_openapi/i,
+];
+const TEST_INFRA_TIMEOUT_HINTS = [
+  /test_infra_timeout/i,
+  /watchdog timed out/i,
+  /provider stage .*timed out/i,
   /timed out before/i,
 ];
 
@@ -39,6 +46,7 @@ function delay(ms) {
 function classifyBlockedType(description) {
   const source = String(description || '');
   if (!source) return 'product';
+  if (TEST_INFRA_TIMEOUT_HINTS.some((re) => re.test(source))) return 'test-infra-timeout';
   return INFRA_BLOCKED_HINTS.some((re) => re.test(source)) ? 'infra' : 'product';
 }
 
@@ -63,7 +71,7 @@ async function detectCloudflare(page) {
   const authModalVisible = appRootVisible
     ? await page
         .locator(
-          '.t-login-modal, [data-testid="login-modal"], .t-login, .t-signup-modal, [data-testid="signup-modal"], .t-signup'
+          '.t-login-modal, [data-testid="login-modal"], .t-login:has(input), .t-signup-modal, [data-testid="signup-modal"], .t-signup:has(input)'
         )
         .first()
         .isVisible({ timeout: 600 })
@@ -274,9 +282,11 @@ function formatWafList(list, limit = 5) {
 
 async function findSignupModal(page, timeoutMs = 500) {
   const selectors = [
+    '.t-popup.t-signup-modal',
+    '.t-popup:has(input):has-text("Sign up")',
     '.t-signup-modal',
     '[data-testid="signup-modal"]',
-    '.t-signup',
+    '.t-signup:has(input)',
     '[role="dialog"]:has(input):has-text("Sign up")',
     '[class*="modal" i]:has(input):has-text("Sign up")',
     '[class*="popup" i]:has(input):has-text("Sign up")',
@@ -297,14 +307,29 @@ async function findSignupModal(page, timeoutMs = 500) {
     }
   }
 
-  const title = page.getByText(/^sign\s*up$/i).first();
-  const titleVisible = await title.isVisible({ timeout: timeoutMs }).catch(() => false);
-  if (titleVisible) {
-    const ancestor = title
-      .locator(
-        'xpath=ancestor::*[.//input and (.//*[normalize-space()="Sign up" or normalize-space()="Sign Up"])][1]'
-      )
-      .first();
+  const titles = page.locator(
+    'xpath=//*[normalize-space()="Sign up" or normalize-space()="Sign Up"]'
+  );
+  const titleCount = await titles.count().catch(() => 0);
+  const titleCap = Math.min(titleCount, 20);
+  const classTranslate =
+    "translate(@class, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
+  const modalAncestorXPath =
+    `xpath=ancestor::*[.//input and (` +
+    `@role="dialog" or contains(${classTranslate}, "signup") or ` +
+    `contains(${classTranslate}, "modal") or contains(${classTranslate}, "popup") or ` +
+    `contains(${classTranslate}, "registration") or contains(${classTranslate}, "dialog")` +
+    `)][1]`;
+
+  for (let i = 0; i < titleCap; i += 1) {
+    const title = titles.nth(i);
+    const titleVisible = await title.isVisible({ timeout: timeoutMs }).catch(() => false);
+    if (!titleVisible) continue;
+
+    const titleTag = await title.evaluate((node) => node.tagName.toLowerCase()).catch(() => '');
+    if (['button', 'a'].includes(titleTag)) continue;
+
+    const ancestor = title.locator(modalAncestorXPath).first();
     const ancestorVisible = await ancestor.isVisible({ timeout: timeoutMs }).catch(() => false);
     if (ancestorVisible) return ancestor;
   }
@@ -317,7 +342,7 @@ async function waitForSignupModal(page, timeoutMs = 5000) {
   while (Date.now() < deadline) {
     const modal = await findSignupModal(page, 250);
     if (modal) return modal;
-    await page.waitForTimeout(200).catch(() => null);
+    await delay(200);
   }
   return null;
 }
@@ -392,6 +417,27 @@ async function maybeSkipWaf({ page, probe, testInfo, error }) {
 }
 
 async function dismissOverlays(page) {
+  try {
+    await page.evaluate(() => {
+      const dismissOneSignal = () => {
+        const button = document.getElementById('onesignal-slidedown-cancel-button');
+        if (button instanceof globalThis.HTMLElement) button.click();
+      };
+      dismissOneSignal();
+      if (!globalThis.__qaOneSignalDismissObserver) {
+        const observer = new globalThis.MutationObserver(dismissOneSignal);
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        globalThis.__qaOneSignalDismissObserver = observer;
+        globalThis.setTimeout(() => {
+          observer.disconnect();
+          delete globalThis.__qaOneSignalDismissObserver;
+        }, 15_000);
+      }
+    });
+  } catch {
+    // ignore
+  }
+
   // Hard-disable known overlays that can intercept clicks
   try {
     await page.addStyleTag({
@@ -409,7 +455,15 @@ async function dismissOverlays(page) {
     '#onesignal-slidedown-allow-button',
     '[data-testid="pwa-close"]',
     '[aria-label="Close"]',
+    '[aria-label*="close" i]',
+    '[data-testid*="close" i]',
+    '.t-popup__close',
+    '.t-popup-close',
+    '[class*="popup" i] [class*="close" i]',
     '.t-header__pwa-close',
+    'button:has-text("No thanks")',
+    'button:has-text("No Thanks")',
+    'button:has-text("Got it")',
   ];
 
   for (const selector of candidates) {
@@ -423,6 +477,87 @@ async function dismissOverlays(page) {
     }
   }
 
+  // OneSignal can mount after the first dismissal pass. Keep its container
+  // inert even when the vendor replaces the DOM node after page readiness.
+  await page
+    .evaluate(() => {
+      const container = document.querySelector(
+        '#onesignal-slidedown-container, .onesignal-slidedown-container'
+      );
+      if (!(container instanceof globalThis.HTMLElement)) return;
+      container.style.setProperty('display', 'none', 'important');
+      container.style.setProperty('pointer-events', 'none', 'important');
+      container.setAttribute('aria-hidden', 'true');
+    })
+    .catch(() => null);
+
+  // Some brands inject the "Pick Your Reward" promo as a delayed cross-origin iframe.
+  // Try its close action first. If the third-party widget ignores the click, remove only
+  // that confirmed reward iframe from the test page so it cannot intercept later actions.
+  // Never hide arbitrary iframes: casino and sports surfaces legitimately use them.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    let rewardFrameHandled = false;
+    const childFrames = page.frames().filter((candidate) => candidate !== page.mainFrame());
+    const frameMatches = await Promise.all(
+      childFrames.map(async (frame) => ({
+        frame,
+        rewardPromptVisible: await frame
+          .getByText(/pick your reward/i)
+          .first()
+          .isVisible({ timeout: 300 })
+          .catch(() => false),
+      }))
+    );
+    for (const { frame, rewardPromptVisible } of frameMatches) {
+      if (!rewardPromptVisible) continue;
+
+      rewardFrameHandled = true;
+      const frameCloseCandidates = [
+        frame.getByRole('button', { name: /close|dismiss|no thanks/i }).first(),
+        frame.locator('[aria-label*="close" i], [data-testid*="close" i]').first(),
+        frame.locator('button').filter({ hasNotText: /claim/i }).first(),
+      ];
+      for (const closeButton of frameCloseCandidates) {
+        const visible = await closeButton.isVisible({ timeout: 300 }).catch(() => false);
+        if (!visible) continue;
+        await closeButton.click({ timeout: 1500, force: true }).catch(() => null);
+        await waitForUiSettled(page, 350).catch(() => null);
+        const stillVisible = await frame
+          .getByText(/pick your reward/i)
+          .first()
+          .isVisible({ timeout: 250 })
+          .catch(() => false);
+        if (!stillVisible) break;
+      }
+
+      const stillVisible = await frame
+        .getByText(/pick your reward/i)
+        .first()
+        .isVisible({ timeout: 250 })
+        .catch(() => false);
+      if (stillVisible) {
+        const frameElement = await frame.frameElement().catch(() => null);
+        if (frameElement) {
+          await frameElement.evaluate((element) => element.remove()).catch(() => null);
+        }
+      }
+    }
+    if (rewardFrameHandled || attempt === 3) break;
+    await waitForUiSettled(page, 250).catch(() => null);
+  }
+
+  // The rewards subscription prompt is injected after the initial route render on
+  // some brands and its dismiss action is not consistently rendered as a button.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const noThanks = page.getByText(/^No thanks$/i).first();
+    const visible = await noThanks.isVisible({ timeout: 500 }).catch(() => false);
+    if (visible) {
+      await noThanks.click({ timeout: 1500, force: true }).catch(() => null);
+      break;
+    }
+    if (attempt < 2) await waitForUiSettled(page, 300).catch(() => null);
+  }
+
   // If OneSignal container still exists, remove it via DOM
   try {
     await page.evaluate(() => {
@@ -432,37 +567,168 @@ async function dismissOverlays(page) {
   } catch {
     // ignore
   }
+
+  await closeMobileNavigationOverlay(page).catch(() => false);
+}
+
+async function closeMobileNavigationOverlay(page) {
+  const viewport = page.viewportSize();
+  if (viewport && viewport.width > 1100) return false;
+
+  const sidebars = page.locator(
+    'aside:visible, [role="complementary"]:visible, [data-testid="sidebar-aside"]:visible, .t-sidebar-menu:visible'
+  );
+  const count = Math.min(await sidebars.count().catch(() => 0), 6);
+  let overlay = null;
+  for (let index = 0; index < count; index += 1) {
+    const candidate = sidebars.nth(index);
+    const coversViewport = await candidate
+      .evaluate((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = globalThis.getComputedStyle(element);
+        const text = String(element.textContent || '');
+        return (
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          Number(style.opacity) !== 0 &&
+          rect.width >= globalThis.innerWidth * 0.38 &&
+          rect.height >= globalThis.innerHeight * 0.55 &&
+          rect.left <= globalThis.innerWidth * 0.08 &&
+          /my profile|deposit|casino|sports|favorites|promotions?/i.test(text)
+        );
+      })
+      .catch(() => false);
+    if (coversViewport) {
+      overlay = candidate;
+      break;
+    }
+  }
+  if (!overlay) return false;
+
+  const candidates = [
+    overlay.locator('button').first(),
+    page.locator('[data-testid="sidebar-burger-button"]:visible').first(),
+    page.locator('.t-sidebar-menu__toggle-btn-active:visible').first(),
+    page.locator('[class*="sidebar-menu" i] [class*="toggle" i]:visible').first(),
+  ];
+  for (const candidate of candidates) {
+    if (!(await candidate.isVisible({ timeout: 250 }).catch(() => false))) continue;
+    await candidate.click({ timeout: 1500, force: true }).catch(() => null);
+    await waitForUiSettled(page, 350).catch(() => null);
+    if (!(await overlay.isVisible({ timeout: 250 }).catch(() => false))) return true;
+  }
+
+  await page.keyboard.press('Escape').catch(() => null);
+  await waitForUiSettled(page, 350).catch(() => null);
+  return !(await overlay.isVisible({ timeout: 250 }).catch(() => false));
 }
 
 async function closeModal(modal, page) {
   const closeCandidates = [
     'button:has-text("Close")',
+    'button:has-text("Закрыть")',
+    'button:has-text("Закрити")',
     '[aria-label="Close"]',
+    '[aria-label*="close" i]',
+    '[aria-label*="закр" i]',
     '[data-testid*="close"]',
+    '.t-popup__close',
+    '.t-popup-close',
+    '[class*="popup" i] [class*="close" i]',
     '.t-modal__close',
     '.t-modal__close-btn',
     '.modal__close',
   ];
 
+  const modalIsClosed = () => modal.isHidden({ timeout: 700 }).catch(() => false);
+  let closeTriggered = false;
   for (const selector of closeCandidates) {
     const btn = modal.locator(selector).first();
     try {
       const visible = await btn.isVisible({ timeout: 500 }).catch(() => false);
       if (visible) {
-        await btn.click({ timeout: 1500 }).catch(() => null);
-        return true;
+        closeTriggered = await btn
+          .click({ timeout: 1500 })
+          .then(() => true)
+          .catch(() => false);
+        if (closeTriggered) {
+          await waitForUiSettled(page, 250).catch(() => null);
+          if (await modalIsClosed()) return true;
+          closeTriggered = false;
+        }
       }
     } catch {
       // try next selector
     }
   }
 
-  try {
-    await page.keyboard.press('Escape');
-    return true;
-  } catch {
-    return false;
+  // Icon-only close buttons often have no accessible name or stable class.
+  // Restrict the fallback to a button in the modal's top-right corner so form
+  // actions such as Continue cannot be clicked accidentally.
+  if (!closeTriggered) {
+    const iconClose = modal.locator('button').filter({ hasNotText: /continue|log in|sign up/i });
+    const count = Math.min(await iconClose.count().catch(() => 0), 20);
+    const modalBox = await modal.boundingBox().catch(() => null);
+    const geometricCandidates = [];
+    for (let index = 0; modalBox && index < count; index += 1) {
+      const candidate = iconClose.nth(index);
+      const box = await candidate.boundingBox().catch(() => null);
+      if (!box) continue;
+      const nearTop = box.y <= modalBox.y + Math.min(120, modalBox.height * 0.2);
+      const nearRight = box.x + box.width >= modalBox.x + modalBox.width - 140;
+      if (!nearTop || !nearRight) continue;
+      geometricCandidates.push({ candidate, box });
+    }
+
+    // Some signup dialogs place a gift/help action immediately to the left of X.
+    // The DOM order is not reliable, so try the rightmost control first and only
+    // accept a click as successful after the dialog actually disappears.
+    geometricCandidates.sort(
+      (left, right) =>
+        right.box.x + right.box.width - (left.box.x + left.box.width) || left.box.y - right.box.y
+    );
+    for (const { candidate } of geometricCandidates) {
+      closeTriggered = await candidate
+        .click({ timeout: 1500, force: true })
+        .then(() => true)
+        .catch(() => false);
+      if (!closeTriggered) continue;
+      await waitForUiSettled(page, 250).catch(() => null);
+      if (await modalIsClosed()) return true;
+      closeTriggered = false;
+    }
   }
+
+  if (!closeTriggered) {
+    await page.keyboard.press('Escape').catch(() => null);
+  }
+
+  await waitForUiSettled(page, 500).catch(() => null);
+  if (await modal.isHidden({ timeout: 1000 }).catch(() => false)) return true;
+
+  // Some brands intentionally ask for confirmation before abandoning registration.
+  // The confirmation is a sibling dialog, so it cannot be found inside `modal`.
+  const confirmationDialog = page
+    .locator(
+      '[role="dialog"]:has-text("УВЕРЕНЫ"), [role="dialog"]:has-text("ARE YOU SURE"), [class*="modal" i]:has-text("УВЕРЕНЫ"), [class*="modal" i]:has-text("ARE YOU SURE"), [class*="popup" i]:has-text("УВЕРЕНЫ"), [class*="popup" i]:has-text("ARE YOU SURE")'
+    )
+    .first();
+  const confirmationVisible = await confirmationDialog
+    .isVisible({ timeout: 1500 })
+    .catch(() => false);
+
+  if (confirmationVisible) {
+    const confirmExit = confirmationDialog
+      .getByRole('button', {
+        name: /^(close|exit|leave|yes|закрыть|выйти|так|да|закрити|вийти)$/i,
+      })
+      .first();
+    if (await confirmExit.isVisible({ timeout: 800 }).catch(() => false)) {
+      await confirmExit.click({ timeout: 2500 }).catch(() => null);
+    }
+  }
+
+  return modal.isHidden({ timeout: 5000 }).catch(() => false);
 }
 
 function markBlocked(testInfo, description) {
@@ -480,7 +746,12 @@ function markBlocked(testInfo, description) {
   const blockedType = classifyBlockedType(reason);
   testInfo.annotations.push({ type: 'blocked', description: reason });
   testInfo.annotations.push({
-    type: blockedType === 'infra' ? 'infra-blocked' : 'product-blocked',
+    type:
+      blockedType === 'infra'
+        ? 'infra-blocked'
+        : blockedType === 'test-infra-timeout'
+          ? 'test-infra-timeout'
+          : 'product-blocked',
     description: reason,
   });
 }
@@ -522,7 +793,7 @@ async function clickLocatorRobust(page, locator, options = {}) {
 
   await locator.scrollIntoViewIfNeeded().catch(() => null);
   try {
-    await locator.click({ timeout });
+    await locator.click({ timeout, noWaitAfter: options.noWaitAfter === true });
     if (waitForNavigation) {
       await page.waitForLoadState('domcontentloaded').catch(() => null);
     }
@@ -744,6 +1015,7 @@ module.exports = {
   createWafProbe,
   detectCloudflare,
   dismissOverlays,
+  closeMobileNavigationOverlay,
   closeModal,
   markBlocked,
   maybeSkipWaf,

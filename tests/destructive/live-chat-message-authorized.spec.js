@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const fs = require('fs');
 const path = require('path');
 const {
@@ -11,6 +11,7 @@ const {
   waitForHomeContent,
 } = require('../helpers/gt-utils');
 const { pickBestAuthStatePath } = require('../helpers/auth-state');
+const { resolveExtraHTTPHeaders } = require('../helpers/context-options');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const PROJECT_AUTOTEST_REPORT_DIR =
@@ -24,6 +25,7 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
@@ -223,11 +225,13 @@ test('Live chat destructive: authorized player sends message and sees chat activ
     status: 'started',
   };
 
+  const extraHTTPHeaders = resolveExtraHTTPHeaders();
   const context = await browser.newContext({
     storageState: authStatePath,
     viewport: { width: 1440, height: 1100 },
     ignoreHTTPSErrors: true,
     locale: process.env.PW_LOCALE || 'en-US',
+    ...(extraHTTPHeaders ? { extraHTTPHeaders } : {}),
   });
 
   const page = await context.newPage();
@@ -235,8 +239,6 @@ test('Live chat destructive: authorized player sends message and sees chat activ
 
   try {
     await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 40_000 });
-    await dismissOverlays(page);
-    await waitForHomeContent(page);
     if (await maybeSkipWaf({ page, probe: wafProbe, testInfo })) {
       payload.status = 'blocked';
       payload.blockedByWaf = true;
@@ -245,6 +247,8 @@ test('Live chat destructive: authorized player sends message and sees chat activ
         'Cloudflare/WAF blocked authorized live chat scenario.';
       return;
     }
+    await dismissOverlays(page);
+    await waitForHomeContent(page);
 
     const loginVisible = await page
       .getByRole('button', { name: /log in/i })
@@ -259,7 +263,9 @@ test('Live chat destructive: authorized player sends message and sees chat activ
     }
 
     const trigger = page
-      .locator('[data-testid="sidebar-liveChat-button"], [data-testid="online-chat-button"]')
+      .locator(
+        '[data-testid="sidebar-Live chat-button"], [data-testid="sidebar-liveChat-button"], [data-testid="online-chat-button"], a:has-text("Live chat"), button:has-text("Live chat"), [role="button"]:has-text("Live chat")'
+      )
       .first();
     const triggerVisible = await trigger.isVisible({ timeout: 15_000 }).catch(() => false);
     if (!triggerVisible) {

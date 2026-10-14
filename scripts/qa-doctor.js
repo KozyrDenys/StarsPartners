@@ -3,6 +3,9 @@
 const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
+const { loadProjectEnv } = require('./lib/env');
+
+loadProjectEnv();
 
 const args = new Set(process.argv.slice(2));
 const isPreflight = args.has('--preflight');
@@ -12,7 +15,7 @@ const skipBrowserCheck = process.env.QA_DOCTOR_SKIP_BROWSER === '1';
 
 const launchTimeoutMs = toPositiveInt(process.env.QA_DOCTOR_LAUNCH_TIMEOUT_MS, 60_000);
 const navigationTimeoutMs = toPositiveInt(process.env.QA_DOCTOR_NAV_TIMEOUT_MS, 20_000);
-const supportedNodeMajors = parseNodeMajors(process.env.QA_NODE_LTS_MAJORS || '20,22');
+const supportedNodeMajors = parseNodeMajors(process.env.QA_NODE_LTS_MAJORS || '24');
 
 const checks = [];
 const shellCandidates = [
@@ -127,7 +130,7 @@ function checkNodeVersion() {
       status: 'fail',
       severity: 'critical',
       message: `Node.js ${rawVersion} is outside supported LTS set (${supportedNodeMajors.join(', ')}).`,
-      details: 'Switch Node to LTS (recommended: 20) via nvm/fnm/volta.',
+      details: 'Switch Node to 24.x LTS via nvm/fnm/volta.',
     });
     return;
   }
@@ -231,6 +234,56 @@ function checkCommand(name, options = {}) {
   });
 }
 
+function checkNodePackage(packageName, options = {}) {
+  const severity = options.severity || 'low';
+  const expected = options.expected || `Install via npm: npm install -D ${packageName}`;
+  const result = runShell(
+    `node -e "const p=require('${packageName}/package.json'); console.log(p.version || 'installed')"`
+  );
+
+  addCheck({
+    id: `pkg-${packageName.replace(/[^a-z0-9]+/gi, '-')}`,
+    name: `Node package: ${packageName}`,
+    status: result.status === 0 ? 'pass' : options.missingStatus || 'warn',
+    severity,
+    message:
+      result.status === 0
+        ? `${packageName} package is available.`
+        : `${packageName} package is not installed.`,
+    details: result.status === 0 ? String(result.stdout || '').trim() : expected,
+  });
+}
+
+function checkVsCodePlaywrightExtension() {
+  if (!commandExists('code')) {
+    addCheck({
+      id: 'vscode-playwright-extension',
+      name: 'VS Code Playwright Extension',
+      status: 'warn',
+      severity: 'low',
+      message: 'VS Code CLI is not available, so extensions cannot be checked.',
+      details: 'Install VS Code and expose the `code` command in PATH.',
+    });
+    return;
+  }
+
+  const result = runShell('code --list-extensions | grep -ix ms-playwright.playwright');
+  addCheck({
+    id: 'vscode-playwright-extension',
+    name: 'VS Code Playwright Extension',
+    status: result.status === 0 ? 'pass' : 'warn',
+    severity: 'low',
+    message:
+      result.status === 0
+        ? 'Playwright VS Code extension is installed.'
+        : 'Playwright VS Code extension is not installed.',
+    details:
+      result.status === 0
+        ? String(result.stdout || '').trim()
+        : 'Install via: code --install-extension ms-playwright.playwright',
+  });
+}
+
 function checkJavaRuntime() {
   const defaultResult = runShell('java -version');
   const defaultOutput = String(defaultResult.stderr || defaultResult.stdout || '').trim();
@@ -264,7 +317,7 @@ function checkJavaRuntime() {
         status: 'warn',
         severity: 'medium',
         message: 'Java runtime is installed but not present in PATH.',
-        details: `${candidate} | Add OpenJDK bin to PATH before Allure/ZAP runs.`,
+        details: `${candidate} | Add OpenJDK bin to PATH before ZAP/OpenAPI Generator runs.`,
       });
       return;
     }
@@ -275,45 +328,8 @@ function checkJavaRuntime() {
     name: 'Java Runtime',
     status: 'warn',
     severity: 'medium',
-    message: 'Java runtime is missing. Allure/ZAP CLI flows may fail.',
+    message: 'Java runtime is missing. ZAP/OpenAPI Generator flows may fail.',
     details: defaultOutput || 'Install OpenJDK (recommended: 21).',
-  });
-}
-
-function checkAllure() {
-  if (commandExists('allure')) {
-    const result = runShell('allure --version');
-    addCheck({
-      id: 'allure-cli',
-      name: 'Allure CLI',
-      status: 'pass',
-      severity: 'medium',
-      message: 'Allure CLI is available.',
-      details: String(result.stdout || result.stderr || '').trim(),
-    });
-    return;
-  }
-
-  const npxResult = runShell('npx --yes allure --version');
-  if (npxResult.status === 0) {
-    addCheck({
-      id: 'allure-cli',
-      name: 'Allure CLI',
-      status: 'pass',
-      severity: 'medium',
-      message: 'Allure CLI is available via project dependency (npx allure).',
-      details: String(npxResult.stdout || npxResult.stderr || '').trim(),
-    });
-    return;
-  }
-
-  addCheck({
-    id: 'allure-cli',
-    name: 'Allure CLI',
-    status: 'warn',
-    severity: 'medium',
-    message: 'Allure CLI is not installed.',
-    details: 'Install via Homebrew: brew install allure',
   });
 }
 
@@ -352,26 +368,29 @@ function checkDocker() {
 }
 
 function checkZap() {
-  const zapPath = '/Applications/ZAP.app/Contents/Java/zap.sh';
-  if (!fs.existsSync(zapPath)) {
+  if (!commandExists('docker')) {
     addCheck({
       id: 'zap-cli',
-      name: 'OWASP ZAP',
+      name: 'OWASP ZAP Docker',
       status: 'warn',
       severity: 'low',
-      message: 'ZAP app binary was not found at default macOS path.',
-      details: `Expected path: ${zapPath}`,
+      message: 'Docker CLI is required for the ZAP scanner.',
+      details: 'Install Docker Desktop or docker+colima.',
     });
     return;
   }
 
+  const info = runShell('docker info --format "{{.ServerVersion}}"');
   addCheck({
     id: 'zap-cli',
-    name: 'OWASP ZAP',
-    status: 'pass',
+    name: 'OWASP ZAP Docker',
+    status: info.status === 0 ? 'pass' : 'warn',
     severity: 'low',
-    message: 'ZAP binary is available.',
-    details: zapPath,
+    message:
+      info.status === 0
+        ? 'ZAP Docker scanner prerequisites are available.'
+        : 'Docker daemon is not reachable; ZAP scans cannot start.',
+    details: 'Image: ghcr.io/zaproxy/zaproxy:stable (digest pinned by runner)',
   });
 }
 
@@ -551,10 +570,6 @@ function shouldFailProcess() {
     severity: 'low',
     versionCmd: 'magick -version | head -n 1',
   });
-  checkCommand('newman', {
-    severity: 'low',
-    versionCmd: 'npx newman -v',
-  });
   checkCommand('adb', {
     severity: 'low',
     versionCmd: 'adb version | head -n 1',
@@ -589,13 +604,141 @@ function shouldFailProcess() {
     expected:
       'Install via npm (`npm i -D @stoplight/spectral-cli`) or globally (`npm i -g @stoplight/spectral-cli`).',
   });
+  checkCommand('openapi-generator', {
+    severity: 'low',
+    versionCmd: 'openapi-generator version',
+    expected: 'Install via Homebrew: brew install openapi-generator',
+  });
+  checkCommand('osv-scanner', {
+    severity: 'medium',
+    versionCmd: 'osv-scanner --version',
+    expected: 'Install via Homebrew: brew install osv-scanner',
+  });
+  checkCommand('snyk', {
+    severity: 'medium',
+    versionCmd: 'snyk --version',
+    expected: 'Install via Homebrew: brew install snyk-cli',
+  });
   checkCommand('ffmpeg', {
     severity: 'low',
     versionCmd: 'ffmpeg -version | head -n 1',
   });
+  checkCommand('actionlint', {
+    severity: 'low',
+    versionCmd: 'actionlint --version',
+    expected: 'Install via Homebrew: brew install actionlint',
+  });
+  checkCommand('zizmor', {
+    severity: 'medium',
+    versionCmd: 'zizmor --version',
+    expected: 'Install via Homebrew: brew install zizmor',
+  });
+  checkCommand('cosign', {
+    severity: 'low',
+    versionCmd: "cosign version --json 2>/dev/null | jq -r '.gitVersion'",
+    expected: 'Install via Homebrew: brew install cosign',
+  });
+  checkCommand('shellcheck', {
+    severity: 'low',
+    versionCmd: 'shellcheck --version | head -n 1',
+    expected: 'Install via Homebrew: brew install shellcheck',
+  });
+  checkCommand('hadolint', {
+    severity: 'low',
+    versionCmd: 'hadolint --version | head -n 1',
+    expected: 'Install via Homebrew: brew install hadolint',
+  });
+  checkCommand('yamllint', {
+    severity: 'low',
+    versionCmd: 'yamllint --version',
+    expected: 'Install via Homebrew: brew install yamllint',
+  });
+  checkCommand('semgrep', {
+    severity: 'medium',
+    versionCmd: 'semgrep --version',
+    expected: 'Install via Homebrew: brew install semgrep',
+  });
+  checkCommand('trivy', {
+    severity: 'medium',
+    versionCmd: 'trivy --version | head -n 1',
+    expected: 'Install via Homebrew: brew install trivy',
+  });
+  checkCommand('gitleaks', {
+    severity: 'medium',
+    versionCmd: 'gitleaks version',
+    expected: 'Install via Homebrew: brew install gitleaks',
+  });
+  checkCommand('syft', {
+    severity: 'low',
+    versionCmd: 'syft version | head -n 1',
+    expected: 'Install via Homebrew: brew install syft',
+  });
+  checkCommand('grype', {
+    severity: 'low',
+    versionCmd: 'grype version | head -n 1',
+    expected: 'Install via Homebrew: brew install grype',
+  });
+  checkCommand('crane', {
+    severity: 'low',
+    versionCmd: 'crane version | head -n 1',
+    expected: 'Install via Homebrew: brew install crane',
+  });
+  checkCommand('regctl', {
+    severity: 'low',
+    versionCmd: 'regctl version | head -n 1',
+    expected: 'Install via Go: go install github.com/regclient/regclient/cmd/regctl@latest',
+  });
+  checkCommand('lychee', {
+    severity: 'low',
+    versionCmd: 'lychee --version',
+    expected: 'Install via Homebrew: brew install lychee',
+  });
+  checkCommand('markdownlint-cli2', {
+    severity: 'low',
+    versionCmd: 'markdownlint-cli2 --version 2>&1 | head -n 1',
+    expected: 'Install via Homebrew: brew install markdownlint-cli2',
+  });
+  checkCommand('watchexec', {
+    severity: 'low',
+    versionCmd: 'watchexec --version | head -n 1',
+    expected: 'Install via Homebrew: brew install watchexec',
+  });
+  checkCommand('just', {
+    severity: 'low',
+    versionCmd: 'just --version',
+    expected: 'Install via Homebrew: brew install just',
+  });
+  checkCommand('dive', {
+    severity: 'low',
+    versionCmd: 'dive version 2>/dev/null || dive --version',
+    expected: 'Install via Homebrew: brew install dive',
+  });
+  checkCommand('oha', {
+    severity: 'low',
+    versionCmd: 'oha --version',
+    expected: 'Install via Homebrew: brew install oha',
+  });
+  checkCommand('autocannon', {
+    severity: 'low',
+    versionCmd: 'autocannon --version | head -n 1',
+    expected: 'Install via npm: npm install -g autocannon',
+  });
+  checkCommand('code', {
+    severity: 'low',
+    versionCmd: 'code --version | head -n 1',
+    expected: 'Install VS Code and expose the `code` command in PATH.',
+  });
+  checkVsCodePlaywrightExtension();
+  checkCommand('BrowserStackLocal', {
+    severity: 'low',
+    expected: 'Install via Homebrew cask: brew install --cask browserstacklocal',
+  });
+  checkNodePackage('browserstack-local', {
+    severity: 'low',
+    expected: 'Install via npm: npm install -D browserstack-local',
+  });
 
   checkJavaRuntime();
-  checkAllure();
   checkZap();
   checkDocker();
 

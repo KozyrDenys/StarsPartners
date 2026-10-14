@@ -22,6 +22,12 @@ function oneLine(value) {
     .trim();
 }
 
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, Number(ms) || 0));
+  });
+}
+
 async function detectChallenge(page) {
   const url = page.url();
   if (/cdn-cgi|challenge-platform|__cf_chl|cf_chl_|just-a-moment/i.test(url)) {
@@ -51,10 +57,10 @@ async function performHumanLikeActions(page) {
     const x = Math.round(Math.random() * Math.max(120, viewport.width - 40)) + 20;
     const y = Math.round(Math.random() * Math.max(160, viewport.height - 40)) + 20;
     await page.mouse.move(x, y, { steps: 12 }).catch(() => null);
-    await page.waitForTimeout(200 + Math.round(Math.random() * 250)).catch(() => null);
+    await delay(200 + Math.round(Math.random() * 250));
   }
   await page.mouse.wheel(0, 900).catch(() => null);
-  await page.waitForTimeout(550).catch(() => null);
+  await delay(550);
   await page.mouse.wheel(0, -500).catch(() => null);
 }
 

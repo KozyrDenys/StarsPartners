@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const fs = require('fs');
 const path = require('path');
 const {
@@ -10,6 +10,7 @@ const {
   waitForUiSettled,
   waitForHomeContent,
 } = require('../helpers/gt-utils');
+const { resolveExtraHTTPHeaders } = require('../helpers/context-options');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const PROJECT_AUTOTEST_REPORT_DIR =
@@ -173,10 +174,12 @@ test('Live chat destructive: guest sends "test" and receives support reply', asy
     status: 'started',
   };
 
+  const extraHTTPHeaders = resolveExtraHTTPHeaders();
   const context = await browser.newContext({
     viewport: { width: 1440, height: 1100 },
     ignoreHTTPSErrors: true,
     locale: process.env.PW_LOCALE || 'en-US',
+    ...(extraHTTPHeaders ? { extraHTTPHeaders } : {}),
   });
 
   const page = await context.newPage();
@@ -194,8 +197,6 @@ test('Live chat destructive: guest sends "test" and receives support reply', asy
       }
       throw err;
     }
-    await dismissOverlays(page);
-    await waitForHomeContent(page);
     if (await maybeSkipWaf({ page, probe: wafProbe, testInfo })) {
       payload.status = 'blocked';
       payload.blockedByWaf = true;
@@ -204,9 +205,13 @@ test('Live chat destructive: guest sends "test" and receives support reply', asy
         'Cloudflare/WAF blocked guest live chat scenario.';
       return;
     }
+    await dismissOverlays(page);
+    await waitForHomeContent(page);
 
     const trigger = page
-      .locator('[data-testid="sidebar-liveChat-button"], [data-testid="online-chat-button"]')
+      .locator(
+        '[data-testid="sidebar-Live chat-button"], [data-testid="sidebar-liveChat-button"], [data-testid="online-chat-button"], a:has-text("Live chat"), button:has-text("Live chat"), [role="button"]:has-text("Live chat")'
+      )
       .first();
     const triggerVisible = await trigger.isVisible({ timeout: 15_000 }).catch(() => false);
     if (!triggerVisible) {

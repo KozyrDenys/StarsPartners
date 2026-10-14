@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const {
   assertNotCloudflare,
   createWafProbe,
@@ -115,7 +115,9 @@ test('GT Home: primary buttons work', async ({ page }, testInfo) => {
     }
     await signupBtn.click();
 
-    const modal = page.locator('.t-signup-modal, [data-testid="signup-modal"], .t-signup').first();
+    const modal = page
+      .locator('.t-signup-modal, [data-testid="signup-modal"], .t-signup:has(input)')
+      .first();
     await expect(modal).toBeVisible({ timeout: 15000 });
 
     await closeModal(modal, page);
@@ -148,7 +150,9 @@ test('GT Home: primary buttons work', async ({ page }, testInfo) => {
     }
     await loginBtn.click();
 
-    const modal = page.locator('.t-login-modal, [data-testid="login-modal"], .t-login').first();
+    const modal = page
+      .locator('.t-login-modal, [data-testid="login-modal"], .t-login:has(input)')
+      .first();
     await expect(modal).toBeVisible({ timeout: 15000 });
 
     await closeModal(modal, page);

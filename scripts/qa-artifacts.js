@@ -4,6 +4,7 @@ const { pathToFileURL } = require('url');
 const { Buffer } = require('buffer');
 const { chromium } = require('playwright');
 const { resolveProjectPaths } = require('../tests/helpers/project-paths');
+const { redactObject, redactSerializedText, redactText } = require('./lib/redact-secrets');
 
 const cwd = process.cwd();
 const baseUrl = process.env.BASE_URL || 'https://gt.bet/';
@@ -152,6 +153,8 @@ const phaseReportCandidates = [
 const imageExtRe = /\.(png|jpe?g|webp|gif|bmp)$/i;
 const failureStatuses = new Set(['failed', 'timedOut', 'interrupted']);
 const safeRootIgnoreNames = new Set(['node_modules', '.git', 'Screenshots', 'Bugs']);
+const playerEmailPlaceholder = '__QA_VISIBLE_PLAYER_EMAIL__';
+const playerPasswordPlaceholder = '__QA_VISIBLE_PLAYER_PASSWORD__';
 
 function readJson(filePath) {
   try {
@@ -160,6 +163,69 @@ function readJson(filePath) {
   } catch {
     return null;
   }
+}
+
+function loadPlayerCredentials() {
+  if (process.env.LOGIN_EMAIL && process.env.LOGIN_PASSWORD) {
+    return {
+      email: String(process.env.LOGIN_EMAIL),
+      password: String(process.env.LOGIN_PASSWORD),
+      source: 'LOGIN_EMAIL / LOGIN_PASSWORD',
+      validationStatus: 'Переданы через окружение запуска',
+    };
+  }
+
+  const candidates = [
+    path.join(projectPaths.artifactsDir, 'last-registered-player.json'),
+    path.join(projectPaths.artifactsDir, 'registration-data-current-run.json'),
+    path.join(projectPaths.artifactsDir, 'last-manual-login-player.json'),
+  ];
+  for (const candidate of candidates) {
+    const payload = readJson(candidate);
+    const email = stripAnsi(
+      String((payload && (payload.loginEmail || payload.email || payload.profileEmail)) || '')
+    ).trim();
+    const password = stripAnsi(String((payload && payload.password) || '')).trim();
+    if (!email || !password) continue;
+    return {
+      email,
+      password,
+      source: path.basename(candidate),
+      validationStatus: oneLine(
+        payload.loginValidationStatus || payload.lastLoginCheckStatus || 'Статус не указан'
+      ),
+    };
+  }
+
+  return {
+    email: '',
+    password: '',
+    source: 'Учётные данные не найдены',
+    validationStatus: 'Недоступно',
+  };
+}
+
+function visiblePlayerCredentials(credentials) {
+  const available = Boolean(credentials && credentials.email && credentials.password);
+  return {
+    email: available ? playerEmailPlaceholder : 'Не найдена',
+    password: available ? playerPasswordPlaceholder : 'Не найден',
+    source: oneLine(credentials && credentials.source) || 'Учётные данные не найдены',
+    validationStatus: oneLine(credentials && credentials.validationStatus) || 'Статус не указан',
+    available,
+  };
+}
+
+function restoreVisiblePlayerCredentials(value, credentials, { html = false } = {}) {
+  const source = String(value || '');
+  if (!credentials || !credentials.email || !credentials.password) return source;
+  const email = html ? escapeHtml(credentials.email) : credentials.email;
+  const password = html ? escapeHtml(credentials.password) : credentials.password;
+  return source
+    .split(playerEmailPlaceholder)
+    .join(email)
+    .split(playerPasswordPlaceholder)
+    .join(password);
 }
 
 function stripAnsi(value) {
@@ -193,7 +259,7 @@ function stripAnsi(value) {
 }
 
 function oneLine(value) {
-  return stripAnsi(value).replace(/\s+/g, ' ').trim();
+  return redactText(stripAnsi(value)).replace(/\s+/g, ' ').trim();
 }
 
 function slugify(value, max = 96) {
@@ -304,9 +370,15 @@ function uniquePath(basePath) {
 
 function copyFileSafe(sourcePath, targetPath) {
   if (!sourcePath || !fs.existsSync(sourcePath)) return '';
+  if (/\.(?:zip|7z|gz|tgz)$/i.test(sourcePath)) return '';
   ensureDir(path.dirname(targetPath));
   const destination = uniquePath(targetPath);
-  fs.copyFileSync(sourcePath, destination);
+  if (/\.(?:json|har|md|txt|log|html?|xml|csv)$/i.test(destination)) {
+    const source = fs.readFileSync(sourcePath, 'utf8');
+    fs.writeFileSync(destination, redactSerializedText(source), 'utf8');
+  } else {
+    fs.copyFileSync(sourcePath, destination);
+  }
   return destination;
 }
 
@@ -318,10 +390,14 @@ function writeBodyAttachment(body, contentType, targetPathWithoutExt) {
 
   try {
     const bytes = Buffer.from(body, 'base64');
-    fs.writeFileSync(targetPath, bytes);
+    if (/^(?:image|audio|video|application\/(?:pdf|zip|octet-stream))/i.test(contentType || '')) {
+      fs.writeFileSync(targetPath, bytes);
+    } else {
+      fs.writeFileSync(targetPath, redactSerializedText(bytes.toString('utf8')), 'utf8');
+    }
     return targetPath;
   } catch {
-    fs.writeFileSync(targetPath, body, 'utf8');
+    fs.writeFileSync(targetPath, redactSerializedText(body), 'utf8');
     return targetPath;
   }
 }
@@ -496,7 +572,7 @@ function formatOutput(outputEntries) {
   if (!Array.isArray(outputEntries) || outputEntries.length === 0) return '';
   return outputEntries
     .map((entry) => {
-      if (typeof entry === 'string') return entry;
+      if (typeof entry === 'string') return redactText(entry);
       return oneLine(entry && (entry.text || entry.message || JSON.stringify(entry)));
     })
     .filter(Boolean)
@@ -726,31 +802,257 @@ function extractProviderName(title) {
 
 function inferExpectedResult({ area, title, providerName }) {
   const titleLower = oneLine(title || '').toLowerCase();
+  if (/\bavatar\b/.test(titleLower)) {
+    return 'В разделе Account отображается загрузка аватара; поддерживаемое изображение сохраняется и остаётся после перезагрузки.';
+  }
+  if (/editable field persists/.test(titleLower)) {
+    return 'В профиле есть редактируемое текстовое поле; новое допустимое значение сохраняется после перезагрузки.';
+  }
+  if (/profile validations/.test(titleLower)) {
+    return 'Поля профиля отображаются и показывают корректную ошибку для обязательного, неверного или слишком длинного значения.';
+  }
+  if (/settings section/.test(titleLower)) {
+    return 'В разделе Settings доступны настройки; изменённое значение сохраняется после перезагрузки.';
+  }
+  if (/favorites?/.test(titleLower)) {
+    return 'На карточке игры доступно управление избранным; выбранная игра появляется в списке Favorites.';
+  }
+  if (/recent history|recent games/.test(titleLower)) {
+    return 'После успешного запуска игра появляется в списке недавних с тем же id, slug или provider link.';
+  }
+  if (/network diagnostics/.test(titleLower)) {
+    return 'Спортивная страница не формирует запросы ассетов с undefined/null country code; для неизвестной страны используется нейтральный флаг.';
+  }
+  if (/metadata smoke/.test(titleLower)) {
+    return 'На всех проверяемых спортивных маршрутах заданы корректные и непустые title, H1 и canonical URL.';
+  }
   if (providerName && /\bprovider\b.*\breal launch\b|\bnon-demo\b/.test(titleLower)) {
-    return `Game from provider "${providerName}" opens in non-demo mode and remains stable (no request failures or critical console errors).`;
+    return `Игра провайдера «${providerName}» запускается в реальном режиме и работает без ошибок запросов или критичных ошибок консоли.`;
   }
   if (/\bdemo\b|\btry for fun\b/.test(titleLower)) {
-    return 'Selected game opens in demo mode and the game surface remains stable.';
+    return 'Выбранная игра запускается в деморежиме и работает стабильно.';
   }
   if (/\bsearch\b/.test(titleLower)) {
-    return 'Search control opens, accepts input, and returns expected results without UI/runtime errors.';
+    return 'Поиск открывается, принимает запрос и показывает ожидаемые результаты без ошибок интерфейса или выполнения.';
   }
   if (/\bfilter\b/.test(titleLower)) {
-    return 'Filter panel opens, selected filter is applied, and catalog/list updates correctly.';
+    return 'Панель фильтров открывается, выбранный фильтр применяется, каталог обновляется корректно.';
   }
   if (area.key === 'deposit') {
-    return 'Deposit surface opens and visible payment methods are interactive without runtime errors.';
+    return 'Раздел депозита открывается, видимые способы оплаты доступны без ошибок выполнения.';
   }
   if (area.key === 'profile') {
-    return 'Profile section opens and all targeted controls are interactive without validation/runtime issues.';
+    return 'Раздел профиля открывается, целевые элементы доступны и работают без ошибок валидации или выполнения.';
   }
   if (area.key === 'sports') {
-    return 'Sports page opens and targeted interactions complete without route/UI/network blockers.';
+    return 'Спортивная страница открывается, целевые действия выполняются без маршрутных, интерфейсных и сетевых блокировок.';
   }
   if (/\blive chat\b/.test(titleLower)) {
-    return 'Live chat widget opens and the target chat interaction completes successfully.';
+    return 'Виджет Live Chat открывается, целевое действие выполняется успешно.';
   }
-  return 'Scenario completes successfully without UI/runtime/network critical errors.';
+  return 'Сценарий завершается успешно без критичных ошибок интерфейса, выполнения или сети.';
+}
+
+function primaryAnnotation(test) {
+  const annotations = Array.isArray(test.annotations) ? test.annotations : [];
+  const metadataSignal = annotations.find((item) =>
+    /metadata has \d+ warning/i.test(oneLine(item && item.description))
+  );
+  if (metadataSignal) return oneLine(metadataSignal.description);
+  const preferredTypes = [
+    'product-blocked',
+    'product-warning',
+    'provider-blocked',
+    'infra-blocked',
+    'test-infra',
+    'blocked',
+    'partial',
+  ];
+  for (const type of preferredTypes) {
+    const match = annotations.find(
+      (item) =>
+        String((item && item.type) || '').toLowerCase() === type &&
+        oneLine(item && item.description)
+    );
+    if (match) return oneLine(match.description);
+  }
+  const fallback = annotations.find((item) => oneLine(item && item.description));
+  return fallback ? oneLine(fallback.description) : '';
+}
+
+function conciseActualResult(test) {
+  const error = oneLine(test.error || '');
+  if (error) return error;
+  const signal = primaryAnnotation(test);
+  if (!signal) return 'Автотест зафиксировал отклонение без текстового сообщения.';
+  const provider = signal.match(/Provider "([^"]+)".*No game cards found/i)?.[1];
+  if (/avatar upload control was not found/i.test(signal))
+    return 'В разделе Account не найден элемент загрузки аватара.';
+  if (/no editable profile text field found/i.test(signal))
+    return 'В профиле не найдено редактируемое текстовое поле.';
+  if (/validation input fields are not visible/i.test(signal))
+    return 'Поля профиля для проверки валидации не отображаются.';
+  if (/no preference control found/i.test(signal))
+    return 'Не найдено управление настройками, для которого можно проверить сохранение.';
+  if (/favorite control is not visible/i.test(signal))
+    return 'На карточке игры в текущем интерфейсе не отображается управление избранным.';
+  if (/recent games list did not include/i.test(signal))
+    return 'Запущенная игра не появилась в списке недавних за отведённое время наблюдения.';
+  if (/country flag asset request.*undefined\/null/i.test(signal))
+    return 'Два запроса флагов стран содержат undefined/null вместо кода страны.';
+  if (/metadata has (\d+) warning/i.test(signal)) {
+    const count = signal.match(/metadata has (\d+) warning/i)?.[1] || '';
+    return `Автопроверка обнаружила ${count} предупреждений в метаданных спортивных маршрутов.`;
+  }
+  if (provider)
+    return `Для провайдера «${provider}» не найдены карточки игр, поэтому реальный запуск невозможен.`;
+  return signal;
+}
+
+function titleCaseMode(mode) {
+  return mode === 'mobile' ? 'Mobile' : 'Desktop';
+}
+
+function inferIssueTitle({ test, manualPlan, actualResult }) {
+  const area = inferAreaContext(test);
+  const mode = titleCaseMode(manualPlan.executionMode);
+  const signal = oneLine(
+    `${test.titlePath || test.title || ''} ${primaryAnnotation(test)} ${actualResult}`
+  ).toLowerCase();
+  const providerName = extractProviderName(test.titlePath || test.title || '');
+  let symptom = actualResult;
+
+  if (/avatar upload/.test(signal)) symptom = 'в разделе Account отсутствует загрузка аватара';
+  else if (/no editable profile text field/.test(signal))
+    symptom = 'в профиле отсутствуют редактируемые текстовые поля';
+  else if (/validation input fields are not visible/.test(signal))
+    symptom = 'поля для проверки валидации профиля не отображаются';
+  else if (/no preference control/.test(signal))
+    symptom = 'отсутствуют настройки, для которых можно проверить сохранение';
+  else if (/favorite control is not visible/.test(signal))
+    symptom = 'на карточке игры отсутствует управление избранным';
+  else if (/recent games list did not include/.test(signal))
+    symptom = 'запущенная игра не появляется в списке недавних';
+  else if (/undefined\/null country code|undefined\.svg/.test(signal))
+    symptom = 'запрос флага страны формируется с кодом undefined';
+  else if (/metadata has \d+ warning/.test(signal))
+    symptom = 'метаданные спортивных страниц не соответствуют требованиям';
+  else if (providerName && /no game cards found/.test(signal))
+    symptom = `в каталоге провайдера ${providerName} нет игр для запуска`;
+
+  return `[${area.label}][${mode}] ${oneLine(symptom).replace(/[.]$/, '')}`;
+}
+
+function inferTriage({ test, manualPlan, actualResult }) {
+  const signal = oneLine(
+    `${test.titlePath || test.title || ''} ${primaryAnnotation(test)} ${actualResult}`
+  ).toLowerCase();
+  const isWarning = test.status === 'product-warning';
+  const isFailure = failureStatuses.has(test.status);
+  let type = isWarning ? 'Предупреждение о качестве' : 'Потенциальный продуктовый дефект';
+  let severity = 'S3 — средняя';
+  let priority = 'P2 — обычная';
+  let confirmation = 'Требуется ручное подтверждение';
+  let reproducibility = 'Зафиксировано в одном автоматизированном прогоне';
+  let impact = 'Отклонение ухудшает целевой пользовательский сценарий.';
+
+  if (isFailure) {
+    type = 'Дефект или нестабильность сценария';
+    confirmation = 'Подтверждено падением автотеста; требуется локализация причины';
+  }
+  if (/undefined\/null country code|undefined\.svg/.test(signal)) {
+    severity = 'S3 — средняя';
+    priority = 'P2 — обычная';
+    confirmation = 'Подтверждено сетевой диагностикой';
+    impact = 'Пользователь может видеть отсутствующий или сломанный флаг страны.';
+  } else if (/metadata has \d+ warning|metadata smoke/.test(signal)) {
+    severity = 'S3 — средняя';
+    priority = 'P2 — обычная';
+    confirmation = 'Подтверждено автоматической проверкой метаданных';
+    impact = 'Снижается качество SEO, шаринга и доступности спортивных страниц.';
+  } else if (/no game cards found/.test(signal)) {
+    severity = 'S2 — высокая';
+    priority = 'P1 — высокая';
+    impact = 'Игрок не может выбрать и запустить игру указанного провайдера.';
+  } else if (/recent games list did not include/.test(signal)) {
+    severity = 'S2 — высокая';
+    priority = 'P1 — высокая';
+    confirmation = 'Подтверждено автоматизированным запуском и последующей проверкой списка';
+    impact = 'Игрок не может быстро вернуться к недавно запущенной игре.';
+  } else if (/favorite control is not visible/.test(signal)) {
+    severity = 'S3 — средняя';
+    impact = 'Игрок не может добавить игру в избранное из текущего интерфейса.';
+  } else if (/avatar upload/.test(signal)) {
+    severity = 'S4 — низкая';
+    priority = 'P3 — низкая';
+    impact = 'Игрок не может персонализировать профиль аватаром.';
+  } else if (/editable profile|validation input fields/.test(signal)) {
+    severity = 'S2 — высокая';
+    priority = 'P1 — высокая';
+    impact = 'Нельзя изменить или корректно проверить персональные данные профиля.';
+  } else if (/preference control/.test(signal)) {
+    severity = 'S3 — средняя';
+    impact = 'Нельзя изменить и сохранить пользовательские настройки.';
+  }
+
+  if (test.status === 'product-blocked' && !/recent games list did not include/.test(signal)) {
+    reproducibility =
+      'Автотест не смог продолжить сценарий из-за отсутствующего элемента или данных';
+  }
+
+  return {
+    type,
+    severity,
+    priority,
+    confirmation,
+    reproducibility,
+    impact,
+    workflowStatus: 'Нужен триаж',
+    component: inferAreaContext(test).label,
+    issueTitle: inferIssueTitle({ test, manualPlan, actualResult }),
+  };
+}
+
+function inferViewport(mode) {
+  return mode === 'mobile' ? '390 × 844' : '1365 × 900';
+}
+
+function compactLogExcerpt(value, maxLines = 12, maxChars = 2200) {
+  const lines = String(value || '')
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .slice(0, maxLines);
+  const excerpt = lines.join('\n');
+  return excerpt.length > maxChars ? `${excerpt.slice(0, maxChars)}…` : excerpt;
+}
+
+function relevantNetworkRecords(candidates, primaryNetwork) {
+  const records = Array.isArray(candidates) ? candidates : [];
+  const relevant = records.filter((item) => {
+    const url = String((item && item.url) || '').toLowerCase();
+    return (
+      (primaryNetwork && item.url === primaryNetwork.url) ||
+      (typeof item.status === 'number' && item.status >= 400) ||
+      item.errorText ||
+      item.consoleError ||
+      /undefined|\/null(?:[./?#]|$)|\/error(?:[/?#]|$)|\/fail(?:[/?#]|$)/.test(url)
+    );
+  });
+  const unique = new Map();
+  for (const item of relevant) {
+    if (!unique.has(item.url)) unique.set(item.url, item);
+  }
+  return Array.from(unique.values()).slice(0, 5);
+}
+
+function displayNetworkUrl(value) {
+  try {
+    const parsed = new URL(String(value || ''));
+    return `${parsed.origin}${parsed.pathname}`;
+  } catch {
+    return oneLine(value || '');
+  }
 }
 
 function buildManualReproPlan({ test, commandHint, primaryNetwork }) {
@@ -762,81 +1064,103 @@ function buildManualReproPlan({ test, commandHint, primaryNetwork }) {
   const providerName = extractProviderName(title);
 
   const preconditions = [
-    `Brand URL: ${baseUrl}`,
-    `Execution mode: ${executionMode}`,
+    `URL бренда: ${baseUrl}`,
+    `Режим запуска: ${executionMode}`,
     userState === 'authorized'
-      ? 'Use an existing player account that can sign in on this brand.'
-      : 'Use a guest session (not authorized).',
+      ? 'Доступна существующая учётная запись игрока с возможностью авторизации.'
+      : 'Используется гостевая сессия без авторизации.',
   ];
   if (test.projectName) {
-    preconditions.push(`Playwright project: ${test.projectName}.`);
+    preconditions.push(`Проект Playwright: ${test.projectName}.`);
   }
   if (area.route && area.route !== '/') {
-    preconditions.push(`Target area is reachable: ${area.route}.`);
+    preconditions.push(`Целевой раздел доступен по маршруту ${area.route}.`);
   }
   if (providerName) {
-    preconditions.push(`Provider is present in current catalog: ${providerName}.`);
+    preconditions.push(`Провайдер доступен в списке фильтров: ${providerName}.`);
   }
   if (primaryNetwork && primaryNetwork.url) {
-    preconditions.push('Open browser DevTools (Network tab) before final action.');
+    preconditions.push('Перед последним действием открыта вкладка Network в DevTools.');
   }
 
   const steps = [
-    `Open ${baseUrl} in a clean browser session and wait for the homepage to finish loading.`,
+    `Открыть ${baseUrl} в чистой сессии браузера и дождаться полной загрузки главной страницы.`,
   ];
   if (executionMode === 'mobile') {
-    steps.push('Use mobile viewport/device emulation (390x844) before starting interactions.');
+    steps.push('До начала действий включить мобильный viewport 390×844.');
   }
 
   if (userState === 'authorized') {
-    steps.push('Sign in with an existing player account.');
+    steps.push('Авторизоваться под существующей учётной записью игрока.');
   } else if (userState === 'guest') {
-    steps.push('Stay logged out (guest mode).');
+    steps.push('Остаться без авторизации в гостевом режиме.');
   }
 
   if (area.key === 'casino') {
-    steps.push('Open the "Casino" page.');
+    steps.push('Открыть страницу Casino.');
   } else if (area.key === 'livecasino') {
-    steps.push('Open the "Live Casino" page.');
+    steps.push('Открыть страницу Live Casino.');
   } else if (area.key === 'sports') {
-    steps.push('Open the "Sports" page.');
+    steps.push('Открыть страницу Sports.');
   } else if (area.key === 'profile') {
-    steps.push('Open "My Profile".');
+    steps.push('Открыть My Profile.');
   } else if (area.key === 'deposit') {
-    steps.push('Open deposit/cashier surface from header/profile wallet.');
+    steps.push('Открыть раздел депозита через шапку сайта или кошелёк профиля.');
   } else if (area.key === 'sidebar') {
-    steps.push('Open sidebar navigation menu.');
+    steps.push('Открыть боковое меню навигации.');
   } else if (area.key === 'registration') {
-    steps.push('Open the sign-up form.');
+    steps.push('Открыть форму регистрации.');
   } else if (area.key === 'auth') {
-    steps.push('Open the login form.');
+    steps.push('Открыть форму входа.');
   }
 
   if (providerName && /\bprovider\b.*\breal launch\b|\bnon-demo\b/.test(titleLower)) {
-    steps.push(`Open providers filter and select "${providerName}".`);
-    steps.push(`Launch any game from "${providerName}" using "Play" (not demo mode).`);
-    steps.push('Wait up to 90 seconds for game iframe/surface to become stable.');
+    steps.push(`Открыть фильтр провайдеров и выбрать «${providerName}».`);
+    steps.push(`Запустить любую игру «${providerName}» кнопкой Play, не в деморежиме.`);
+    steps.push('Подождать до 90 секунд, пока игровая область или iframe стабилизируется.');
   } else if (providerName && /\bdemo\b|\btry for fun\b/.test(titleLower)) {
-    steps.push(`Open providers filter and select "${providerName}".`);
-    steps.push(`Launch any game from "${providerName}" using "Try for Fun"/demo.`);
+    steps.push(`Открыть фильтр провайдеров и выбрать «${providerName}».`);
+    steps.push(`Запустить любую игру «${providerName}» через Try for Fun / Demo.`);
+  } else if (/favorites?/.test(titleLower)) {
+    steps.push('На карточке игры нажать управление избранным и открыть список Favorites.');
+  } else if (/recent history|recent games/.test(titleLower)) {
+    steps.push('Запустить игру в реальном режиме, закрыть её и открыть список недавних игр.');
+  } else if (/metadata smoke/.test(titleLower)) {
+    steps.push(
+      'Для каждого проверяемого спортивного маршрута проверить document.title, видимый H1 и canonical link.'
+    );
+  } else if (/network diagnostics/.test(titleLower)) {
+    steps.push(
+      'Проверить запросы флагов стран в Network и найти URL с undefined/null вместо кода страны.'
+    );
   } else if (/\bsearch\b/.test(titleLower)) {
-    steps.push('Open search control, enter a query, and apply it.');
+    steps.push('Открыть поиск, ввести запрос и применить его.');
   } else if (/\bfilter\b/.test(titleLower)) {
-    steps.push('Open filters, apply one value, and verify resulting catalog/list update.');
+    steps.push('Открыть фильтры, выбрать значение и проверить обновление каталога.');
   } else if (/\blive chat\b/.test(titleLower)) {
-    steps.push('Open live chat widget and complete the interaction required by this case.');
+    steps.push('Открыть Live Chat и выполнить целевое действие сценария.');
   } else if (/\bavatar\b/.test(titleLower)) {
-    steps.push('In Account section, upload avatar and save changes.');
+    steps.push('В разделе Account загрузить аватар и сохранить изменения.');
+  } else if (/editable field persists/.test(titleLower)) {
+    steps.push(
+      'Изменить доступное текстовое поле профиля, сохранить данные и перезагрузить страницу.'
+    );
+  } else if (/profile validations/.test(titleLower)) {
+    steps.push(
+      'Поочерёдно ввести в поле профиля пустое, неверное и слишком длинное значение, сохраняя форму.'
+    );
   } else if (/\bsettings\b|\btoggle\b|\bdropdown\b/.test(titleLower)) {
-    steps.push('In the target section, change setting/toggle/dropdown and apply changes.');
+    steps.push(
+      'В целевом разделе изменить настройку, переключатель или список и применить изменения.'
+    );
   } else {
-    steps.push(`Repeat user actions from the case title: "${test.title || title}".`);
+    steps.push(`Повторить пользовательские действия из исходного теста: «${test.title || title}».`);
   }
 
   if (primaryNetwork && primaryNetwork.url) {
-    steps.push(`Monitor request(s) related to: ${primaryNetwork.url}`);
+    steps.push(`Проверить запросы, связанные с ${displayNetworkUrl(primaryNetwork.url)}.`);
   }
-  steps.push('Compare observed behavior with "Actual Result" section below.');
+  steps.push('Сравнить результат с разделами «Фактический» и «Ожидаемый» ниже.');
 
   return {
     executionMode,
@@ -852,6 +1176,9 @@ function buildBugMarkdown({
   test,
   commandHint,
   manualPlan,
+  triage,
+  generatedAt,
+  playerCredentials,
   actualResult,
   primaryNetwork,
   networkCandidates,
@@ -860,94 +1187,107 @@ function buildBugMarkdown({
   stdoutText,
   stderrText,
 }) {
+  const evidence = dedupeEvidence(copiedAttachments);
   const lines = [];
-  lines.push(`# Bug ${bugId}`);
+  lines.push(`# ${triage.issueTitle}`);
   lines.push('');
-  lines.push('## Bug');
+  lines.push(`> ${actualResult}`);
   lines.push('');
-  lines.push(`- Phase: ${test.phase}`);
-  lines.push(`- Test: ${test.titlePath || test.title}`);
-  lines.push(`- File: ${test.file || '-'}`);
-  lines.push(`- Status: ${test.status}`);
-  lines.push(`- Project: ${test.projectName || '-'}`);
-  lines.push(`- Execution mode: ${manualPlan.executionMode || '-'}`);
+  lines.push('## Триаж');
   lines.push('');
-  lines.push('## Preconditions');
+  lines.push('| Поле | Значение |');
+  lines.push('| --- | --- |');
+  lines.push(`| ID | ${bugId} |`);
+  lines.push(`| Статус | ${triage.workflowStatus} |`);
+  lines.push(`| Тип | ${triage.type} |`);
+  lines.push(`| Серьёзность | ${triage.severity} |`);
+  lines.push(`| Приоритет | ${triage.priority} |`);
+  lines.push(`| Компонент | ${triage.component} |`);
+  lines.push(`| Подтверждение | ${triage.confirmation} |`);
+  lines.push(`| Воспроизводимость | ${triage.reproducibility} |`);
+  lines.push('');
+  lines.push('## Влияние');
+  lines.push('');
+  lines.push(triage.impact);
+  lines.push('');
+  lines.push('## Окружение');
+  lines.push('');
+  lines.push(`- URL: ${baseUrl}`);
+  lines.push(`- Платформа: ${manualPlan.executionMode || '-'}`);
+  lines.push(`- Viewport: ${inferViewport(manualPlan.executionMode)}`);
+  lines.push(`- Браузер: Chromium / Playwright (${test.projectName || 'project не указан'})`);
+  lines.push(`- ОС раннера: ${process.platform} ${process.arch}`);
+  lines.push(`- Сформировано: ${generatedAt}`);
+  lines.push('');
+  lines.push('## Данные тестового игрока');
+  lines.push('');
+  lines.push(`- Почта: ${playerCredentials.email}`);
+  lines.push(`- Пароль: ${playerCredentials.password}`);
+  lines.push(`- Источник: ${playerCredentials.source}`);
+  lines.push(`- Статус проверки входа: ${playerCredentials.validationStatus}`);
+  lines.push('');
+  lines.push('## Предусловия');
   lines.push('');
   for (const precondition of manualPlan.preconditions || []) {
     lines.push(`- ${precondition}`);
   }
   lines.push('');
-  lines.push('## Steps To Reproduce (Manual)');
+  lines.push('## Шаги воспроизведения');
   lines.push('');
   for (let index = 0; index < (manualPlan.steps || []).length; index += 1) {
     lines.push(`${index + 1}. ${manualPlan.steps[index]}`);
   }
   lines.push('');
-  lines.push('## Quick Re-Run (Automation)');
+  lines.push('## Фактический и ожидаемый результат');
   lines.push('');
-  lines.push(`- Command: \`${commandHint}\``);
+  lines.push('| Фактический | Ожидаемый |');
+  lines.push('| --- | --- |');
+  lines.push(`| ${actualResult || 'Сообщение не сохранено.'} | ${manualPlan.expectedResult} |`);
   lines.push('');
-  lines.push('## Actual Result');
+  lines.push('## Критерии приёмки исправления');
   lines.push('');
-  lines.push(actualResult || 'No explicit error message captured.');
-  lines.push('');
-  lines.push('## Expected Result');
-  lines.push('');
+  lines.push(`- [ ] ${manualPlan.expectedResult}`);
   lines.push(
-    manualPlan.expectedResult ||
-      'Scenario should complete successfully without runtime errors or critical diagnostics.'
+    '- [ ] Повторный запуск целевого теста завершается без product-blocked/product-warning.'
   );
+  lines.push('- [ ] В консоли и Network нет новых критичных ошибок для этого сценария.');
   lines.push('');
-  lines.push('## Triggering Network Request');
+  lines.push('## Доказательства');
   lines.push('');
+  lines.push(`- Скриншот: ${screenshotRelPath || 'не был сохранён'}`);
+  for (const item of evidence) lines.push(`- Вложение: ${item.relPath}`);
+  lines.push(`- Сетевых записей: ${networkCandidates.length} (полный файл: network-evidence.json)`);
+  lines.push('');
+  lines.push('## Техническая диагностика');
+  lines.push('');
+  lines.push(`- Исходный тест: ${test.titlePath || test.title}`);
+  lines.push(`- Файл: ${test.file || '-'}`);
+  lines.push(`- Фаза / статус автоматики: ${test.phase} / ${test.status}`);
+  lines.push(`- Команда повтора: \`${commandHint}\``);
   if (primaryNetwork) {
-    lines.push(`- URL: ${primaryNetwork.url}`);
-    lines.push(`- Method: ${primaryNetwork.method || '-'}`);
-    lines.push(`- Status: ${primaryNetwork.status != null ? primaryNetwork.status : '-'}`);
-    lines.push(`- Status Text: ${primaryNetwork.statusText || '-'}`);
-    lines.push(`- Error: ${primaryNetwork.errorText || primaryNetwork.consoleError || '-'}`);
-    lines.push(`- Source: ${primaryNetwork.source || '-'}`);
+    lines.push(
+      `- Основной запрос: ${primaryNetwork.method || 'GET'} ${displayNetworkUrl(primaryNetwork.url)}`
+    );
+    lines.push(
+      `- HTTP / ошибка: ${primaryNetwork.status != null ? primaryNetwork.status : '-'} ${primaryNetwork.errorText || primaryNetwork.consoleError || ''}`
+    );
   } else {
-    lines.push('- Network trigger not found in available artifacts.');
+    lines.push('- Основной проблемный запрос не определён.');
   }
   lines.push('');
-  lines.push('## Logs');
+  lines.push('### Выдержка из логов');
   lines.push('');
-  if (stdoutText) {
-    lines.push('### stdout');
-    lines.push('');
+  const logExcerpt = compactLogExcerpt(stderrText || stdoutText);
+  if (logExcerpt) {
     lines.push('```text');
-    lines.push(stdoutText);
+    lines.push(logExcerpt);
     lines.push('```');
     lines.push('');
-  }
-  if (stderrText) {
-    lines.push('### stderr');
-    lines.push('');
-    lines.push('```text');
-    lines.push(stderrText);
-    lines.push('```');
-    lines.push('');
-  }
-  if (!stdoutText && !stderrText) {
-    lines.push('No stdout/stderr logs captured for final test attempt.');
-    lines.push('');
-  }
-
-  lines.push('## Evidence');
-  lines.push('');
-  if (screenshotRelPath) lines.push(`- Screenshot: ${screenshotRelPath}`);
-  else lines.push('- Screenshot: not found');
-  if (copiedAttachments.length > 0) {
-    for (const item of copiedAttachments) {
-      lines.push(`- Attachment: ${item.relPath}`);
-    }
+    lines.push('Полный вывод сохранён в `logs.txt`.');
   } else {
-    lines.push('- Attachment: none');
-  }
-  if (networkCandidates.length > 0) {
-    lines.push(`- Network records extracted: ${networkCandidates.length}`);
+    lines.push(
+      'stdout/stderr для финальной попытки не сохранены; диагностические аннотации доступны в `logs.txt`.'
+    );
   }
   lines.push('');
   return `${lines.join('\n')}\n`;
@@ -958,6 +1298,9 @@ function buildBugHtml({
   test,
   commandHint,
   manualPlan,
+  triage,
+  generatedAt,
+  playerCredentials,
   actualResult,
   primaryNetwork,
   networkCandidates,
@@ -966,26 +1309,25 @@ function buildBugHtml({
   stdoutText,
   stderrText,
 }) {
+  const evidence = dedupeEvidence(copiedAttachments);
+  const visibleNetworkRecords = relevantNetworkRecords(networkCandidates, primaryNetwork);
   const screenshotBlock = screenshotRelPath
-    ? `<div class="card"><h3>Screenshot</h3><img src="${escapeHtml(
+    ? `<div class="evidence-card"><h3>Скриншот</h3><img src="${escapeHtml(
         screenshotRelPath
       )}" alt="Bug screenshot" /></div>`
-    : '<div class="card"><h3>Screenshot</h3><p>No screenshot found.</p></div>';
+    : '<div class="evidence-card muted"><h3>Скриншот</h3><p>Не был сохранён для этой проверки.</p></div>';
 
   const attachmentsHtml =
-    copiedAttachments.length > 0
-      ? `<ul>${copiedAttachments
-          .map((item) => `<li>${escapeHtml(item.relPath)}</li>`)
-          .join('')}</ul>`
-      : '<p>No attachments copied.</p>';
+    evidence.length > 0
+      ? `<ul>${evidence.map((item) => `<li>${escapeHtml(item.relPath)}</li>`).join('')}</ul>`
+      : '<p class="muted">Дополнительных вложений нет.</p>';
 
   const networkRows =
-    networkCandidates.length > 0
-      ? networkCandidates
-          .slice(0, 30)
+    visibleNetworkRecords.length > 0
+      ? visibleNetworkRecords
           .map(
             (item) => `<tr>
-      <td>${escapeHtml(item.url)}</td>
+      <td>${escapeHtml(displayNetworkUrl(item.url))}</td>
       <td>${escapeHtml(item.method || '-')}</td>
       <td>${escapeHtml(item.status != null ? String(item.status) : '-')}</td>
       <td>${escapeHtml(item.errorText || item.consoleError || '-')}</td>
@@ -993,129 +1335,193 @@ function buildBugHtml({
     </tr>`
           )
           .join('')
-      : '<tr><td colspan="5">No network records found.</td></tr>';
+      : '<tr><td colspan="5">Сетевые записи не найдены.</td></tr>';
 
   const primaryNetworkHtml = primaryNetwork
-    ? `<ul>
-      <li><strong>URL:</strong> ${escapeHtml(primaryNetwork.url)}</li>
-      <li><strong>Method:</strong> ${escapeHtml(primaryNetwork.method || '-')}</li>
-      <li><strong>Status:</strong> ${
+    ? `<div class="network-primary">
+      <div><strong>URL:</strong> ${escapeHtml(displayNetworkUrl(primaryNetwork.url))}</div>
+      <div><strong>Метод:</strong> ${escapeHtml(primaryNetwork.method || '-')}</div>
+      <div><strong>Статус:</strong> ${
         primaryNetwork.status != null ? escapeHtml(String(primaryNetwork.status)) : '-'
-      }</li>
-      <li><strong>Status Text:</strong> ${escapeHtml(primaryNetwork.statusText || '-')}</li>
-      <li><strong>Error:</strong> ${escapeHtml(
+      }</div>
+      <div><strong>Ошибка:</strong> ${escapeHtml(
         primaryNetwork.errorText || primaryNetwork.consoleError || '-'
-      )}</li>
-      <li><strong>Source:</strong> ${escapeHtml(primaryNetwork.source || '-')}</li>
-    </ul>`
-    : '<p>Network trigger not found in available artifacts.</p>';
+      )}</div>
+    </div>`
+    : '<p class="muted">Основной проблемный запрос не определён.</p>';
+
+  const logExcerpt = compactLogExcerpt(stderrText || stdoutText);
 
   return `<!doctype html>
-<html lang="en">
+<html lang="ru">
   <head>
     <meta charset="UTF-8" />
-    <title>Bug ${escapeHtml(bugId)}</title>
+    <title>${escapeHtml(triage.issueTitle)}</title>
     <style>
-      body { font-family: Arial, sans-serif; margin: 24px; color: #111; }
-      h1, h2, h3 { margin: 0 0 8px 0; }
-      section { margin: 0 0 20px 0; }
-      .meta { background: #f5f5f5; padding: 12px; border-radius: 8px; }
-      .card { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin: 8px 0; }
-      code, pre { font-family: Menlo, Monaco, Consolas, monospace; font-size: 12px; }
-      pre { background: #f7f7f7; border: 1px solid #ddd; padding: 8px; border-radius: 6px; white-space: pre-wrap; }
-      img { max-width: 100%; border: 1px solid #ccc; border-radius: 6px; }
-      table { border-collapse: collapse; width: 100%; font-size: 12px; }
-      th, td { border: 1px solid #ddd; padding: 6px; vertical-align: top; }
-      th { background: #f0f0f0; text-align: left; }
-      .muted { color: #666; }
+      @page { size: A4; margin: 13mm 12mm 15mm; }
+      * { box-sizing: border-box; }
+      html, body { width: 100%; max-width: 100%; overflow-x: hidden; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; margin: 0; color: #172033; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+      h1 { margin: 0 0 8px; max-width: 100%; font-size: 22px; line-height: 1.22; color: #101828; overflow-wrap: anywhere; }
+      h2 { margin: 0 0 10px; font-size: 15px; color: #101828; }
+      h3 { margin: 0 0 7px; font-size: 12px; }
+      section { margin: 0 0 15px; break-inside: avoid; }
+      .eyebrow { max-width: 100%; color: #475467; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; overflow-wrap: anywhere; }
+      .summary { width: 100%; max-width: 100%; margin: 0 0 16px; padding: 11px 13px; border-left: 4px solid #d92d20; background: #fff4f2; font-size: 12px; }
+      .triage { display: grid; width: 100%; min-width: 0; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+      .metric { min-width: 0; padding: 8px 9px; border: 1px solid #e4e7ec; border-radius: 7px; background: #f9fafb; overflow-wrap: anywhere; }
+      .metric b { display: block; margin-bottom: 2px; font-size: 9px; color: #667085; text-transform: uppercase; }
+      .impact { padding: 10px 12px; border-radius: 7px; background: #fffaeb; border: 1px solid #fedf89; }
+      .credentials { padding: 10px 12px; border-radius: 7px; background: #eff8ff; border: 1px solid #b2ddff; }
+      .credentials-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 14px; }
+      .credential-value { font-family: Menlo, Monaco, Consolas, monospace; overflow-wrap: anywhere; }
+      .security-note { margin: 7px 0 0; color: #475467; font-size: 9px; }
+      .env { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 14px; }
+      .env div { border-bottom: 1px solid #eaecf0; padding: 3px 0; }
+      ol, ul { margin: 6px 0 0; padding-left: 19px; }
+      li { margin: 0 0 4px; }
+      .result-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+      .result { border-radius: 7px; padding: 10px; border: 1px solid #e4e7ec; }
+      .actual { border-color: #fda29b; background: #fff4f2; }
+      .expected { border-color: #6ce9a6; background: #ecfdf3; }
+      .evidence-grid { display: grid; grid-template-columns: 1.2fr .8fr; gap: 9px; }
+      .evidence-card { border: 1px solid #e4e7ec; border-radius: 7px; padding: 9px; }
+      code, pre { font-family: Menlo, Monaco, Consolas, monospace; font-size: 9px; }
+      code { overflow-wrap: anywhere; }
+      pre { background: #f8fafc; border: 1px solid #e4e7ec; padding: 8px; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
+      img { display: block; max-width: 100%; max-height: 260px; object-fit: contain; border: 1px solid #d0d5dd; border-radius: 5px; }
+      table { border-collapse: collapse; width: 100%; font-size: 9px; table-layout: fixed; }
+      th, td { border: 1px solid #e4e7ec; padding: 5px; vertical-align: top; overflow-wrap: anywhere; }
+      th { background: #f2f4f7; text-align: left; }
+      .muted { color: #667085; }
+      .technical { break-before: auto; }
+      .technical-row { margin: 0 0 4px; overflow-wrap: anywhere; }
+      .checklist { list-style: none; padding-left: 0; }
+      .checklist li::before { content: "□"; margin-right: 7px; font-size: 14px; }
+      .footer-note { margin-top: 9px; color: #667085; font-size: 9px; }
     </style>
   </head>
   <body>
-    <h1>Bug ${escapeHtml(bugId)}</h1>
-    <section class="meta">
-      <div><strong>Phase:</strong> ${escapeHtml(test.phase)}</div>
-      <div><strong>Test:</strong> ${escapeHtml(test.titlePath || test.title)}</div>
-      <div><strong>File:</strong> ${escapeHtml(test.file || '-')}</div>
-      <div><strong>Status:</strong> ${escapeHtml(test.status)}</div>
-      <div><strong>Project:</strong> ${escapeHtml(test.projectName || '-')}</div>
-      <div><strong>Execution mode:</strong> ${escapeHtml(manualPlan.executionMode || '-')}</div>
+    <div class="eyebrow">${escapeHtml(bugId)} · ${escapeHtml(triage.workflowStatus)}</div>
+    <h1>${escapeHtml(triage.issueTitle)}</h1>
+    <p class="summary">${escapeHtml(actualResult)}</p>
+
+    <section>
+      <h2>Триаж</h2>
+      <div class="triage">
+        <div class="metric"><b>Тип</b>${escapeHtml(triage.type)}</div>
+        <div class="metric"><b>Серьёзность</b>${escapeHtml(triage.severity)}</div>
+        <div class="metric"><b>Приоритет</b>${escapeHtml(triage.priority)}</div>
+        <div class="metric"><b>Компонент</b>${escapeHtml(triage.component)}</div>
+        <div class="metric"><b>Подтверждение</b>${escapeHtml(triage.confirmation)}</div>
+        <div class="metric"><b>Воспроизводимость</b>${escapeHtml(triage.reproducibility)}</div>
+      </div>
     </section>
 
     <section>
-      <h2>Preconditions</h2>
+      <h2>Влияние</h2>
+      <div class="impact">${escapeHtml(triage.impact)}</div>
+    </section>
+
+    <section>
+      <h2>Окружение</h2>
+      <div class="env">
+        <div><strong>URL:</strong> ${escapeHtml(baseUrl)}</div>
+        <div><strong>Платформа:</strong> ${escapeHtml(manualPlan.executionMode || '-')}</div>
+        <div><strong>Viewport:</strong> ${escapeHtml(inferViewport(manualPlan.executionMode))}</div>
+        <div><strong>Браузер:</strong> Chromium / Playwright (${escapeHtml(test.projectName || '-')})</div>
+        <div><strong>ОС раннера:</strong> ${escapeHtml(`${process.platform} ${process.arch}`)}</div>
+        <div><strong>Сформировано:</strong> ${escapeHtml(generatedAt)}</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Данные тестового игрока</h2>
+      <div class="credentials">
+        <div class="credentials-grid">
+          <div><strong>Почта:</strong> <span class="credential-value">${escapeHtml(playerCredentials.email)}</span></div>
+          <div><strong>Пароль:</strong> <span class="credential-value">${escapeHtml(playerCredentials.password)}</span></div>
+          <div><strong>Источник:</strong> ${escapeHtml(playerCredentials.source)}</div>
+          <div><strong>Статус проверки входа:</strong> ${escapeHtml(playerCredentials.validationStatus)}</div>
+        </div>
+        <p class="security-note">Содержит открытые учётные данные тестового аккаунта. Ограничьте доступ к отчёту.</p>
+      </div>
+    </section>
+
+    <section>
+      <h2>Предусловия</h2>
       <ul>
         ${(manualPlan.preconditions || []).map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
       </ul>
     </section>
 
     <section>
-      <h2>Steps To Reproduce (Manual)</h2>
+      <h2>Шаги воспроизведения</h2>
       <ol>
         ${(manualPlan.steps || []).map((item) => `<li>${escapeHtml(item)}</li>`).join('')}
       </ol>
     </section>
 
     <section>
-      <h2>Quick Re-Run (Automation)</h2>
-      <p>Run: <code>${escapeHtml(commandHint)}</code></p>
-    </section>
-
-    <section>
-      <h2>Actual Result</h2>
-      <pre>${escapeHtml(actualResult || 'No explicit error message captured.')}</pre>
-    </section>
-
-    <section>
-      <h2>Expected Result</h2>
-      <p>${escapeHtml(
-        manualPlan.expectedResult ||
-          'Scenario should pass without runtime errors and without critical diagnostics.'
-      )}</p>
-    </section>
-
-    <section>
-      <h2>Triggering Network Request</h2>
-      ${primaryNetworkHtml}
-    </section>
-
-    <section>
-      <h2>Evidence</h2>
-      ${screenshotBlock}
-      <div class="card">
-        <h3>Attachments</h3>
-        ${attachmentsHtml}
+      <h2>Результат</h2>
+      <div class="result-grid">
+        <div class="result actual"><h3>Фактический</h3>${escapeHtml(actualResult)}</div>
+        <div class="result expected"><h3>Ожидаемый</h3>${escapeHtml(manualPlan.expectedResult)}</div>
       </div>
     </section>
 
     <section>
-      <h2>Logs</h2>
-      ${
-        stdoutText
-          ? `<h3>stdout</h3><pre>${escapeHtml(stdoutText)}</pre>`
-          : '<p class="muted">No stdout logs captured.</p>'
-      }
-      ${
-        stderrText
-          ? `<h3>stderr</h3><pre>${escapeHtml(stderrText)}</pre>`
-          : '<p class="muted">No stderr logs captured.</p>'
-      }
+      <h2>Критерии приёмки исправления</h2>
+      <ul class="checklist">
+        <li>${escapeHtml(manualPlan.expectedResult)}</li>
+        <li>Повторный запуск теста завершается без product-blocked/product-warning.</li>
+        <li>В консоли и Network нет новых критичных ошибок для этого сценария.</li>
+      </ul>
     </section>
 
     <section>
-      <h2>Network Records (${networkCandidates.length})</h2>
+      <h2>Доказательства</h2>
+      <div class="evidence-grid">
+        ${screenshotBlock}
+        <div class="evidence-card">
+          <h3>Вложения</h3>
+          ${attachmentsHtml}
+          <p class="footer-note">Сетевых записей: ${networkCandidates.length}. Полные данные: network-evidence.json</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="technical">
+      <h2>Техническая диагностика</h2>
+      <div class="technical-row"><strong>Исходный тест:</strong> ${escapeHtml(test.titlePath || test.title)}</div>
+      <div class="technical-row"><strong>Файл:</strong> ${escapeHtml(test.file || '-')}</div>
+      <div class="technical-row"><strong>Фаза / статус:</strong> ${escapeHtml(test.phase)} / ${escapeHtml(test.status)}</div>
+      <div class="technical-row"><strong>Команда повтора:</strong> <code>${escapeHtml(commandHint)}</code></div>
+      <h3 style="margin-top:10px">Основной сетевой сигнал</h3>
+      ${primaryNetworkHtml}
+      <h3 style="margin-top:10px">Выдержка из логов</h3>
+      ${logExcerpt ? `<pre>${escapeHtml(logExcerpt)}</pre><p class="muted">Полный вывод: logs.txt</p>` : '<p class="muted">stdout/stderr не сохранены; аннотации доступны в logs.txt.</p>'}
+    </section>
+
+    ${
+      visibleNetworkRecords.length > 1
+        ? `<section>
+      <h2>Релевантные сетевые записи (${visibleNetworkRecords.length}; всего сохранено ${networkCandidates.length})</h2>
       <table>
         <thead>
           <tr>
             <th>URL</th>
-            <th>Method</th>
-            <th>Status</th>
-            <th>Error</th>
-            <th>Source</th>
+            <th style="width:10%">Метод</th>
+            <th style="width:10%">Статус</th>
+            <th style="width:22%">Ошибка</th>
+            <th style="width:18%">Источник</th>
           </tr>
         </thead>
         <tbody>${networkRows}</tbody>
       </table>
-    </section>
+    </section>`
+        : ''
+    }
   </body>
 </html>
 `;
@@ -1128,6 +1534,10 @@ async function exportPdfFromHtml(page, htmlPath, pdfPath) {
     path: pdfPath,
     format: 'A4',
     printBackground: true,
+    displayHeaderFooter: true,
+    headerTemplate: '<span></span>',
+    footerTemplate:
+      '<div style="width:100%;padding:0 12mm;text-align:right;font-family:Arial,sans-serif;font-size:8px;color:#667085"><span class="pageNumber"></span> / <span class="totalPages"></span></div>',
     margin: { top: '12mm', right: '10mm', bottom: '12mm', left: '10mm' },
   });
 }
@@ -1197,7 +1607,18 @@ function dedupeEvidence(items) {
 
 async function main() {
   const tests = loadAllTests();
+  const playerCredentials = loadPlayerCredentials();
+  const reportPlayerCredentials = visiblePlayerCredentials(playerCredentials);
   const failedTests = tests.filter((test) => failureStatuses.has(test.status));
+  const bugCandidateTests = tests.filter(
+    (test) =>
+      failureStatuses.has(test.status) ||
+      (test.annotations || []).some((annotation) =>
+        ['product-blocked', 'product-warning'].includes(
+          String((annotation && annotation.type) || '').toLowerCase()
+        )
+      )
+  );
 
   cleanDir(screenshotsAllDir);
   cleanDir(screenshotsFailDir);
@@ -1225,7 +1646,21 @@ async function main() {
 
   {
     let bugIndex = 0;
-    for (const test of failedTests) {
+    for (const sourceTest of bugCandidateTests) {
+      const isProductBlocked = (sourceTest.annotations || []).some(
+        (annotation) =>
+          String((annotation && annotation.type) || '').toLowerCase() === 'product-blocked'
+      );
+      const isProductWarning = (sourceTest.annotations || []).some(
+        (annotation) =>
+          String((annotation && annotation.type) || '').toLowerCase() === 'product-warning'
+      );
+      const test =
+        isProductBlocked && !failureStatuses.has(sourceTest.status)
+          ? { ...sourceTest, status: 'product-blocked' }
+          : isProductWarning && !failureStatuses.has(sourceTest.status)
+            ? { ...sourceTest, status: 'product-warning' }
+            : sourceTest;
       bugIndex += 1;
       const executionMode = inferExecutionMode(test);
       const bugId = `${String(bugIndex).padStart(3, '0')}-${slugify(
@@ -1294,7 +1729,10 @@ async function main() {
           const bodyPath = writeBodyAttachment(
             attachment.body,
             attachment.contentType,
-            path.join(evidenceDir, attachmentName || 'attachment')
+            path.join(
+              evidenceDir,
+              path.basename(attachmentName || 'attachment', path.extname(attachmentName || ''))
+            )
           );
           if (bodyPath) {
             copiedAttachments.push({
@@ -1304,6 +1742,32 @@ async function main() {
               copiedPath: bodyPath,
               relPath: asRelative(bodyPath, bugDir),
             });
+            if (isImageAttachment(attachment)) {
+              const copiedToFail = copyFileSafe(
+                bodyPath,
+                path.join(failDir, path.basename(bodyPath))
+              );
+              const copiedToBugScreens = copyFileSafe(
+                bodyPath,
+                path.join(bugDir, 'screenshots', path.basename(bodyPath))
+              );
+              if (copiedToFail) {
+                copiedScreenshots.push({
+                  sourcePath: bodyPath,
+                  failPath: copiedToFail,
+                  bugPath: copiedToBugScreens || '',
+                });
+              }
+              if (copiedToBugScreens) {
+                copiedAttachments.push({
+                  name: 'screenshot',
+                  contentType: attachment.contentType || 'image/png',
+                  sourcePath: bodyPath,
+                  copiedPath: copiedToBugScreens,
+                  relPath: asRelative(copiedToBugScreens, bugDir),
+                });
+              }
+            }
           }
         }
       }
@@ -1317,12 +1781,13 @@ async function main() {
       }
 
       const annotationsText = test.annotations
+        .filter((item) => oneLine(item && item.description))
         .map((item) => `${item.type}: ${item.description}`)
         .filter(Boolean)
         .join('\n');
       const stdoutText = formatOutput(test.stdout);
       const stderrText = formatOutput(test.stderr);
-      const actualResult = oneLine([test.error, annotationsText].filter(Boolean).join(' | '));
+      const actualResult = conciseActualResult(test);
 
       const network = { items: [], keys: new Set() };
       for (const url of extractUrls(test.error)) {
@@ -1359,16 +1824,22 @@ async function main() {
         commandHint,
         primaryNetwork,
       });
+      const generatedAt = new Date().toISOString();
+      const triage = inferTriage({ test, manualPlan, actualResult });
+      const evidence = dedupeEvidence(copiedAttachments);
       const markdown = buildBugMarkdown({
         bugId,
         test,
         commandHint,
         manualPlan,
+        triage,
+        generatedAt,
+        playerCredentials: reportPlayerCredentials,
         actualResult,
         primaryNetwork,
         networkCandidates,
         screenshotRelPath,
-        copiedAttachments: dedupeEvidence(copiedAttachments),
+        copiedAttachments: evidence,
         stdoutText,
         stderrText,
       });
@@ -1377,11 +1848,14 @@ async function main() {
         test,
         commandHint,
         manualPlan,
+        triage,
+        generatedAt,
+        playerCredentials: reportPlayerCredentials,
         actualResult,
         primaryNetwork,
         networkCandidates,
         screenshotRelPath,
-        copiedAttachments: dedupeEvidence(copiedAttachments),
+        copiedAttachments: evidence,
         stdoutText,
         stderrText,
       });
@@ -1393,27 +1867,41 @@ async function main() {
       const networkPath = path.join(bugDir, 'network-evidence.json');
       const logsPath = path.join(bugDir, 'logs.txt');
 
-      fs.writeFileSync(markdownPath, markdown, 'utf8');
-      fs.writeFileSync(htmlPath, html, 'utf8');
+      fs.writeFileSync(
+        markdownPath,
+        restoreVisiblePlayerCredentials(redactText(markdown), playerCredentials),
+        'utf8'
+      );
+      fs.writeFileSync(
+        htmlPath,
+        restoreVisiblePlayerCredentials(redactText(html), playerCredentials, { html: true }),
+        'utf8'
+      );
       fs.writeFileSync(
         networkPath,
-        JSON.stringify({ primary: primaryNetwork, records: networkCandidates }, null, 2),
+        JSON.stringify(
+          redactObject({ primary: primaryNetwork, records: networkCandidates }),
+          null,
+          2
+        ),
         'utf8'
       );
       fs.writeFileSync(
         logsPath,
-        [
-          `Error: ${test.error || '-'}`,
-          '',
-          'Annotations:',
-          annotationsText || '-',
-          '',
-          'stdout:',
-          stdoutText || '-',
-          '',
-          'stderr:',
-          stderrText || '-',
-        ].join('\n'),
+        redactText(
+          [
+            `Error: ${test.error || '-'}`,
+            '',
+            'Annotations:',
+            annotationsText || '-',
+            '',
+            'stdout:',
+            stdoutText || '-',
+            '',
+            'stderr:',
+            stderrText || '-',
+          ].join('\n')
+        ),
         'utf8'
       );
 
@@ -1429,9 +1917,13 @@ async function main() {
         error: test.error || '',
         annotations: test.annotations,
         commandHint,
-        manualReproduction: manualPlan,
+        issueTitle: triage.issueTitle,
+        triage,
+        generatedAt,
+        playerCredentials: reportPlayerCredentials,
+        manualReproduction: { ...manualPlan, actualResult },
         screenshotCount: copiedScreenshots.length,
-        attachments: dedupeEvidence(copiedAttachments).map((item) => ({
+        attachments: evidence.map((item) => ({
           name: item.name,
           contentType: item.contentType,
           relPath: item.relPath,
@@ -1439,7 +1931,15 @@ async function main() {
         })),
         primaryNetwork,
       };
-      fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2), 'utf8');
+      const safeMetadata = redactObject(metadata);
+      safeMetadata.playerCredentials = {
+        email: playerCredentials.email || '',
+        password: playerCredentials.password || '',
+        source: playerCredentials.source || '',
+        validationStatus: playerCredentials.validationStatus || '',
+        available: reportPlayerCredentials.available,
+      };
+      fs.writeFileSync(metadataPath, JSON.stringify(safeMetadata, null, 2), 'utf8');
 
       pdfJobs.push({ htmlPath, pdfPath });
 
@@ -1449,7 +1949,8 @@ async function main() {
         status: test.status,
         projectName: test.projectName || '',
         executionMode: manualPlan.executionMode || inferExecutionMode(test),
-        title: test.titlePath || test.title,
+        title: triage.issueTitle,
+        sourceTestTitle: test.titlePath || test.title,
         file: test.file || '-',
         folder: bugDir,
         pdfPath,
@@ -1457,6 +1958,7 @@ async function main() {
         htmlPath,
         screenshotCount: copiedScreenshots.length,
         primaryNetwork,
+        triage,
       });
     }
   }
@@ -1511,6 +2013,7 @@ async function main() {
           pdfPath: entry.pdfPath,
           screenshotCount: entry.screenshotCount,
           primaryNetwork: entry.primaryNetwork || null,
+          triage: entry.triage || null,
         })),
       },
       null,
@@ -1526,14 +2029,16 @@ async function main() {
     '',
     `Total bugs: ${bugEntries.length}`,
     '',
-    '| Bug ID | Phase | Mode | Status | Test | File | PDF | Screenshots |',
-    '| --- | --- | --- | --- | --- | --- | --- | --- |',
+    '| Bug ID | Заголовок | Severity | Priority | Подтверждение | Phase | Mode | PDF | Screenshots |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
     ...bugEntries.map(
       (entry) =>
-        `| ${entry.bugId} | ${entry.phase} | ${entry.executionMode || '-'} | ${entry.status} | ${entry.title.replace(
+        `| ${entry.bugId} | ${entry.title.replace(
           /\|/g,
           '\\|'
-        )} | ${String(entry.file || '-').replace(/\|/g, '\\|')} | ${asRelative(
+        )} | ${entry.triage?.severity || '-'} | ${entry.triage?.priority || '-'} | ${
+          entry.triage?.confirmation || '-'
+        } | ${entry.phase} | ${entry.executionMode || '-'} | ${asRelative(
           entry.pdfPath,
           bugsRoot
         )} | ${entry.screenshotCount} |`

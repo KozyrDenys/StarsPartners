@@ -1,15 +1,20 @@
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const {
   closeModal,
+  closeMobileNavigationOverlay,
   detectCloudflare,
   dismissOverlays,
   markBlocked,
   waitForUiSettled,
 } = require('../helpers/gt-utils');
 const { pickBestAuthStatePath } = require('../helpers/auth-state');
+const {
+  resolveExtraHTTPHeaders,
+  resolveMatrixContextOptions,
+} = require('../helpers/context-options');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const BASE_ORIGIN = new URL(BASE_URL).origin;
@@ -25,6 +30,7 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
@@ -184,25 +190,33 @@ async function openCasino(page) {
 }
 
 async function waitForCasinoContent(page) {
-  const heading = page.getByText(/^games$|^popular$/i).first();
-  const searchButton = page.locator('.t-games-catalog__search-btn').first();
-  const searchInput = page
-    .locator(
-      '.t-games-catalog input[placeholder*="Search" i], .t-games-catalog input[type="search"], .t-games-catalog input[class*="search" i], [class*="games-catalog" i] input[placeholder*="Search" i], [class*="games-catalog" i] input[type="search"], [data-testid="sidebar-search-input"]'
-    )
-    .first();
-  const gameCard = page
-    .locator(
-      '.t-games-catalog .t-game-play, .t-games-catalog a[href*="/casino/"], main [class*="game-play" i], main [class*="games-item" i]'
-    )
-    .first();
-
-  await Promise.any([
-    heading.waitFor({ state: 'visible', timeout: 30000 }),
-    searchButton.waitFor({ state: 'visible', timeout: 30000 }),
-    searchInput.waitFor({ state: 'visible', timeout: 30000 }),
-    gameCard.waitFor({ state: 'visible', timeout: 30000 }),
-  ]).catch(() => null);
+  const deadlineAt = Date.now() + 30_000;
+  let lastState = { gameCards: 0, skeletons: 0, emptyStateVisible: false };
+  while (Date.now() < deadlineAt) {
+    const gameCards = await page
+      .locator(
+        '.t-games-catalog .t-game-item, .t-games-catalog a[href*="/casino/"], main .t-game-item, main [class*="game-play" i] a[href], main [class*="game-card" i] a[href]'
+      )
+      .count()
+      .catch(() => 0);
+    const skeletons = await page
+      .locator(
+        'main [class*="skeleton" i]:visible, main [class*="placeholder" i]:visible, main [aria-busy="true"]:visible'
+      )
+      .count()
+      .catch(() => 0);
+    const emptyStateVisible = await page
+      .getByText(/^(nothing found|no games|no results|not available)$/i)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    lastState = { gameCards, skeletons, emptyStateVisible };
+    if ((gameCards > 0 || emptyStateVisible) && skeletons === 0) {
+      return { ready: true, ...lastState };
+    }
+    await sleep(400);
+  }
+  return { ready: false, ...lastState };
 }
 
 async function collectCatalogEntries(page) {
@@ -224,17 +238,20 @@ async function collectCatalogEntries(page) {
         document.body;
       const links = Array.from(
         root.querySelectorAll(
-          'a[href*="/casino/"], [class*="game-play" i], [class*="games-item" i], [class*="game-card" i]'
+          '.t-game-item, a[href*="/casino/"], [class*="game-play" i], [class*="games-item" i], [class*="game-card" i]'
         )
       ).filter((node) => isVisible(node));
 
       const unique = new Map();
-      for (const node of links) {
+      for (const [index, node] of links.entries()) {
         const anchor = node.matches('a[href]') ? node : node.querySelector('a[href*="/casino/"]');
         const href = (anchor && anchor.getAttribute('href')) || '';
-        const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+        const imageTitle = node.querySelector('img[alt]')?.getAttribute('alt') || '';
+        const text = (node.innerText || imageTitle || node.textContent || '')
+          .replace(/\s+/g, ' ')
+          .trim();
         if (!href && !text) continue;
-        const key = `${href}|${text}`;
+        const key = `${href}|${text || `card-${index + 1}`}`;
         if (!unique.has(key)) unique.set(key, { href, text });
       }
       return [...unique.values()];
@@ -242,7 +259,94 @@ async function collectCatalogEntries(page) {
     .catch(() => []);
 }
 
+async function mobileSidebarCoversViewport(page) {
+  const activeToggle = await firstVisibleLocator(page, [
+    '.t-sidebar-menu__toggle-btn-active',
+    '.t-sidebar-menu__toggle-btn.is-active',
+    '[class*="sidebar-menu" i] [class*="toggle" i][class*="active" i]',
+  ]);
+  if (activeToggle) return true;
+  return page
+    .locator('aside, [role="complementary"], [class*="sidebar-menu" i]')
+    .evaluateAll((elements) =>
+      elements.some((element) => {
+        const style = window.getComputedStyle(element);
+        const rect = element.getBoundingClientRect();
+        const text = String(element.textContent || '');
+        return (
+          style.display !== 'none' &&
+          style.visibility !== 'hidden' &&
+          Number(style.opacity) !== 0 &&
+          rect.width > 180 &&
+          rect.height > window.innerHeight * 0.4 &&
+          rect.left < window.innerWidth / 2 &&
+          rect.right > window.innerWidth / 2 &&
+          /deposit|invite\s*&\s*earn|my profile/i.test(text)
+        );
+      })
+    )
+    .catch(() => false);
+}
+
+async function closeMobileSidebarIfOpen(page) {
+  const sidebarCoversViewport = await mobileSidebarCoversViewport(page);
+  if (!sidebarCoversViewport) return false;
+  const sharedClosed = await closeMobileNavigationOverlay(page).catch(() => false);
+  if (!(await mobileSidebarCoversViewport(page))) return sharedClosed;
+  const activeToggle = await firstVisibleLocator(page, [
+    '.t-sidebar-menu__toggle-btn-active',
+    '.t-sidebar-menu__toggle-btn.is-active',
+    '[class*="sidebar-menu" i] [class*="toggle" i][class*="active" i]',
+    '[data-testid="sidebar-burger-button"]',
+    'aside button',
+    '[role="complementary"] button',
+  ]);
+  if (!activeToggle) return false;
+  const closed = await activeToggle
+    .click({ timeout: 5000 })
+    .then(() => true)
+    .catch(() => false);
+  if (closed) await waitForUiSettled(page, 700);
+  return closed;
+}
+
+async function closeCasinoPromotionModal(page, timeoutMs = 2500) {
+  const title = page.getByText(/bring your vip\s*[—-]\s*we match/i).first();
+  const visible = await title.isVisible({ timeout: timeoutMs }).catch(() => false);
+  if (!visible) return false;
+
+  const modal = title
+    .locator(
+      'xpath=ancestor::*[@role="dialog" or contains(translate(@class, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "modal") or contains(translate(@class, "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "popup")][1]'
+    )
+    .first();
+  const scope = (await modal.isVisible().catch(() => false)) ? modal : page;
+  const buttons = scope.locator('button:visible');
+  const count = Math.min(await buttons.count().catch(() => 0), 12);
+  for (let index = 0; index < count; index += 1) {
+    const button = buttons.nth(index);
+    const text = String((await button.innerText().catch(() => '')) || '').trim();
+    const ariaLabel = String((await button.getAttribute('aria-label').catch(() => '')) || '');
+    if (text && !/close|dismiss/i.test(text)) continue;
+    if (!text && ariaLabel && !/close|dismiss/i.test(ariaLabel)) continue;
+    const clicked = await button
+      .click({ timeout: 3000 })
+      .then(() => true)
+      .catch(() => false);
+    if (clicked) {
+      await waitForUiSettled(page, 700);
+      return true;
+    }
+  }
+  return false;
+}
+
 async function openSearchModal(page) {
+  // Reward/subscription prompts can be injected after the casino route has
+  // already settled. Dismiss them immediately before resolving the search UI.
+  await dismissOverlays(page);
+  await waitForUiSettled(page, 500);
+
   const inlineInput = await firstVisibleLocator(page, [
     '.t-games-catalog input[placeholder*="Search" i]',
     '.t-games-catalog input[type="search"]',
@@ -284,8 +388,16 @@ async function openSearchModal(page) {
 
   let clicked = false;
   if (searchButton) {
-    await searchButton.click({ timeout: 7000 }).catch(() => null);
-    clicked = true;
+    clicked = await searchButton
+      .click({ timeout: 7000 })
+      .then(() => true)
+      .catch(() => false);
+    if (!clicked) {
+      clicked = await searchButton
+        .click({ timeout: 3000, force: true })
+        .then(() => true)
+        .catch(() => false);
+    }
     await waitForUiSettled(page, 1500);
   }
 
@@ -331,6 +443,8 @@ async function openSearchModal(page) {
     '[role="dialog"] input[type="text"]',
     '.t-modal input[type="search"]',
     '.t-modal input[type="text"]',
+    '.t-game-search-modal input[type="search"]',
+    '.t-game-search-modal input[type="text"]',
     '.t-games-catalog input[placeholder*="Search" i]',
     '.t-games-catalog input[type="search"]',
     '.t-games-catalog input[class*="search" i]',
@@ -795,11 +909,13 @@ async function discoverCategoryChipsByDom(page) {
 
 async function findGameActionButton(page, mode) {
   const cardSelectors = [
+    '.t-games-catalog .t-game-item',
     '.t-games-catalog .t-game-play',
     '.t-games-catalog [class*="game-play" i]',
     '.t-games-catalog [class*="games-item" i]',
     'main [class*="game-play" i]',
     'main [class*="games-item" i]',
+    'main .t-game-item',
   ];
 
   let cards = null;
@@ -842,42 +958,41 @@ async function findGameActionButton(page, mode) {
           '[data-testid*="play" i]',
           '[href*="mode=real" i]',
         ];
-  const count = Math.min(await cards.count(), 12);
-  const globalFallbackButton = await firstVisibleLocator(page, globalSelectors);
+  // Keep this lookup comfortably below the outer watchdog. Twelve sequential
+  // hover attempts at the previous per-card timeouts could consume the entire
+  // 45 second budget even when the page itself was healthy.
+  const count = Math.min(await cards.count(), 8);
 
   for (let i = 0; i < count; i += 1) {
     const card = cards.nth(i);
     if (!(await card.isVisible().catch(() => false))) continue;
 
-    await card.scrollIntoViewIfNeeded().catch(() => null);
-    await card.hover().catch(() => null);
-    await waitForUiSettled(page, 900);
+    await card.scrollIntoViewIfNeeded({ timeout: 900 }).catch(() => null);
+    await card.hover({ timeout: 700 }).catch(() => null);
+    await waitForUiSettled(page, 150);
 
-    const cardTitle = (
-      (await card
-        .locator(
-          '.t-game-play__title, .t-game-item__hover-name, [class*="title" i], [class*="name" i]'
-        )
-        .first()
-        .innerText()
-        .catch(() => '')) || ''
-    )
-      .replace(/\s+/g, ' ')
-      .trim();
-    const cardHref = (
-      (await card
-        .locator('a[href*="/casino/"], a[href]')
-        .first()
-        .getAttribute('href')
-        .catch(() => '')) || ''
-    )
-      .replace(/\s+/g, ' ')
-      .trim();
+    // Read optional metadata in one synchronous DOM operation. Locator
+    // innerText/getAttribute calls inherit the page's 30s timeout when the
+    // nested node is absent, which previously exhausted the 45s action lookup
+    // watchdog on otherwise healthy IGO cards.
     const cardMeta = await card
       .evaluate((node) => {
         const attr = (name) => String(node.getAttribute(name) || '').trim();
         const anchor = node.querySelector('a[href]');
+        const titleNode = node.querySelector(
+          '.t-game-play__title, .t-game-item__hover-name, [class*="title" i], [class*="name" i]'
+        );
+        const imageTitle = node.querySelector('img[alt]')?.getAttribute('alt') || '';
         return {
+          title: String(
+            (titleNode && (titleNode.innerText || titleNode.textContent)) ||
+              node.innerText ||
+              imageTitle ||
+              node.textContent ||
+              ''
+          )
+            .replace(/\s+/g, ' ')
+            .trim(),
           dataId: attr('data-id') || attr('data-game-id') || attr('data-gid') || '',
           dataProvider:
             attr('data-provider') ||
@@ -890,14 +1005,27 @@ async function findGameActionButton(page, mode) {
         };
       })
       .catch(() => null);
+    const cardTitle = String((cardMeta && cardMeta.title) || '').trim();
+    const cardHref = String((cardMeta && cardMeta.anchorHref) || '').trim();
     const parsedHrefIdentity = parseCasinoIdentityFromUrl(
       cardHref || (cardMeta && cardMeta.anchorHref) || ''
     );
 
     let button = await firstVisibleLocator(card, localSelectors);
-    if (!button && globalFallbackButton) {
-      const fallbackVisible = await globalFallbackButton.isVisible().catch(() => false);
-      if (fallbackVisible) button = globalFallbackButton;
+    const mobileCard = await card.evaluate((node) => node.matches('.t-game-item'));
+    if (!button && mobileCard) {
+      // Mobile cards reveal their action layer only after the first tap. The
+      // card itself is not Play/Try for Fun, so return the semantic action from
+      // the newly revealed layer.
+      const imageSurface = card.locator('.t-game-item__img').first();
+      const activationTarget = (await imageSurface.isVisible().catch(() => false))
+        ? imageSurface
+        : card;
+      await activationTarget
+        .click({ timeout: 3000 })
+        .catch(() => activationTarget.click({ timeout: 2000, force: true }).catch(() => null));
+      await waitForUiSettled(page, 350);
+      button = await firstVisibleLocator(card, localSelectors);
     }
     if (!button) continue;
 
@@ -920,6 +1048,33 @@ async function findGameActionButton(page, mode) {
       cardGameId: (cardMeta && cardMeta.dataId) || parsedHrefIdentity.gameId || '',
       cardMeta: cardMeta || null,
     };
+  }
+
+  // Some layouts render the hover action in a portal outside the card node.
+  // Resolve that only after card-local attempts, so an unrelated global action
+  // cannot be associated with the wrong game.
+  const globalFallbackButton = await firstVisibleLocator(page, globalSelectors);
+  if (globalFallbackButton) {
+    const buttonText = ((await globalFallbackButton.innerText().catch(() => '')) || '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const hrefHint = (await globalFallbackButton.getAttribute('href').catch(() => '')) || '';
+    if (!(mode === 'real' && /try for fun|demo/i.test(`${buttonText} ${hrefHint}`))) {
+      return {
+        found: true,
+        reason: null,
+        button: globalFallbackButton,
+        cardIndex: -1,
+        buttonText,
+        cardTitle: '',
+        cardHref: hrefHint,
+        cardKey: String(hrefHint || `${mode}-global-action`).toLowerCase(),
+        cardProvider: '',
+        cardSlug: '',
+        cardGameId: '',
+        cardMeta: null,
+      };
+    }
   }
 
   return {
@@ -1350,11 +1505,9 @@ async function withCasinoPage(browser, testInfo, testName, run) {
     return;
   }
 
-  const context = await browser.newContext({
-    storageState: authStatePath,
-    viewport: { width: 1365, height: 900 },
-    ignoreHTTPSErrors: true,
-  });
+  const context = await browser.newContext(
+    resolveMatrixContextOptions({ storageState: authStatePath })
+  );
   const page = await context.newPage();
 
   try {
@@ -1367,6 +1520,7 @@ async function withCasinoPage(browser, testInfo, testName, run) {
     }
 
     await waitForCasinoContent(page);
+    await dismissOverlays(page);
     const loginVisible = await page
       .getByRole('button', { name: /log in/i })
       .first()
@@ -1390,7 +1544,8 @@ async function withCasinoPage(browser, testInfo, testName, run) {
   }
 }
 
-test.describe.configure({ mode: 'serial' });
+// Independent catalog checks must continue even when one capability fails.
+test.describe.configure({ mode: 'default' });
 
 test.describe('Casino Catalog Coverage: search/filter/load more/game launch', () => {
   test.setTimeout(180000);
@@ -1793,13 +1948,33 @@ test.describe('Casino Catalog Coverage: search/filter/load more/game launch', ()
 
       const checks = [];
       for (const chip of chips.slice(0, 6)) {
+        await dismissOverlays(page);
+        await closeMobileSidebarIfOpen(page);
         const before = await collectCatalogEntries(page);
+        let clicked = false;
         if (chip.locator) {
-          await chip.locator.click({ timeout: 5000 }).catch(() => null);
+          clicked = await chip.locator
+            .click({ timeout: 5000 })
+            .then(() => true)
+            .catch(() => false);
         } else if (chip.point) {
-          await page.mouse.click(chip.point.x + chip.point.w / 2, chip.point.y + chip.point.h / 2);
+          clicked = await page.mouse
+            .click(chip.point.x + chip.point.w / 2, chip.point.y + chip.point.h / 2)
+            .then(() => true)
+            .catch(() => false);
+        }
+        if (!clicked) {
+          await dismissOverlays(page);
+          await closeMobileSidebarIfOpen(page);
+          if (chip.locator) {
+            clicked = await chip.locator
+              .click({ timeout: 5000, force: true })
+              .then(() => true)
+              .catch(() => false);
+          }
         }
         await waitForUiSettled(page, 1800);
+        await dismissOverlays(page);
         const after = await collectCatalogEntries(page);
 
         const active = chip.locator
@@ -1812,6 +1987,7 @@ test.describe('Casino Catalog Coverage: search/filter/load more/game launch', ()
         const changed = JSON.stringify(before.slice(0, 50)) !== JSON.stringify(after.slice(0, 50));
         checks.push({
           chip: chip.label,
+          clicked,
           active,
           changed,
           beforeCount: before.length,
@@ -2094,12 +2270,27 @@ test.describe('Casino Catalog Coverage: search/filter/load more/game launch', ()
   }, testInfo) => {
     const testName = 'p1_10_load_more';
     await withCasinoPage(browser, testInfo, testName, async ({ page, route, authStatePath }) => {
-      const beforeEntries = await collectCatalogEntries(page);
+      await page.keyboard.press('Escape').catch(() => null);
+      await dismissOverlays(page);
+      await closeMobileSidebarIfOpen(page);
+      await closeCasinoPromotionModal(page);
+      await waitForUiSettled(page, 800);
+      let beforeEntries = await collectCatalogEntries(page);
+      if (beforeEntries.length === 0) {
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await dismissOverlays(page);
+        await closeMobileSidebarIfOpen(page);
+        await closeCasinoPromotionModal(page);
+        await waitForCasinoContent(page);
+        await waitForUiSettled(page, 1200);
+        beforeEntries = await collectCatalogEntries(page);
+      }
       const loadMore = await firstVisibleLocator(page, [
         'button:has-text("LOAD MORE")',
         'button:has-text("Load more")',
         '.t-games-catalog__load-more',
-        '[class*="load-more" i]',
+        '.t-games-catalog [class*="load-more" i]',
+        'main [class*="games-catalog" i] [class*="load-more" i]',
       ]);
       if (!loadMore) {
         const payload = {
@@ -2120,7 +2311,12 @@ test.describe('Casino Catalog Coverage: search/filter/load more/game launch', ()
         return;
       }
 
-      await loadMore.scrollIntoViewIfNeeded().catch(() => null);
+      await loadMore
+        .evaluate((element) => element.scrollIntoView({ block: 'center', inline: 'nearest' }))
+        .catch(() => null);
+      await waitForUiSettled(page, 500);
+      await closeMobileSidebarIfOpen(page);
+      await closeCasinoPromotionModal(page, 1000);
       const enabledBeforeClick = await loadMore.isEnabled().catch(() => false);
       if (!enabledBeforeClick) {
         const reason = 'LOAD MORE button is disabled before click.';
@@ -2135,8 +2331,22 @@ test.describe('Casino Catalog Coverage: search/filter/load more/game launch', ()
         return;
       }
 
-      await loadMore.click({ timeout: 7000 }).catch(() => null);
-      await waitForUiSettled(page, 2500);
+      const clickSucceeded = await loadMore
+        .click({ timeout: 7000 })
+        .then(() => true)
+        .catch(() => false);
+      expect(clickSucceeded, 'LOAD MORE should be clickable.').toBeTruthy();
+      await expect
+        .poll(
+          async () => {
+            const entries = await collectCatalogEntries(page);
+            const controlVisible = await loadMore.isVisible().catch(() => false);
+            return entries.length > beforeEntries.length || !controlVisible;
+          },
+          { timeout: 12000, intervals: [500, 1000, 1500] }
+        )
+        .toBeTruthy()
+        .catch(() => null);
       const challenge = await getChallengeReason(page);
       if (challenge) {
         markBlocked(testInfo, challenge);
@@ -2153,18 +2363,16 @@ test.describe('Casino Catalog Coverage: search/filter/load more/game launch', ()
       const afterEntries = await collectCatalogEntries(page);
       const loadMoreStillVisible = await loadMore.isVisible().catch(() => false);
       const expanded = afterEntries.length > beforeEntries.length || !loadMoreStillVisible;
+      const sidebarOpenedAfterClick = await mobileSidebarCoversViewport(page);
 
       if (!expanded) {
         testInfo.annotations.push({
-          type: 'note',
-          description:
-            'LOAD MORE click did not change visible catalog size in current run; no hard failure.',
+          type: 'product-warning',
+          description: sidebarOpenedAfterClick
+            ? 'LOAD MORE interaction opened the mobile sidebar instead of expanding the casino catalog.'
+            : 'LOAD MORE click did not change visible catalog size in current run.',
         });
       }
-      expect(
-        afterEntries.length,
-        'Casino catalog should expose entries after LOAD MORE action.'
-      ).toBeGreaterThan(0);
 
       const payload = {
         route,
@@ -2173,8 +2381,17 @@ test.describe('Casino Catalog Coverage: search/filter/load more/game launch', ()
         afterCount: afterEntries.length,
         loadMoreStillVisible,
         expanded,
+        sidebarOpenedAfterClick,
       };
       await writeAndAttach(testInfo, testName, payload);
+      expect(
+        sidebarOpenedAfterClick,
+        'LOAD MORE interaction should not open the mobile sidebar.'
+      ).toBeFalsy();
+      expect(
+        afterEntries.length,
+        'Casino catalog should expose entries after LOAD MORE action.'
+      ).toBeGreaterThan(0);
     });
   });
 
@@ -2379,7 +2596,7 @@ test.describe('Casino Catalog Coverage: search/filter/load more/game launch', ()
       }
 
       const cards = page.locator(
-        '.t-games-catalog .t-game-play, .t-games-catalog [class*="game-play" i], .t-games-catalog [class*="games-item" i], main [class*="game-play" i], main [class*="games-item" i]'
+        '.t-games-catalog .t-game-item, .t-games-catalog .t-game-play, .t-games-catalog [class*="game-play" i], .t-games-catalog [class*="games-item" i], main .t-game-item, main [class*="game-play" i], main [class*="games-item" i]'
       );
       const targetCard =
         action.cardIndex >= 0 ? cards.nth(action.cardIndex) : page.locator('main').first();
@@ -2759,10 +2976,12 @@ test.describe('Casino Catalog Coverage: search/filter/load more/game launch', ()
     ];
 
     for (const plan of plans) {
+      const extraHTTPHeaders = resolveExtraHTTPHeaders();
       const context = await browser.newContext({
         storageState: authStatePath,
         viewport: plan.viewport,
         ignoreHTTPSErrors: true,
+        ...(extraHTTPHeaders ? { extraHTTPHeaders } : {}),
       });
       try {
         const page = await context.newPage();

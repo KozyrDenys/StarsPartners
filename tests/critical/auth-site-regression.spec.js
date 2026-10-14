@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const {
   assertNotCloudflare,
   detectCloudflare,

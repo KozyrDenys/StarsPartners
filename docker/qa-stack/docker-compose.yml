@@ -2,7 +2,7 @@ name: qa-stack
 
 services:
   zap-baseline:
-    image: ghcr.io/zaproxy/zaproxy:stable
+    image: ghcr.io/zaproxy/zaproxy:stable@sha256:c4da4c234258d444d9988fce9d034b00323724818daa4c91ca46f09aa04b46db
     profiles: ['zap']
     working_dir: /workspace
     volumes:
@@ -17,7 +17,7 @@ services:
       ]
 
   lighthouse:
-    image: mcr.microsoft.com/playwright:v1.58.0-jammy
+    image: mcr.microsoft.com/playwright:v1.62.1-noble@sha256:dcc5531e97840b9b5e794f2814476b21571c5124a3fca2267d73041f56e7580e
     profiles: ['lighthouse']
     working_dir: /workspace
     shm_size: 1gb
@@ -25,10 +25,12 @@ services:
       - ../..:/workspace
     environment:
       BASE_URL: ${BASE_URL:-https://gt.bet}
-      CHROME_PATH: ${LHCI_CHROME_PATH:-/ms-playwright/chromium-1208/chrome-linux/chrome}
+      CHROME_PATH: ${LHCI_CHROME_PATH:-/ms-playwright/chromium-1234/chrome-linux/chrome}
     command:
       [
         'npx',
+        '--yes',
+        '--package=@lhci/cli@0.15.1',
         'lhci',
         'collect',
         '--config=.lighthouserc.js',

@@ -20,6 +20,7 @@ fi
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 REPORT_FILE="zap-baseline-${STAMP}.html"
+ZAP_IMAGE="${ZAP_DOCKER_IMAGE:-ghcr.io/zaproxy/zaproxy:stable@sha256:c4da4c234258d444d9988fce9d034b00323724818daa4c91ca46f09aa04b46db}"
 
 echo "Running ZAP baseline in Docker"
 echo "Target: ${TARGET_URL}"
@@ -27,7 +28,7 @@ echo "Report: ${OUT_DIR_ABS}/${REPORT_FILE}"
 
 docker run --rm \
   -v "${OUT_DIR_ABS}:/zap/wrk" \
-  ghcr.io/zaproxy/zaproxy:stable \
+  "${ZAP_IMAGE}" \
   zap.sh -cmd -quickurl "${TARGET_URL}" -quickout "/zap/wrk/${REPORT_FILE}"
 
 echo "Done: ${OUT_DIR_ABS}/${REPORT_FILE}"

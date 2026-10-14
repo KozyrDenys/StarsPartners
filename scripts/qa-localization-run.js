@@ -1,6 +1,9 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { loadProjectEnv } = require('./lib/env');
+
+loadProjectEnv();
 
 const BRAND_CATALOG = {
   gt: { key: 'gt', slug: 'gt.bet', baseUrl: 'https://gt.bet' },
@@ -10,9 +13,10 @@ const BRAND_CATALOG = {
   starzino: { key: 'starzino', slug: 'starzino.com', baseUrl: 'https://starzino.com' },
   igo: { key: 'igo', slug: 'igo.bet', baseUrl: 'https://igo.bet' },
   chacha: { key: 'chacha', slug: 'chacha.bet', baseUrl: 'https://chacha.bet' },
+  casho: { key: 'casho', slug: 'casho.bet', baseUrl: 'https://casho.bet' },
 };
 
-const DEFAULT_ORDER = ['gt', 'likes', 'booms', 'nix', 'starzino', 'igo', 'chacha'];
+const DEFAULT_ORDER = ['gt', 'likes', 'booms', 'nix', 'starzino', 'igo', 'chacha', 'casho'];
 const VALID_MODES = new Set(['desktop', 'mobile']);
 
 function parseArgs(argv) {

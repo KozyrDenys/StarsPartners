@@ -2,7 +2,7 @@ name: qa-observability
 
 services:
   loki:
-    image: grafana/loki:3.1.1
+    image: grafana/loki:3.7.3@sha256:70b9f699fc9bb868b62f1cfd4f787dfa50242f1fd92e6089787d5d7daea75fe8
     container_name: qa-loki
     command: ['-config.file=/etc/loki/config.yml']
     ports:
@@ -12,22 +12,9 @@ services:
       - loki-data:/loki
     restart: unless-stopped
 
-  promtail:
-    image: grafana/promtail:3.1.1
-    container_name: qa-promtail
-    command: ['-config.file=/etc/promtail/config.yml']
-    depends_on:
-      - loki
-    volumes:
-      - ./promtail-config.yml:/etc/promtail/config.yml:ro
-      - ../..:/workspace:ro
-      - promtail-data:/tmp
-    restart: unless-stopped
-
   alloy:
-    image: grafana/alloy:v1.7.2
+    image: grafana/alloy:v1.17.1@sha256:4f6ddc56ffdcf8a6316748fc5162972e20cb301523cac1bb4a31957df733ae9b
     container_name: qa-alloy
-    profiles: ['alloy']
     command: ['run', '--server.http.listen-addr=0.0.0.0:12345', '/etc/alloy/config.river']
     depends_on:
       - loki
@@ -39,7 +26,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana-oss:11.1.4
+    image: grafana/grafana:13.1.0@sha256:121a7a9ece6dc10b969f1f96eed64b4f07dfac0d0b8abc070f7cb83bbde86f63
     container_name: qa-grafana
     depends_on:
       - loki
@@ -56,5 +43,4 @@ services:
 
 volumes:
   loki-data:
-  promtail-data:
   grafana-data:

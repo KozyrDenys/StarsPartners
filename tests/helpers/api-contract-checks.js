@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { URL } = require('url');
+const { resolveExtraHTTPHeaders } = require('./context-options');
 
 const DEFAULT_TIMEOUT_MS = 6 * 60 * 1000;
 
@@ -12,6 +13,10 @@ function compactText(value, maxLength = 4000) {
   if (!text) return '';
   if (text.length <= maxLength) return text;
   return `${text.slice(0, maxLength)}...`;
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error || '');
 }
 
 function normalizePath(value) {
@@ -38,6 +43,10 @@ function parsePositiveInt(value, fallback) {
   const parsed = Number.parseInt(String(value || ''), 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return parsed;
+}
+
+function isEnabledFlag(value) {
+  return value === true || String(value || '').trim() === '1';
 }
 
 function hasCommand(command) {
@@ -77,8 +86,10 @@ function runCommand(command, args, options = {}) {
       signal: result.signal || '',
       stdout: result.stdout || '',
       stderr: result.stderr || '',
-      timedOut: Boolean(result.error && result.error.code === 'ETIMEDOUT'),
-      error: result.error ? compactText(result.error.message || result.error) : '',
+      timedOut: Boolean(
+        result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === 'ETIMEDOUT'
+      ),
+      error: result.error ? compactText(errorMessage(result.error)) : '',
     };
   } catch (error) {
     return {
@@ -88,7 +99,7 @@ function runCommand(command, args, options = {}) {
       stdout: '',
       stderr: '',
       timedOut: false,
-      error: compactText(error && error.message ? error.message : error),
+      error: compactText(errorMessage(error)),
     };
   }
 }
@@ -124,6 +135,7 @@ async function fetchText(url, timeoutMs = 20_000) {
         method: 'GET',
         headers: {
           accept: 'application/json, application/yaml, text/yaml, text/plain, */*',
+          ...(resolveExtraHTTPHeaders() || {}),
         },
       }),
       timeoutPromise,
@@ -143,7 +155,7 @@ async function fetchText(url, timeoutMs = 20_000) {
       statusText: '',
       headers: {},
       body: '',
-      error: compactText(error && error.message ? error.message : error),
+      error: compactText(errorMessage(error)),
     };
   } finally {
     if (timer) clearTimeout(timer);
@@ -325,13 +337,25 @@ function runSchemathesis({ specPath, baseUrl, timeoutMs, maxExamples, preferDock
       return String(baseUrl || '').trim();
     }
   })();
+  const headerArgs = Object.entries(resolveExtraHTTPHeaders() || {}).flatMap(([name, value]) => [
+    '--header',
+    `${name}:${value}`,
+  ]);
 
   const directCommand = hasCommand('schemathesis') ? 'schemathesis' : hasCommand('st') ? 'st' : '';
 
   if (directCommand) {
     const direct = runCommand(
       directCommand,
-      ['run', specPath, '--base-url', baseOrigin, '--max-examples', String(maxExamples)],
+      [
+        'run',
+        specPath,
+        '--base-url',
+        baseOrigin,
+        '--max-examples',
+        String(maxExamples),
+        ...headerArgs,
+      ],
       { timeoutMs }
     );
     return {
@@ -358,13 +382,14 @@ function runSchemathesis({ specPath, baseUrl, timeoutMs, maxExamples, preferDock
         `${cwd}:/work`,
         '-w',
         '/work',
-        'schemathesis/schemathesis:stable',
+        'schemathesis/schemathesis:4.25.2@sha256:72d6907a936f7b5f08f137c8f84c89eb3ab7834956d9af416e7b6510ebe4e065',
         'run',
         `/work/${relativeSpec}`,
         '--base-url',
         baseOrigin,
         '--max-examples',
         String(maxExamples),
+        ...headerArgs,
       ],
       { timeoutMs }
     );
@@ -415,7 +440,7 @@ async function runAuthPaymentContractChecks(options = {}) {
   );
   const strictSource =
     typeof options.strict !== 'undefined' ? options.strict : process.env.PW_CONTRACT_STRICT || '0';
-  const strict = String(strictSource) === '1';
+  const strict = isEnabledFlag(strictSource);
 
   ensureDir(openApiDir);
   ensureDir(outputsDir);
@@ -450,6 +475,7 @@ async function runAuthPaymentContractChecks(options = {}) {
       item.status = 'blocked';
       item.note = resolved.reason || 'OpenAPI schema was not resolved.';
       summary.blockedReasons.push(`${kind}: ${item.note}`);
+      if (strict) summary.failedReasons.push(`${kind}: ${item.note}`);
       summary.checks.push(item);
       continue;
     }
@@ -510,6 +536,7 @@ async function runAuthPaymentContractChecks(options = {}) {
 }
 
 module.exports = {
+  isEnabledFlag,
   runAuthPaymentContractChecks,
   readJsonSafe,
 };

@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const fs = require('fs');
 const path = require('path');
 const {
@@ -17,11 +17,16 @@ const {
 } = require('../helpers/signup-api-fallback');
 const { createRegistrationData, maskValue } = require('../helpers/registration-data');
 const { SignupRegistrationPage } = require('../page-objects/signup-registration-page');
+const { isAuthTokenName } = require('../helpers/auth-state');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const PROJECT_TEST_RESULTS_DIR =
   process.env.QA_TEST_RESULTS_DIR || path.join(process.cwd(), 'test-results');
 const PROJECT_ARTIFACTS_DIR = process.env.QA_ARTIFACTS_DIR || path.join(process.cwd(), 'artifacts');
+const REGISTRATION_AUTH_STATE_PATH = path.join(
+  PROJECT_ARTIFACTS_DIR,
+  'registration-auth-state.json'
+);
 const SHORT_RUN_TAG = `c${Date.now().toString(36).slice(-6)}`;
 const SIGNIN_VALIDATION_ENABLED = process.env.PW_SIGNUP_VALIDATE_SIGNIN !== '0';
 const SIGNIN_VALIDATION_TIMEOUT_MS = Number.parseInt(
@@ -225,6 +230,9 @@ async function validateSigninAfterSignup({ page, data, signupToken, testInfo }) 
 }
 
 async function persistRegistrationWithValidation({ page, data, signupToken, testInfo }) {
+  await applyAuthTokenCookie(page.context(), signupToken, BASE_URL);
+  fs.mkdirSync(path.dirname(REGISTRATION_AUTH_STATE_PATH), { recursive: true });
+  await page.context().storageState({ path: REGISTRATION_AUTH_STATE_PATH });
   const validation = await validateSigninAfterSignup({
     page,
     data,
@@ -282,6 +290,35 @@ test('Sign Up API: successful registration returns token and userId', async ({
 
   try {
     await page.setViewportSize({ width: 1365, height: 900 });
+    const existingCookies = await page
+      .context()
+      .cookies(BASE_URL)
+      .catch(() => []);
+    const existingAuthCookies = existingCookies.filter((cookie) => isAuthTokenName(cookie.name));
+    for (const cookie of existingAuthCookies) {
+      await page.context().clearCookies({
+        name: cookie.name,
+        domain: cookie.domain,
+        path: cookie.path || '/',
+      });
+    }
+    await page.addInitScript(() => {
+      for (const key of Object.keys(globalThis.localStorage || {})) {
+        if (
+          /^(?:auth[._-].*token|auth_token|authtoken|access_token|accesstoken|id_token|idtoken)$/i.test(
+            key
+          )
+        ) {
+          globalThis.localStorage.removeItem(key);
+        }
+      }
+    });
+    if (existingAuthCookies.length > 0) {
+      testInfo.annotations.push({
+        type: 'session-setup',
+        description: `Removed ${existingAuthCookies.length} application auth cookie(s) before guest signup while preserving Cloudflare cookies.`,
+      });
+    }
     await page.goto(BASE_URL, { waitUntil: 'domcontentloaded' });
     await assertNotCloudflare(page);
     await dismissOverlays(page);

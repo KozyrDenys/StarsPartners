@@ -1,28 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { test, expect } = require('@playwright/test');
-let percySnapshot = null;
-try {
-  ({ percySnapshot } = require('@percy/playwright'));
-} catch {
-  percySnapshot = null;
-}
-let EyesClass = null;
-let TargetClass = null;
-let ConfigurationClass = null;
-let BatchInfoClass = null;
-try {
-  const applitools = require('@applitools/eyes-playwright');
-  EyesClass = applitools.Eyes;
-  TargetClass = applitools.Target;
-  ConfigurationClass = applitools.Configuration;
-  BatchInfoClass = applitools.BatchInfo;
-} catch {
-  EyesClass = null;
-  TargetClass = null;
-  ConfigurationClass = null;
-  BatchInfoClass = null;
-}
+const { test, expect } = require('../fixtures/qa-test');
 const {
   assertNotCloudflare,
   dismissOverlays,
@@ -32,8 +10,6 @@ const {
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet';
 const VISUAL_REGRESSION = process.env.PW_VISUAL_REGRESSION === '1';
-const VISUAL_PERCY = process.env.PW_VISUAL_PERCY === '1';
-const VISUAL_APPLITOOLS = process.env.PW_VISUAL_APPLITOOLS === '1';
 const VISUAL_BASELINE_TAG = (() => {
   const projectMatrix = String(process.env.PW_PROJECT_MATRIX || 'desktop')
     .trim()
@@ -50,8 +26,6 @@ const VISUAL_BASELINE_TAG = (() => {
     .toLowerCase();
   return raw.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '') || 'default';
 })();
-const APPLITOOLS_API_KEY = String(process.env.APPLITOOLS_API_KEY || '').trim();
-const APPLITOOLS_BATCH = String(process.env.APPLITOOLS_BATCH || 'qa-assistant-visual').trim();
 const PROJECT_AUTOTEST_REPORT_DIR =
   process.env.QA_AUTOTEST_REPORT_DIR || path.join(process.cwd(), 'Autotest report');
 const ARTIFACT_DIR = path.join(PROJECT_AUTOTEST_REPORT_DIR, 'visual');
@@ -104,49 +78,6 @@ test.describe('Visual smoke: capture + optional snapshot assertions', () => {
 
       const imageSize = fs.statSync(screenshotPath).size;
       expect(imageSize, `Screenshot for ${item.slug} should not be empty.`).toBeGreaterThan(10_000);
-
-      if (VISUAL_PERCY) {
-        if (!percySnapshot) {
-          markBlocked(testInfo, 'Percy SDK is not available in this runtime.');
-        } else {
-          try {
-            await percySnapshot(page, `percy-${VISUAL_BASELINE_TAG}-${item.slug}`);
-          } catch (err) {
-            markBlocked(
-              testInfo,
-              `Percy snapshot failed: ${err instanceof Error ? err.message : String(err)}`
-            );
-          }
-        }
-      }
-
-      if (VISUAL_APPLITOOLS) {
-        if (!EyesClass || !TargetClass || !ConfigurationClass || !BatchInfoClass) {
-          markBlocked(testInfo, 'Applitools SDK is not available in this runtime.');
-        } else if (!APPLITOOLS_API_KEY) {
-          markBlocked(testInfo, 'APPLITOOLS_API_KEY is missing for Applitools visual checks.');
-        } else {
-          const eyes = new EyesClass();
-          try {
-            const config = new ConfigurationClass();
-            config.setApiKey(APPLITOOLS_API_KEY);
-            config.setAppName(new URL(BASE_URL).hostname || 'qa-assistant');
-            config.setBatch(new BatchInfoClass(APPLITOOLS_BATCH));
-            config.setTestName(`visual-${VISUAL_BASELINE_TAG}-${item.slug}`);
-            eyes.setConfiguration(config);
-            await eyes.open(page);
-            await eyes.check(item.slug, TargetClass.window().fully());
-            await eyes.close(false);
-          } catch (err) {
-            markBlocked(
-              testInfo,
-              `Applitools check failed: ${err instanceof Error ? err.message : String(err)}`
-            );
-          } finally {
-            await eyes.abortIfNotClosed().catch(() => null);
-          }
-        }
-      }
 
       if (!VISUAL_REGRESSION) return;
 

@@ -1,6 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 const { chromium, webkit } = require('playwright');
+const { resolveExtraHTTPHeaders } = require('../tests/helpers/context-options');
+const { createCdpBrowserFacade } = require('../tests/helpers/cdp-reuse-context');
 
 function parseArgs(argv) {
   const args = {};
@@ -37,6 +39,12 @@ function isChallengeLike(value) {
   );
 }
 
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, Number(ms) || 0));
+  });
+}
+
 function readStorageStatePath(candidate) {
   const value = String(candidate || '').trim();
   if (!value) return '';
@@ -62,7 +70,7 @@ async function routeProbe(page, baseUrl, route, timeoutMs) {
   let error = '';
   try {
     response = await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
-    await page.waitForTimeout(1000);
+    await delay(1000);
   } catch (err) {
     error = String(err && err.message ? err.message : err);
   } finally {
@@ -175,12 +183,25 @@ async function depositApiProbe(context, baseUrl, currencies, timeoutMs) {
     args['storage-state'] || process.env.PW_STORAGE_STATE
   );
   const browserType = browserName === 'webkit' ? webkit : chromium;
-  const browser = await browserType.launch({ headless: process.env.PW_HEADED !== '1' });
+  const cdpEndpoint = String(process.env.PW_CDP_ENDPOINT || '').trim();
+  const reuseCdpContext = process.env.PW_CDP_REUSE_CONTEXT === '1' && cdpEndpoint;
+  const connectedBrowser = reuseCdpContext
+    ? await chromium.connectOverCDP(cdpEndpoint)
+    : await browserType.launch({ headless: process.env.PW_HEADED !== '1' });
+  const extraHTTPHeaders = resolveExtraHTTPHeaders();
   const contextOptions = {
     locale: process.env.PW_LOCALE || 'en-US',
-    userAgent: process.env.PW_USER_AGENT,
+    ...(process.env.PW_USER_AGENT ? { userAgent: process.env.PW_USER_AGENT } : {}),
+    ...(extraHTTPHeaders ? { extraHTTPHeaders } : {}),
   };
   if (storageStatePath) contextOptions.storageState = storageStatePath;
+  const persistentContext = reuseCdpContext ? connectedBrowser.contexts()[0] : null;
+  if (reuseCdpContext && !persistentContext) {
+    throw new Error(`Native Chrome at ${cdpEndpoint} has no persistent browser context.`);
+  }
+  const browser = reuseCdpContext
+    ? createCdpBrowserFacade(connectedBrowser, persistentContext, { baseUrl })
+    : connectedBrowser;
   const context = await browser.newContext(contextOptions);
   const page = await context.newPage();
 
@@ -193,7 +214,8 @@ async function depositApiProbe(context, baseUrl, currencies, timeoutMs) {
     ? await depositApiProbe(context, baseUrl, currencies, timeoutMs)
     : null;
 
-  await browser.close();
+  await context.close().catch(() => null);
+  if (!reuseCdpContext) await browser.close();
 
   const blockedRoutes = routeResults.filter((item) => item.blocked);
   const blocked = blockedRoutes.length > 0 || Boolean(depositApi && depositApi.blocked);
@@ -202,6 +224,7 @@ async function depositApiProbe(context, baseUrl, currencies, timeoutMs) {
     generatedAt: new Date().toISOString(),
     baseUrl,
     browser: browserName,
+    cdpReuseContext: Boolean(reuseCdpContext),
     storageStatePath: storageStatePath || '',
     routes: routeResults,
     depositApi,

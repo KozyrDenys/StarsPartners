@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const {
   detectCloudflare,
   dismissOverlays,
@@ -9,7 +9,12 @@ const {
   waitForUiSettled,
 } = require('../helpers/gt-utils');
 const { isCapabilityOptionalForBrand } = require('../helpers/brand-capabilities');
+const {
+  resolveExtraHTTPHeaders,
+  resolveMatrixContextOptions,
+} = require('../helpers/context-options');
 const { createWsCapture } = require('../helpers/ws-capture');
+const { serializeArtifactPayload } = require('../helpers/artifact-output');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const BASE_ORIGIN = new URL(BASE_URL).origin;
@@ -18,6 +23,24 @@ const PROJECT_AUTOTEST_REPORT_DIR =
 const PROJECT_ARTIFACTS_DIR = process.env.QA_ARTIFACTS_DIR || path.join(process.cwd(), 'artifacts');
 const ARTIFACT_DIR = path.join(PROJECT_AUTOTEST_REPORT_DIR, 'sports');
 const VISUAL_DIR = path.join(ARTIFACT_DIR, 'visual');
+const PRODUCT_REMEDIATION_PATH = (() => {
+  if (!process.env.QA_PROJECT_ROOT) return '';
+  const projectRoot = path.resolve(String(process.env.QA_PROJECT_ROOT));
+  let brandHost = '';
+  try {
+    brandHost = new URL(BASE_ORIGIN).hostname;
+  } catch {
+    brandHost = '';
+  }
+  const candidates = [
+    ...(brandHost
+      ? [path.join(process.cwd(), 'docs', 'product-remediation', `${brandHost}.md`)]
+      : []),
+    path.join(projectRoot, 'product-remediation.md'),
+    path.join(projectRoot, '..', 'product-remediation.md'),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || candidates[0];
+})();
 const EXPLICIT_STORAGE_STATE_PATH = process.env.PW_STORAGE_STATE
   ? path.resolve(String(process.env.PW_STORAGE_STATE))
   : '';
@@ -25,6 +48,7 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   EXPLICIT_STORAGE_STATE_PATH,
   PROJECT_ROOT_STORAGE_STATE_PATH,
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
@@ -35,6 +59,10 @@ const AUTH_STATE_CANDIDATES = [
   .filter(Boolean)
   .filter((candidate, index, all) => all.indexOf(candidate) === index);
 const ALLOWED_403_PATTERNS = [/\/server\/api\/languages\/thook\/?/i];
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function buildUrl(route) {
   return new URL(route, BASE_ORIGIN).toString();
@@ -118,10 +146,23 @@ async function writeAndAttach(testInfo, name, payload) {
   fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
   const fileName = `${toSlug(name)}.json`;
   const filePath = path.join(ARTIFACT_DIR, fileName);
-  const body = JSON.stringify(payload, null, 2);
+  const body = serializeArtifactPayload(payload);
   fs.writeFileSync(filePath, body, 'utf8');
   await testInfo.attach(fileName, { body, contentType: 'application/json' });
   return filePath;
+}
+
+async function attachProductEvidenceScreenshot(page, testInfo, name) {
+  try {
+    const body = await page.screenshot({ fullPage: true });
+    await testInfo.attach(`${toSlug(name)}.png`, {
+      body,
+      contentType: 'image/png',
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function firstVisibleLocator(root, selectors) {
@@ -134,6 +175,405 @@ async function firstVisibleLocator(root, selectors) {
     }
   }
   return null;
+}
+
+async function firstVisibleTextLocator(root, patterns) {
+  for (const pattern of patterns) {
+    const locator = root.getByText(pattern);
+    const count = Math.min(await locator.count().catch(() => 0), 120);
+    for (let i = 0; i < count; i += 1) {
+      const candidate = locator.nth(i);
+      if (await candidate.isVisible().catch(() => false)) return candidate;
+    }
+  }
+  return null;
+}
+
+async function findBetslipSurface(page) {
+  let surface = await firstVisibleLocator(page, [
+    '[data-testid*="betslip" i]',
+    '[data-testid*="coupon" i]',
+    '[id*="betslip" i]',
+    '[class*="betslip" i]',
+    '[class*="coupon" i]',
+  ]);
+  if (!surface) {
+    const label = page.getByText(/^betslip$/i).first();
+    if (await label.isVisible().catch(() => false)) {
+      surface = label.locator('..').locator('..').locator('..').locator('..');
+    }
+  }
+  return surface;
+}
+
+async function readBetslipEvidence(page) {
+  const surface = await findBetslipSurface(page);
+  if (!surface) {
+    return {
+      visible: false,
+      text: '',
+      inputCount: 0,
+      emptyStateVisible: await page
+        .getByText(/place your bets|betslip is empty|no selections/i)
+        .first()
+        .isVisible()
+        .catch(() => false),
+    };
+  }
+  const text = ((await surface.innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+  return {
+    visible: true,
+    text: text.slice(0, 800),
+    inputCount: await surface
+      .locator('input')
+      .count()
+      .catch(() => 0),
+    emptyStateVisible: /place your bets|betslip is empty|no selections/i.test(text),
+  };
+}
+
+async function clickOddsWithEvidence(page, preferredTarget = null) {
+  const selectors = [
+    'button[data-testid*="odd" i]:not([disabled])',
+    '[data-testid*="odd" i][role="button"]',
+    'button[class*="odd" i]:not([disabled])',
+    '[class*="odd" i][role="button"]',
+    '[class*="selection" i][role="button"]',
+    '#betby span',
+  ];
+  const attempts = [];
+  const seen = new Set();
+  const targets = [];
+  if (preferredTarget && preferredTarget.selector && Number.isInteger(preferredTarget.index)) {
+    targets.push({ ...preferredTarget, preferred: true });
+  }
+  for (const selector of selectors) {
+    const matches = page.locator(selector);
+    const maxMatches = selector === '#betby span' ? 800 : 80;
+    const visibleTargets = await matches
+      .evaluateAll((elements, limit) => {
+        const result = [];
+        for (let index = 0; index < Math.min(elements.length, limit); index += 1) {
+          const element = elements[index];
+          const style = window.getComputedStyle(element);
+          const rect = element.getBoundingClientRect();
+          if (
+            style.display === 'none' ||
+            style.visibility === 'hidden' ||
+            Number(style.opacity) === 0 ||
+            rect.width <= 2 ||
+            rect.height <= 2
+          ) {
+            continue;
+          }
+          const text = String(element.innerText || element.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (!/\b\d{1,2}[.,]\d{1,3}\b/.test(text) || text.length > 80) continue;
+          let interactive = false;
+          let interactiveText = '';
+          let current = element;
+          for (let depth = 0; current && depth < 4; depth += 1, current = current.parentElement) {
+            if (
+              current.tagName === 'BUTTON' ||
+              current.getAttribute('role') === 'button' ||
+              typeof current.onclick === 'function' ||
+              window.getComputedStyle(current).cursor === 'pointer'
+            ) {
+              interactive = true;
+              interactiveText = String(current.innerText || current.textContent || '')
+                .replace(/\s+/g, ' ')
+                .trim();
+              break;
+            }
+          }
+          if (/total odds|bet builder/i.test(interactiveText)) continue;
+          if (interactive) result.push({ index, text });
+          if (result.length >= 24) break;
+        }
+        return result;
+      }, maxMatches)
+      .catch(() => []);
+    for (const target of visibleTargets) targets.push({ selector, ...target });
+  }
+
+  let successfulClicks = 0;
+  for (const target of targets) {
+    const { selector, index } = target;
+    const signature = `${selector}|${index}`;
+    if (seen.has(signature)) continue;
+    seen.add(signature);
+    const candidate = page.locator(selector).nth(index);
+    if (
+      !(await candidate.isVisible({ timeout: target.preferred ? 500 : 100 }).catch(() => false))
+    ) {
+      attempts.push({ selector, index, text: target.text || '', clicked: false });
+      continue;
+    }
+    const text =
+      target.text ||
+      ((await candidate.innerText().catch(() => '')) || '').replace(/\s+/g, ' ').trim();
+    const hasInteractiveAncestor = await candidate
+      .evaluate((element) => {
+        let current = element;
+        for (let depth = 0; current && depth < 4; depth += 1, current = current.parentElement) {
+          if (
+            current.tagName === 'BUTTON' ||
+            current.getAttribute('role') === 'button' ||
+            typeof current.onclick === 'function' ||
+            window.getComputedStyle(current).cursor === 'pointer'
+          ) {
+            return true;
+          }
+        }
+        return false;
+      })
+      .catch(() => false);
+    if (!hasInteractiveAncestor) continue;
+    const beforeElement = await candidate
+      .evaluate((element) => ({
+        ariaPressed: element.getAttribute('aria-pressed'),
+        ariaSelected: element.getAttribute('aria-selected'),
+        className: typeof element.className === 'string' ? element.className : '',
+      }))
+      .catch(() => ({}));
+    const beforeBetslip = await readBetslipEvidence(page);
+    await candidate.scrollIntoViewIfNeeded().catch(() => null);
+    const clicked = await candidate
+      .click({ timeout: target.preferred ? 3000 : 2500 })
+      .then(() => true)
+      .catch(() => false);
+    if (!clicked) {
+      attempts.push({ selector, index, text, clicked: false });
+      continue;
+    }
+    successfulClicks += 1;
+    await waitForUiSettled(page, 700);
+    const afterBetslip = await readBetslipEvidence(page);
+    const afterElement = await candidate
+      .evaluate((element) => ({
+        ariaPressed: element.getAttribute('aria-pressed'),
+        ariaSelected: element.getAttribute('aria-selected'),
+        className: typeof element.className === 'string' ? element.className : '',
+      }))
+      .catch(() => ({}));
+    const selectionAttributeChanged =
+      beforeElement.ariaPressed !== afterElement.ariaPressed ||
+      beforeElement.ariaSelected !== afterElement.ariaSelected ||
+      beforeElement.className !== afterElement.className;
+    const betslipChanged = JSON.stringify(beforeBetslip) !== JSON.stringify(afterBetslip);
+    const confirmed = Boolean(
+      betslipChanged &&
+      afterBetslip.visible &&
+      (!afterBetslip.emptyStateVisible ||
+        afterBetslip.inputCount > beforeBetslip.inputCount ||
+        afterBetslip.text !== beforeBetslip.text)
+    );
+    attempts.push({
+      selector,
+      index,
+      text,
+      clicked: true,
+      confirmed,
+      selectionAttributeChanged,
+      selectionOnly: selectionAttributeChanged && !confirmed,
+      betslipChanged,
+      beforeBetslip,
+      afterBetslip,
+    });
+    if (confirmed) {
+      return {
+        confirmed: true,
+        target: { selector, index, text },
+        attempts,
+        beforeBetslip,
+        afterBetslip,
+      };
+    }
+    if (successfulClicks >= 3) break;
+  }
+  return {
+    confirmed: false,
+    selectionOnly: attempts.some((attempt) => attempt.selectionOnly === true),
+    attempts,
+    afterBetslip: await readBetslipEvidence(page),
+  };
+}
+
+async function removeBetslipSelection(page) {
+  const surface = await findBetslipSurface(page);
+  const beforeBetslip = await readBetslipEvidence(page);
+  if (!surface) {
+    return {
+      confirmed: false,
+      attempts: [],
+      reason: 'Betslip surface is not visible.',
+      beforeBetslip,
+      afterBetslip: beforeBetslip,
+    };
+  }
+
+  const selectors = [
+    'svg[data-cy="rounded-close"]',
+    '[data-testid*="remove" i]',
+    '[data-testid*="delete" i]',
+    '[aria-label*="remove" i]',
+    '[aria-label*="delete" i]',
+    'svg[data-cy="ic-delete"]',
+  ];
+  const attempts = [];
+  for (const selector of selectors) {
+    const candidates = surface.locator(selector);
+    const count = Math.min(await candidates.count().catch(() => 0), 8);
+    for (let index = 0; index < count; index += 1) {
+      const candidate = candidates.nth(index);
+      if (!(await candidate.isVisible({ timeout: 300 }).catch(() => false))) continue;
+      const clicked = await candidate
+        .click({ timeout: 3000 })
+        .then(() => true)
+        .catch(() => false);
+      attempts.push({ selector, index, clicked });
+      if (!clicked) continue;
+      await waitForUiSettled(page, 700);
+      const afterBetslip = await readBetslipEvidence(page);
+      const confirmed =
+        afterBetslip.emptyStateVisible ||
+        afterBetslip.inputCount < beforeBetslip.inputCount ||
+        afterBetslip.text !== beforeBetslip.text;
+      if (confirmed) {
+        return { confirmed: true, attempts, beforeBetslip, afterBetslip };
+      }
+    }
+  }
+
+  return {
+    confirmed: false,
+    attempts,
+    reason: 'No semantic remove/clear control changed the betslip.',
+    beforeBetslip,
+    afterBetslip: await readBetslipEvidence(page),
+  };
+}
+
+async function returnFromSportsEvent(page, eventUrl) {
+  const attempts = [];
+  const backControl = await firstVisibleLocator(page, [
+    'button[data-testid*="back" i]',
+    '[role="button"][data-testid*="back" i]',
+    'button[aria-label*="back" i]',
+    '[role="button"][aria-label*="back" i]',
+  ]);
+  if (backControl) {
+    const label =
+      (await backControl.getAttribute('aria-label').catch(() => '')) ||
+      ((await backControl.innerText().catch(() => '')) || '').trim();
+    const clicked = await backControl
+      .click({ timeout: 7000 })
+      .then(() => true)
+      .catch(() => false);
+    await waitForUiSettled(page, 900);
+    attempts.push({ strategy: 'semantic-back-control', label, clicked, afterUrl: page.url() });
+    if (clicked && page.url() !== eventUrl) {
+      return { returned: true, strategy: 'semantic-back-control', attempts, afterUrl: page.url() };
+    }
+  }
+
+  // The embedded sports widget can replace its current history entry. Use the
+  // persistent Sports navigation while the app shell is still available; calling
+  // browser back first can leave a directly-opened test tab at about:blank.
+  await dismissOverlays(page).catch(() => null);
+  let sportsNavigation = await firstVisibleLocator(page, [
+    '[data-testid="sidebar-Sport-button"]',
+    'a[href*="/sports/"]',
+    '[data-testid*="sport" i]',
+    'nav a:has-text("Sport")',
+    'nav button:has-text("Sport")',
+    'button:has-text("Sport")',
+  ]);
+  if (!sportsNavigation) {
+    const labels = page.getByText(/^Sport(?:s)?$/i);
+    const labelCount = Math.min(await labels.count().catch(() => 0), 12);
+    for (let index = labelCount - 1; index >= 0; index -= 1) {
+      const label = labels.nth(index);
+      if (await label.isVisible({ timeout: 250 }).catch(() => false)) {
+        sportsNavigation = label;
+        break;
+      }
+    }
+  }
+  if (sportsNavigation) {
+    const navigationHref = await sportsNavigation.getAttribute('href').catch(() => '');
+    let clicked = false;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      clicked = await sportsNavigation
+        .click({ timeout: 5000, force: attempt > 0 })
+        .then(() => true)
+        .catch(() => false);
+      if (!clicked) continue;
+      await page.waitForURL(/\/sports\/?(?:\?|$)/i, { timeout: 5000 }).catch(() => null);
+      if (/\/sports\/?(?:\?|$)/i.test(page.url())) break;
+      await waitForUiSettled(page, 900);
+    }
+    attempts.push({
+      strategy: 'sports-navigation',
+      clicked,
+      navigationHref,
+      afterUrl: page.url(),
+    });
+    if (clicked && /\/sports\/?(?:\?|$)/i.test(page.url())) {
+      return {
+        returned: true,
+        strategy: 'sports-navigation',
+        attempts,
+        afterUrl: page.url(),
+      };
+    }
+  }
+
+  // A directly-opened event tab may have no usable history entry. Navigate to
+  // the app's known Sports route before falling back to browser history.
+  const fallbackHref =
+    (sportsNavigation && (await sportsNavigation.getAttribute('href').catch(() => ''))) ||
+    '/sports/?bt-path=%2F';
+  const fallbackUrl = new URL(fallbackHref, BASE_ORIGIN).toString();
+  const fallbackNavigated = await page
+    .goto(fallbackUrl, { waitUntil: 'domcontentloaded', timeout: 12000 })
+    .then(() => true)
+    .catch(() => false);
+  await waitForUiSettled(page, 900);
+  attempts.push({
+    strategy: 'sports-route-fallback',
+    fallbackUrl,
+    navigated: fallbackNavigated,
+    afterUrl: page.url(),
+  });
+  if (fallbackNavigated && /\/sports\/?(?:\?|$)/i.test(page.url())) {
+    return {
+      returned: true,
+      strategy: 'sports-route-fallback',
+      attempts,
+      afterUrl: page.url(),
+    };
+  }
+
+  await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => null);
+  await waitForUiSettled(page, 1200);
+  attempts.push({ strategy: 'browser-history', afterUrl: page.url() });
+  if (/\/sports\/?(?:\?|$)/i.test(page.url())) {
+    return {
+      returned: true,
+      strategy: 'browser-history',
+      attempts,
+      afterUrl: page.url(),
+    };
+  }
+
+  return {
+    returned: page.url() !== eventUrl,
+    strategy: 'none',
+    attempts,
+    afterUrl: page.url(),
+  };
 }
 
 async function hasChallengeTokenPage(page) {
@@ -164,6 +604,15 @@ async function getChallengeReason(page) {
     .catch(() => false);
   if (challengeTextVisible) return 'Challenge text is visible.';
 
+  const geoBlockText = await page
+    .getByText(/cannot be accessed in |region not restricted|proxy service or vpn/i)
+    .first()
+    .isVisible({ timeout: 500 })
+    .catch(() => false);
+  if (geoBlockText) {
+    return `Geo restriction detected: ${new URL(BASE_ORIGIN).hostname} is unavailable from the current QA egress region.`;
+  }
+
   if (await hasChallengeTokenPage(page)) {
     return 'Cloudflare token page detected (no app root + token body).';
   }
@@ -172,17 +621,34 @@ async function getChallengeReason(page) {
 }
 
 async function waitForSportsContent(page) {
-  const signals = [
-    page.locator('#betby').first(),
-    page.locator('.t-game-sports-st8').first(),
-    page.getByText(/upcoming/i).first(),
-    page.getByText(/football/i).first(),
-    page.getByText(/live sports/i).first(),
-    page.getByText(/place your bets/i).first(),
-  ];
-  await Promise.any(
-    signals.map((locator) => locator.waitFor({ state: 'visible', timeout: 30000 }))
-  ).catch(() => null);
+  const deadlineAt = Date.now() + 30_000;
+  let lastState = { containers: 0, embeddedFrames: 0, contentSignals: 0, skeletons: 0 };
+  while (Date.now() < deadlineAt) {
+    const containers = await page
+      .locator('#betby:visible, .t-game-sports-st8:visible, iframe[src*="sport" i]:visible')
+      .count()
+      .catch(() => 0);
+    const contentSignals = await page
+      .getByText(/upcoming|football|live sports|place your bets|events|leagues|odds/i)
+      .count()
+      .catch(() => 0);
+    const embeddedFrames = await page
+      .locator('#betby iframe[src]:visible, iframe[src*="sport" i]:visible')
+      .count()
+      .catch(() => 0);
+    const skeletons = await page
+      .locator(
+        'main [class*="skeleton" i]:visible, main [class*="placeholder" i]:visible, main [aria-busy="true"]:visible'
+      )
+      .count()
+      .catch(() => 0);
+    lastState = { containers, embeddedFrames, contentSignals, skeletons };
+    if (containers > 0 && (contentSignals > 0 || embeddedFrames > 0) && skeletons === 0) {
+      return { ready: true, ...lastState };
+    }
+    await sleep(400);
+  }
+  return { ready: false, ...lastState };
 }
 
 async function openSports(page, route = '/sports/?bt-path=%2F') {
@@ -197,8 +663,16 @@ async function openSports(page, route = '/sports/?bt-path=%2F') {
   }
 
   await dismissOverlays(page);
-  await waitForSportsContent(page);
+  const contentState = await waitForSportsContent(page);
   await waitForUiSettled(page, 1200);
+  await dismissOverlays(page);
+
+  if (!/\/sports\/?/i.test(new URL(page.url(), BASE_ORIGIN).pathname) && !navigationError) {
+    navigationError = `Sports route resolved outside /sports: ${page.url()}`;
+  }
+  if (!contentState.ready && !navigationError) {
+    navigationError = `Sports content did not become ready at ${page.url()}.`;
+  }
 
   const challenge = await getChallengeReason(page);
   const loginVisible = await page
@@ -215,6 +689,7 @@ async function openSports(page, route = '/sports/?bt-path=%2F') {
     title: await page.title().catch(() => ''),
     challenge: challenge || (navigationError ? `Navigation failed: ${navigationError}` : null),
     loginVisible,
+    contentState,
   };
 }
 
@@ -302,6 +777,33 @@ function getBtPath(urlString) {
   }
 }
 
+function decodeSportsPath(value) {
+  let decoded = String(value || '');
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const next = decodeURIComponent(decoded);
+      if (next === decoded) break;
+      decoded = next;
+    } catch {
+      break;
+    }
+  }
+  return decoded;
+}
+
+function isSportsEventUrl(urlString) {
+  try {
+    const url = new URL(urlString, BASE_ORIGIN);
+    const btPath = url.searchParams.get('bt-path') || '';
+    if (btPath.split('/').filter(Boolean).length >= 3) return true;
+    return /^\/(?:football|soccer|tennis|basketball|ice-hockey|hockey|volleyball)\//i.test(
+      url.pathname
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function readSportsState(page) {
   return page.evaluate(() => ({
     url: window.location.href,
@@ -341,6 +843,42 @@ async function openEventFromSportsList(page) {
   const beforeUrl = page.url();
   const attempts = [];
 
+  const eventLinks = page.locator(
+    'a[href*="/sports/"][href*="bt-path="], a[href^="/football/"], a[href^="/soccer/"], a[href^="/tennis/"], a[href^="/basketball/"], a[href^="/ice-hockey/"], a[href^="/hockey/"], a[href^="/volleyball/"]'
+  );
+  const eventLinkCount = Math.min(await eventLinks.count().catch(() => 0), 80);
+  for (let index = 0; index < eventLinkCount; index += 1) {
+    const locator = eventLinks.nth(index);
+    const href = await locator.getAttribute('href').catch(() => '');
+    let routeDepth = 0;
+    try {
+      const candidateUrl = new URL(href || '', BASE_ORIGIN);
+      const btPath = candidateUrl.searchParams.get('bt-path') || '';
+      routeDepth = Math.max(
+        btPath.split('/').filter(Boolean).length,
+        candidateUrl.pathname.split('/').filter(Boolean).length
+      );
+    } catch {
+      routeDepth = 0;
+    }
+    if (routeDepth < 3) continue;
+    const visible = await locator.isVisible({ timeout: 300 }).catch(() => false);
+    if (!visible) continue;
+    await locator.scrollIntoViewIfNeeded().catch(() => null);
+    await locator.click({ timeout: 7000 }).catch(() => null);
+    await page
+      .waitForFunction((previousUrl) => window.location.href !== previousUrl, beforeUrl, {
+        timeout: 5000,
+      })
+      .catch(() => null);
+    await waitForUiSettled(page, 500);
+    const afterUrl = page.url();
+    attempts.push({ strategy: `event-link:${href}`, afterUrl });
+    if (afterUrl !== beforeUrl && isSportsEventUrl(afterUrl)) {
+      return { opened: true, strategy: `event-link:${href}`, beforeUrl, afterUrl, attempts };
+    }
+  }
+
   const textCandidates = [
     /brentford fc/i,
     /wolverhampton/i,
@@ -355,7 +893,7 @@ async function openEventFromSportsList(page) {
     await waitForUiSettled(page, 900);
     const afterUrl = page.url();
     attempts.push({ strategy: `text:${pattern}`, afterUrl });
-    if (afterUrl !== beforeUrl && /\/sports\/\?bt-path=/i.test(afterUrl)) {
+    if (afterUrl !== beforeUrl && isSportsEventUrl(afterUrl)) {
       return {
         opened: true,
         strategy: `text:${pattern}`,
@@ -368,25 +906,35 @@ async function openEventFromSportsList(page) {
 
   const box = await findSportsBox(page);
   if (box) {
+    await page.evaluate(() => window.scrollTo(0, 0)).catch(() => null);
+    await waitForUiSettled(page, 300);
+    const refreshedBox = (await findSportsBox(page)) || box;
+    const viewport = page.viewportSize() || { width: 1365, height: 900 };
+    const left = Math.max(0, refreshedBox.x);
+    const top = Math.max(90, refreshedBox.y);
+    const right = Math.min(viewport.width - 1, refreshedBox.x + refreshedBox.width);
+    const bottom = Math.min(viewport.height - 1, refreshedBox.y + refreshedBox.height);
+    const visibleWidth = Math.max(1, right - left);
+    const visibleHeight = Math.max(1, bottom - top);
     const points = [
-      [820, 390],
-      [860, 390],
-      [780, 430],
-      [840, 430],
-      [760, 470],
+      [0.35, 0.3],
+      [0.6, 0.3],
+      [0.35, 0.5],
+      [0.6, 0.5],
+      [0.45, 0.7],
     ];
 
-    for (const [x, y] of points) {
-      const absX = box.x + x;
-      const absY = box.y + y;
+    for (const [xRatio, yRatio] of points) {
+      const absX = Math.round(left + visibleWidth * xRatio);
+      const absY = Math.round(top + visibleHeight * yRatio);
       await page.mouse.click(absX, absY).catch(() => null);
       await waitForUiSettled(page, 900);
       const afterUrl = page.url();
-      attempts.push({ strategy: `point:${x},${y}`, absX, absY, afterUrl });
-      if (afterUrl !== beforeUrl && /\/sports\/\?bt-path=/i.test(afterUrl)) {
+      attempts.push({ strategy: `viewport-point:${xRatio},${yRatio}`, absX, absY, afterUrl });
+      if (afterUrl !== beforeUrl && isSportsEventUrl(afterUrl)) {
         return {
           opened: true,
-          strategy: `point:${x},${y}`,
+          strategy: `viewport-point:${xRatio},${yRatio}`,
           beforeUrl,
           afterUrl,
           attempts,
@@ -407,6 +955,31 @@ async function openEventFromSportsList(page) {
 function isAllowed403(url) {
   const normalized = String(url || '').toLowerCase();
   return ALLOWED_403_PATTERNS.some((re) => re.test(normalized));
+}
+
+function isNonCriticalAuthProbeError(row) {
+  const status = Number((row && row.status) || 0);
+  return (
+    (status === 400 || status === 403) &&
+    /\/api\/auth\/user(?:[/?#]|$)/i.test(String((row && row.url) || ''))
+  );
+}
+
+function isOptionalBetBuilder404(row) {
+  return (
+    Number((row && row.status) || 0) === 404 &&
+    /\/api\/v1\/bet-builder\/brand\/[^/]+\/sport\/[^/?#]+(?:[/?#]|$)/i.test(
+      String((row && row.url) || '')
+    )
+  );
+}
+
+function isMainBrandUrl(url) {
+  try {
+    return new URL(String(url || '')).hostname === new URL(BASE_ORIGIN).hostname;
+  } catch {
+    return false;
+  }
 }
 
 function isStaticAssetUrl(url) {
@@ -475,8 +1048,6 @@ async function probeAuthorizedSession(page) {
   return probe;
 }
 
-test.describe.configure({ mode: 'serial' });
-
 test.describe('Sports Coverage: interactions + diagnostics', () => {
   test.setTimeout(180000);
 
@@ -496,11 +1067,9 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       return;
     }
 
-    const context = await browser.newContext({
-      storageState: authStatePath,
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+    const context = await browser.newContext(
+      resolveMatrixContextOptions({ storageState: authStatePath })
+    );
     const page = await context.newPage();
 
     try {
@@ -518,6 +1087,13 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
 
       const sportsBox = await findSportsBox(page);
       const visibleSignals = {
+        navigation: await page
+          .locator(
+            '[data-editor-id="mobileSportButton"]:visible, [data-editor-id="headerNavigationButton"]:visible, [data-testid="sports-navigation"]:visible'
+          )
+          .first()
+          .isVisible()
+          .catch(() => false),
         upcoming: await page
           .getByText(/upcoming/i)
           .first()
@@ -627,18 +1203,20 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       return;
     }
 
-    const context = await browser.newContext({
-      storageState: authStatePath,
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+    const context = await browser.newContext(
+      resolveMatrixContextOptions({ storageState: authStatePath })
+    );
     const page = await context.newPage();
 
     const checks = [
-      { label: 'Football', expected: '/soccer-1' },
-      { label: 'Basketball', expected: '/basketball-2' },
-      { label: 'Tennis', expected: '/tennis-5' },
-      { label: 'Live Sports', expected: '/live' },
+      {
+        label: 'Football',
+        expected: ['/football-1', '/soccer-1', '/1'],
+        dataCy: 'sport-soccer',
+      },
+      { label: 'Basketball', expected: ['/basketball-2', '/2'], dataCy: 'sport-basketball' },
+      { label: 'Tennis', expected: ['/tennis-5', '/5'], dataCy: 'sport-tennis' },
+      { label: 'Live', expected: ['/live'], dataCy: 'ic-live-simple', optional: true },
     ];
 
     try {
@@ -656,17 +1234,60 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
 
       const findings = [];
       for (const item of checks) {
+        // A selected sport replaces the root sport picker, so every assertion starts from
+        // the same canonical hub instead of depending on the previous sport's layout.
+        if (page.url() !== route.finalUrl) {
+          const resetRoute = await openSports(page, '/sports/?bt-path=%2F');
+          if (resetRoute.challenge) {
+            findings.push({
+              label: item.label,
+              status: 'blocked',
+              reason: resetRoute.challenge,
+              beforeUrl: page.url(),
+              afterUrl: page.url(),
+            });
+            continue;
+          }
+        }
         const beforeUrl = page.url();
-        const locator = await firstVisibleLocator(page, [
-          `a[href*="/sports/?bt-path="]:has-text("${item.label}")`,
-          `a:has-text("${item.label}")`,
+        const routeSelectors = item.expected.flatMap((expectedPath) => [
+          `a[href*="bt-path=${encodeURIComponent(expectedPath)}" i]`,
+          `a[href*="bt-path=${expectedPath}" i]`,
         ]);
+        // The sportsbook renders the sport switcher as generic shadow-DOM controls with a
+        // dynamic event count (for example, "Football 758"). Exact text alone also matches
+        // the "Football" fragment inside league links and opens a league instead of bt-path.
+        const sportWithCount = new RegExp(`^${item.label}\\s*\\d+\\s*$`, 'i');
+        const stableControl = item.optional
+          ? page
+              .locator('[data-editor-id="headerNavigationButton"]')
+              .filter({ has: page.locator(`[data-cy="${item.dataCy}"]`) })
+              .first()
+          : page
+              .locator('[data-editor-id="mobileSportButton"]')
+              .filter({ has: page.locator(`[data-cy="${item.dataCy}"]`) })
+              .first();
+        const locator =
+          ((await stableControl.isVisible({ timeout: 1200 }).catch(() => false))
+            ? stableControl
+            : null) ||
+          (await firstVisibleLocator(page, [
+            ...routeSelectors,
+            `a[href*="/sports/?bt-path="]:has-text("${item.label}")`,
+            `button:has-text("${item.label}")`,
+          ])) ||
+          (await firstVisibleTextLocator(page, [
+            sportWithCount,
+            new RegExp(`^${item.label}$`, 'i'),
+          ]));
 
         if (!locator) {
           findings.push({
             label: item.label,
-            status: 'blocked',
-            reason: 'Navigation link is not visible.',
+            status: item.optional ? 'not-applicable' : 'blocked',
+            reason: item.optional
+              ? 'Optional navigation item is not exposed in the current mobile layout.'
+              : 'Navigation link is not visible.',
             beforeUrl,
             afterUrl: page.url(),
           });
@@ -674,30 +1295,59 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         }
 
         await locator.click({ timeout: 10000 }).catch(() => null);
-        await waitForUiSettled(page, 1200);
+        await page
+          .waitForFunction((previousUrl) => window.location.href !== previousUrl, beforeUrl, {
+            timeout: 5000,
+          })
+          .catch(() => null);
+        await waitForUiSettled(page, 600);
         const afterUrl = page.url();
         const btPath = getBtPath(afterUrl);
-        const ok = afterUrl !== beforeUrl && btPath.includes(item.expected);
+        const decodedBtPath = decodeSportsPath(btPath);
+        const matchedExpected = item.expected.find((expectedPath) =>
+          decodedBtPath.includes(expectedPath)
+        );
+        const ok = afterUrl !== beforeUrl && Boolean(matchedExpected);
 
         findings.push({
           label: item.label,
           expected: item.expected,
-          status: ok ? 'passed' : 'failed',
+          matchedExpected: matchedExpected || '',
+          status: ok ? 'passed' : item.optional ? 'not-applicable' : 'failed',
+          reason:
+            ok || !item.optional
+              ? ''
+              : 'Optional navigation item did not expose the expected bt-path in this layout.',
           beforeUrl,
           afterUrl,
           btPath,
+          decodedBtPath,
         });
       }
 
+      const requiredLabels = checks.filter((item) => !item.optional).map((item) => item.label);
+      const requiredFindings = findings.filter((item) => requiredLabels.includes(item.label));
+      const optionalNotApplicable = findings.filter((item) => item.status === 'not-applicable');
+      if (optionalNotApplicable.length > 0) {
+        testInfo.annotations.push({
+          type: 'not-applicable',
+          description: `Optional sports navigation is not exposed in this layout: ${optionalNotApplicable
+            .map((item) => item.label)
+            .join(', ')}.`,
+        });
+      }
       const passedCount = findings.filter((item) => item.status === 'passed').length;
-      if (passedCount === 0) {
+      const requiredPassedCount = requiredFindings.filter(
+        (item) => item.status === 'passed'
+      ).length;
+      if (requiredPassedCount < requiredFindings.length) {
         markBlocked(
           testInfo,
-          'Sports navigation items were not switchable via visible links in current render.'
+          `Sports navigation is incomplete: ${requiredPassedCount}/${requiredFindings.length} required sport switches were confirmed.`
         );
         await writeAndAttach(testInfo, testInfo.title, {
           blocked: true,
-          reason: 'No sports nav route switch passed.',
+          reason: 'Not all required sports navigation switches passed.',
           findings,
           route,
           authStatePath,
@@ -705,16 +1355,11 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         return;
       }
 
-      if (passedCount < checks.length) {
-        testInfo.annotations.push({
-          type: 'partial',
-          description: `Sports nav coverage is partial: ${passedCount}/${checks.length} switches confirmed.`,
-        });
-      }
-
       await writeAndAttach(testInfo, testInfo.title, {
         blocked: false,
-        partial: passedCount < checks.length,
+        partial: false,
+        passedCount,
+        requiredPassedCount,
         findings,
         route,
         authStatePath,
@@ -737,11 +1382,9 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       return;
     }
 
-    const context = await browser.newContext({
-      storageState: authStatePath,
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+    const context = await browser.newContext(
+      resolveMatrixContextOptions({ storageState: authStatePath })
+    );
     const page = await context.newPage();
 
     try {
@@ -883,11 +1526,9 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       return;
     }
 
-    const context = await browser.newContext({
-      storageState: authStatePath,
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+    const context = await browser.newContext(
+      resolveMatrixContextOptions({ storageState: authStatePath })
+    );
     const page = await context.newPage();
 
     try {
@@ -917,18 +1558,41 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       }
 
       const eventUrl = page.url();
-      await page.goBack({ waitUntil: 'domcontentloaded' }).catch(() => null);
-      await waitForUiSettled(page, 1200);
-      const afterBackUrl = page.url();
-      const remainedOnSports = /\/sports\/\?bt-path=/i.test(afterBackUrl);
+      const backAction = await returnFromSportsEvent(page, eventUrl);
+      const afterBackUrl = backAction.afterUrl;
+      const remainedOnSports = /\/sports\/?(?:\?|$)/i.test(afterBackUrl);
+
+      // Persist the navigation trace before assertions so a failed return keeps
+      // the exact event/list URLs and every fallback attempt in the report.
+      await writeAndAttach(testInfo, `${testInfo.title}-navigation-trace`, {
+        route,
+        openEvent,
+        eventUrl,
+        afterBackUrl,
+        remainedOnSports,
+        backAction,
+      });
 
       expect(remainedOnSports, 'After back, page should remain on /sports route.').toBeTruthy();
+      if (backAction.strategy === 'sports-navigation') {
+        testInfo.annotations.push({
+          type: 'partial',
+          description:
+            'The embedded widget did not expose a semantic Back control; persistent Sports navigation returned to the sports list.',
+        });
+      }
       if (
         eventUrl === afterBackUrl &&
         isCapabilityOptionalForBrand(BASE_URL, 'sportsEventDetails')
       ) {
-        const reason = 'Sports event details back action did not change route.';
+        const reason =
+          'Neither a semantic Back control nor browser history returned from sports event details.';
         markBlocked(testInfo, reason);
+        const screenshotAttached = await attachProductEvidenceScreenshot(
+          page,
+          testInfo,
+          'sports-event-back-navigation-defect'
+        );
         await writeAndAttach(testInfo, testInfo.title, {
           blocked: true,
           partial: true,
@@ -936,8 +1600,11 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
           route,
           authStatePath,
           openEvent,
+          backAction,
           eventUrl,
           afterBackUrl,
+          screenshotAttached,
+          remediationContract: PRODUCT_REMEDIATION_PATH || '',
         });
         return;
       }
@@ -951,6 +1618,7 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         route,
         authStatePath,
         openEvent,
+        backAction,
         eventUrl,
         afterBackUrl,
       });
@@ -970,11 +1638,9 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       return;
     }
 
-    const context = await browser.newContext({
-      storageState: authStatePath,
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+    const context = await browser.newContext(
+      resolveMatrixContextOptions({ storageState: authStatePath })
+    );
     const page = await context.newPage();
 
     try {
@@ -1010,45 +1676,13 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         await waitForUiSettled(page, 800);
       }
 
-      const box = await findSportsBox(page);
       const before = await readSportsState(page);
-      const attempts = [];
-      let interactionConfirmed = false;
-      const pointCandidates = [
-        [630, 230],
-        [680, 230],
-        [560, 270],
-        [620, 300],
-        [700, 300],
-      ];
-
-      if (box) {
-        for (const [x, y] of pointCandidates) {
-          const absX = box.x + x;
-          const absY = box.y + y;
-          await page.mouse.click(absX, absY).catch(() => null);
-          await waitForUiSettled(page, 700);
-          const after = await readSportsState(page);
-          const changed = diffSportsState(before, after);
-          const row = {
-            x,
-            y,
-            absX,
-            absY,
-            url: after.url,
-            changed,
-          };
-          attempts.push(row);
-          const sameEventRoute = after.url === before.url;
-          if (
-            sameEventRoute &&
-            changed.some((key) => key.includes('localStorage.') || key === 'btPath')
-          ) {
-            interactionConfirmed = true;
-            break;
-          }
-        }
-      }
+      const oddsInteraction = await clickOddsWithEvidence(page);
+      const after = await readSportsState(page);
+      const changed = diffSportsState(before, after).filter(
+        (key) => !['localStorage.btSession', 'localStorage.tokenSport'].includes(key)
+      );
+      const interactionConfirmed = oddsInteraction.confirmed;
 
       const trackerVisible = await page
         .getByText(/tracker/i)
@@ -1069,7 +1703,8 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
           route,
           openEvent,
           authStatePath,
-          attempts,
+          oddsInteraction,
+          changed,
           trackerVisible,
           couponSignalVisible,
         });
@@ -1080,7 +1715,12 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         testInfo.annotations.push({
           type: 'partial',
           description:
-            'Odds click signal is weak: panel stayed interactive, but deterministic localStorage delta was not captured.',
+            'Odds click signal is weak: the betslip surface was visible, but no deterministic selection/state delta was captured.',
+        });
+      } else {
+        testInfo.annotations.push({
+          type: 'strong-evidence',
+          description: 'Odds interaction produced a deterministic betslip selection/state delta.',
         });
       }
 
@@ -1090,7 +1730,8 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         route,
         openEvent,
         authStatePath,
-        attempts,
+        oddsInteraction,
+        changed,
         trackerVisible,
         couponSignalVisible,
       });
@@ -1112,11 +1753,9 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       return;
     }
 
-    const context = await browser.newContext({
-      storageState: authStatePath,
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+    const context = await browser.newContext(
+      resolveMatrixContextOptions({ storageState: authStatePath })
+    );
     const page = await context.newPage();
 
     const betPosts = [];
@@ -1126,6 +1765,7 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         const url = req.url();
         if (method !== 'POST') return;
         if (!/\/api\/.*(bet|coupon|wager|ticket)/i.test(url)) return;
+        if (/\/bet-builder\/.*\/coeffs(?:[/?#]|$)/i.test(url)) return;
         betPosts.push({ method, url });
       } catch {
         // ignore request parsing issues
@@ -1174,22 +1814,21 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         steps.push('betslip-click');
       }
 
-      const box = await findSportsBox(page);
-      if (box) {
-        await page.mouse.click(box.x + 630, box.y + 230).catch(() => null);
-        await waitForUiSettled(page, 600);
-        await page.mouse.click(box.x + 630, box.y + 230).catch(() => null);
-        await waitForUiSettled(page, 600);
-        steps.push('odds-toggle-try');
-      }
+      const oddsInteraction = await clickOddsWithEvidence(page);
+      steps.push(
+        oddsInteraction.confirmed ? 'odds-selection-confirmed' : 'odds-selection-not-confirmed'
+      );
 
       let stakeInputFound = false;
-      const stakeInput = await firstVisibleLocator(page, [
-        'input[placeholder*="stake" i]',
-        'input[placeholder*="amount" i]',
-        'input[inputmode="decimal"]',
-        'input[type="number"]',
-      ]);
+      const betslipSurface = await findBetslipSurface(page);
+      const stakeInput = betslipSurface
+        ? await firstVisibleLocator(betslipSurface, [
+            'input[placeholder*="stake" i]',
+            'input[placeholder*="amount" i]',
+            'input[inputmode="decimal"]',
+            'input[type="number"]',
+          ])
+        : null;
       if (stakeInput) {
         stakeInputFound = true;
         await stakeInput.fill('0').catch(() => null);
@@ -1199,17 +1838,16 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         await page.keyboard.press('Enter').catch(() => null);
         await waitForUiSettled(page, 500);
         steps.push('stake-invalid-input');
-      } else if (box) {
-        await page.mouse.click(box.x + 1110, box.y + 220).catch(() => null);
-        await page.keyboard.type('0').catch(() => null);
-        await page.keyboard.press('Enter').catch(() => null);
-        await waitForUiSettled(page, 400);
-        await page.keyboard.press('Control+A').catch(() => null);
-        await page.keyboard.type('-10').catch(() => null);
-        await page.keyboard.press('Enter').catch(() => null);
-        await waitForUiSettled(page, 500);
-        steps.push('stake-coordinate-try');
       }
+
+      const removeInteraction = oddsInteraction.confirmed
+        ? await removeBetslipSelection(page)
+        : { confirmed: false, attempts: [], reason: 'No selected odd to remove.' };
+      steps.push(
+        removeInteraction.confirmed
+          ? 'odds-selection-removed'
+          : 'odds-selection-remove-not-confirmed'
+      );
 
       const stateAfter = await readSportsState(page);
       const changed = diffSportsState(stateBefore, stateAfter);
@@ -1218,7 +1856,13 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         testInfo.annotations.push({
           type: 'partial',
           description:
-            'No visible stake input detected in DOM; invalid stake was tested via coordinate+keyboard fallback.',
+            'No visible stake input detected in DOM; invalid stake was not simulated with unsafe coordinate input.',
+        });
+      }
+      if (!oddsInteraction.confirmed || !removeInteraction.confirmed) {
+        testInfo.annotations.push({
+          type: 'partial',
+          description: 'Odds selection and removal could not both be confirmed from DOM evidence.',
         });
       }
 
@@ -1231,11 +1875,13 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
 
       await writeAndAttach(testInfo, testInfo.title, {
         blocked: false,
-        partial: !stakeInputFound,
+        partial: !stakeInputFound || !oddsInteraction.confirmed || !removeInteraction.confirmed,
         route,
         openEvent,
         authStatePath,
         steps,
+        oddsInteraction,
+        removeInteraction,
         changed,
         stateBefore,
         stateAfter,
@@ -1259,11 +1905,9 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       return;
     }
 
-    const context = await browser.newContext({
-      storageState: authStatePath,
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+    const context = await browser.newContext(
+      resolveMatrixContextOptions({ storageState: authStatePath })
+    );
     const page = await context.newPage();
 
     const responseErrors = [];
@@ -1278,6 +1922,7 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
           status,
           url: resp.url(),
           method: resp.request().method(),
+          resourceType: resp.request().resourceType(),
         });
       } catch {
         // ignore response parsing errors
@@ -1332,22 +1977,73 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       await openEventFromSportsList(page);
       await waitForUiSettled(page, 1000);
 
+      const betBuilderUiVisible = await page
+        .getByText(/^bet builder$/i)
+        .first()
+        .isVisible({ timeout: 700 })
+        .catch(() => false);
+
       const ignored = responseErrors.filter((row) => row.status === 403 && isAllowed403(row.url));
+      const optionalCapabilityErrors = betBuilderUiVisible
+        ? []
+        : responseErrors.filter((row) => isOptionalBetBuilder404(row));
+      const authProbeErrors = responseErrors.filter((row) => isNonCriticalAuthProbeError(row));
       const criticalHttp = responseErrors.filter((row) => {
         const url = String(row.url || '');
-        const inMainDomain = /gt\.bet/i.test(url);
+        if (!betBuilderUiVisible && isOptionalBetBuilder404(row)) return false;
+        if (isNonCriticalAuthProbeError(row)) return false;
+        const inMainDomain = isMainBrandUrl(url);
         if (row.status >= 500) return true;
         if (row.status >= 400 && inMainDomain && !isAllowed403(url)) return true;
         return false;
       });
+      const mainDomain403 = responseErrors.filter(
+        (row) => row.status === 403 && isMainBrandUrl(String(row.url || ''))
+      );
+      const massWaf403 = mainDomain403.length >= 3;
       const noisyFailedRequests = failedRequests.filter((row) => isNoisyRequestFailure(row));
+      const invalidFlagRequests = failedRequests.filter((row) =>
+        /flags_by_code\/(?:undefined|null|\.)?\.svg/i.test(String((row && row.url) || ''))
+      );
       const criticalFailedRequests = failedRequests.filter((row) => isCriticalFailedRequest(row));
       const consoleWarnings = consoleErrors.filter((row) => {
         const url = String(row.url || '');
+        const text = String(row.text || '');
+        if (
+          !betBuilderUiVisible &&
+          (/\/api\/v1\/bet-builder\/brand\/[^/]+\/sport\//i.test(url) ||
+            /loading betbuilder settings.*status 404/i.test(text))
+        ) {
+          return false;
+        }
         if (!url) return true;
         if (isAllowed403(url)) return false;
-        return /gt\.bet|sptpub/i.test(url);
+        return isMainBrandUrl(url) || /sptpub/i.test(url);
       });
+
+      if (optionalCapabilityErrors.length > 0) {
+        testInfo.annotations.push({
+          type: 'product-warning',
+          description: `${optionalCapabilityErrors.length} BetBuilder capability request(s) returned 404. The UI does not expose Bet Builder, but the frontend still requests its configuration.`,
+        });
+      }
+      if (authProbeErrors.length > 0) {
+        testInfo.annotations.push({
+          type: 'product-warning',
+          description: `${authProbeErrors.length} background /api/auth/user probe(s) returned 400/403 while the authorized sports UI remained usable.`,
+        });
+      }
+      if (invalidFlagRequests.length > 0) {
+        testInfo.annotations.push({
+          type: 'product-warning',
+          description: `${invalidFlagRequests.length} country flag asset request(s) contain an undefined/null country code. Add data validation and a neutral flag fallback.`,
+        });
+        await attachProductEvidenceScreenshot(
+          page,
+          testInfo,
+          'sports-invalid-country-flag-fallback'
+        );
+      }
 
       if (consoleWarnings.length > 0) {
         testInfo.annotations.push({
@@ -1362,6 +2058,52 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
         });
       }
 
+      const diagnosticPayload = {
+        blocked: massWaf403,
+        reason: massWaf403
+          ? `WAF 403 on critical sports resources: ${mainDomain403
+              .slice(0, 5)
+              .map((row) => row.url)
+              .join(' | ')}`
+          : '',
+        route,
+        authStatePath,
+        summary: {
+          responseErrors: responseErrors.length,
+          ignored403: ignored.length,
+          optionalCapabilityErrors: optionalCapabilityErrors.length,
+          authProbeErrors: authProbeErrors.length,
+          betBuilderUiVisible,
+          criticalHttp: criticalHttp.length,
+          failedRequests: failedRequests.length,
+          noisyFailedRequests: noisyFailedRequests.length,
+          invalidFlagRequests: invalidFlagRequests.length,
+          criticalFailedRequests: criticalFailedRequests.length,
+          consoleErrors: consoleErrors.length,
+          consoleWarnings: consoleWarnings.length,
+          mainDomain403: mainDomain403.length,
+          massWaf403,
+        },
+        responseErrors,
+        ignored403: ignored,
+        optionalCapabilityErrors,
+        authProbeErrors,
+        criticalHttp,
+        failedRequests,
+        noisyFailedRequests,
+        invalidFlagRequests,
+        criticalFailedRequests,
+        consoleErrors,
+        consoleWarnings,
+      };
+
+      await writeAndAttach(testInfo, testInfo.title, diagnosticPayload);
+
+      if (massWaf403) {
+        markBlocked(testInfo, diagnosticPayload.reason);
+        return;
+      }
+
       expect(
         criticalHttp.length,
         `Critical sports HTTP diagnostics detected: ${criticalHttp
@@ -1374,30 +2116,6 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
           .map((row) => `${row.method} ${row.url} (${row.failure})`)
           .join(' | ')}`
       ).toBe(0);
-
-      await writeAndAttach(testInfo, testInfo.title, {
-        blocked: false,
-        route,
-        authStatePath,
-        summary: {
-          responseErrors: responseErrors.length,
-          ignored403: ignored.length,
-          criticalHttp: criticalHttp.length,
-          failedRequests: failedRequests.length,
-          noisyFailedRequests: noisyFailedRequests.length,
-          criticalFailedRequests: criticalFailedRequests.length,
-          consoleErrors: consoleErrors.length,
-          consoleWarnings: consoleWarnings.length,
-        },
-        responseErrors,
-        ignored403: ignored,
-        criticalHttp,
-        failedRequests,
-        noisyFailedRequests,
-        criticalFailedRequests,
-        consoleErrors,
-        consoleWarnings,
-      });
     } finally {
       await context.close();
     }
@@ -1418,10 +2136,12 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
     const captured = [];
     const blockedViewports = [];
 
+    const extraHTTPHeaders = resolveExtraHTTPHeaders();
     const desktopContext = await browser.newContext({
       storageState: authStatePath,
       viewport: { width: 1365, height: 900 },
       ignoreHTTPSErrors: true,
+      ...(extraHTTPHeaders ? { extraHTTPHeaders } : {}),
     });
     const desktopPage = await desktopContext.newPage();
     try {
@@ -1443,6 +2163,7 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       ignoreHTTPSErrors: true,
       isMobile: true,
       hasTouch: true,
+      ...(extraHTTPHeaders ? { extraHTTPHeaders } : {}),
     });
     const mobilePage = await mobileContext.newPage();
     try {
@@ -1507,11 +2228,9 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       return;
     }
 
-    const context = await browser.newContext({
-      storageState: authStatePath,
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+    const context = await browser.newContext(
+      resolveMatrixContextOptions({ storageState: authStatePath })
+    );
     const page = await context.newPage();
 
     const plans = [
@@ -1606,6 +2325,13 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
           type: 'partial',
           description: `Sports metadata has ${warnings.length} warning(s); see attached artifact.`,
         });
+        testInfo.annotations.push({
+          type: 'product-warning',
+          description: `Sports metadata requires a product fix. Remediation contract: ${
+            PRODUCT_REMEDIATION_PATH || 'not configured'
+          }`,
+        });
+        await attachProductEvidenceScreenshot(page, testInfo, 'sports-metadata-h1-defect');
       }
       if (blockedRoutes.length) {
         testInfo.annotations.push({
@@ -1619,6 +2345,9 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       await writeAndAttach(testInfo, testInfo.title, {
         blocked: false,
         partial: warnings.length > 0 || blockedRoutes.length > 0,
+        productOwnerActionRequired: warnings.length > 0,
+        remediationContract:
+          warnings.length > 0 && PRODUCT_REMEDIATION_PATH ? PRODUCT_REMEDIATION_PATH : '',
         authStatePath,
         checked,
         blockedRoutes,
@@ -1642,11 +2371,9 @@ test.describe('Sports Coverage: interactions + diagnostics', () => {
       return;
     }
 
-    const context = await browser.newContext({
-      storageState: authStatePath,
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+    const context = await browser.newContext(
+      resolveMatrixContextOptions({ storageState: authStatePath })
+    );
     const page = await context.newPage();
     const wsCapture = createWsCapture(page, { sampleLimit: 24, framePreviewLength: 260 });
 

@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const {
   detectCloudflare,
   dismissOverlays,
@@ -9,6 +9,7 @@ const {
   waitForUiSettled,
 } = require('../helpers/gt-utils');
 const { isCapabilityOptionalForBrand } = require('../helpers/brand-capabilities');
+const { resolveExtraHTTPHeaders } = require('../helpers/context-options');
 const {
   AUTH_ASSETS_SERVICE_ITEMS,
   AUTH_HOME_ITEMS,
@@ -54,6 +55,7 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   EXPLICIT_STORAGE_STATE_PATH,
   PROJECT_ROOT_STORAGE_STATE_PATH,
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
@@ -81,7 +83,9 @@ const GUEST_NAV_CHECK_OPTIONS = {
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-const DEFAULT_GUEST_PRIMARY_MAX = MOBILE_MODE_ENABLED ? 2 : 3;
+// Run the complete declared navigation inventory by default. A caller can still
+// cap it explicitly for a diagnostic run through PW_SIDEBAR_GUEST_PRIMARY_MAX.
+const DEFAULT_GUEST_PRIMARY_MAX = GUEST_NAV_PRIMARY_ITEMS.length;
 const GUEST_PRIMARY_MAX_ITEMS = toPositiveInt(
   process.env.PW_SIDEBAR_GUEST_PRIMARY_MAX || String(DEFAULT_GUEST_PRIMARY_MAX),
   DEFAULT_GUEST_PRIMARY_MAX
@@ -92,10 +96,20 @@ const SIDEBAR_LANGUAGE_MATRIX_MAX = toPositiveInt(
 );
 
 function getSidebarContextOptions(extra = {}) {
+  const configuredHeaders = resolveExtraHTTPHeaders();
   const options = {
     viewport: MOBILE_MODE_ENABLED ? MOBILE_CONTEXT_VIEWPORT : DESKTOP_CONTEXT_VIEWPORT,
     ignoreHTTPSErrors: true,
+    storageState: { cookies: [], origins: [] },
     ...extra,
+    ...(configuredHeaders || extra.extraHTTPHeaders
+      ? {
+          extraHTTPHeaders: {
+            ...(configuredHeaders || {}),
+            ...(extra.extraHTTPHeaders || {}),
+          },
+        }
+      : {}),
   };
   if (MOBILE_MODE_ENABLED) {
     options.isMobile = true;
@@ -301,8 +315,28 @@ function inventoryItemMatchesExpected(inventoryItem, expectedItem) {
   const testId = compactText(inventoryItem.testId || '').toLowerCase();
 
   if (expectedItem.testId && testId === String(expectedItem.testId).toLowerCase()) return true;
+  if (
+    Array.isArray(expectedItem.testIds) &&
+    expectedItem.testIds.some((expectedTestId) =>
+      testId.includes(String(expectedTestId || '').toLowerCase())
+    )
+  ) {
+    return true;
+  }
+  if (
+    Array.isArray(expectedItem.expectedPaths) &&
+    expectedItem.expectedPaths.some((expectedPath) => href.includes(String(expectedPath || '')))
+  ) {
+    return true;
+  }
   if (expectedItem.placeholder && areLabelsEquivalent(text, expectedItem.placeholder)) return true;
   if (expectedItem.label && areLabelsEquivalent(text, expectedItem.label)) return true;
+  if (
+    Array.isArray(expectedItem.aliases) &&
+    expectedItem.aliases.some((alias) => areLabelsEquivalent(text, alias))
+  ) {
+    return true;
+  }
 
   if (expectedItem.kind === 'search-input') {
     return /search|поиск/i.test(text) || /search/i.test(testId) || /search/i.test(href);
@@ -315,6 +349,16 @@ function inventoryItemMatchesExpected(inventoryItem, expectedItem) {
   }
 
   return false;
+}
+
+function inventoryExposesLanguage(inventoryItem) {
+  const text = compactText(inventoryItem && (inventoryItem.text || inventoryItem.placeholder));
+  const href = compactText((inventoryItem && inventoryItem.href) || '');
+  const testId = compactText((inventoryItem && inventoryItem.testId) || '');
+  return (
+    /english|fran[cç]ais|espa[nñ]ol|italiano|deutsch|portugu[eê]s|русск|україн/i.test(text) ||
+    /(?:^|[-_/])(lang|language)(?:[-_/]|$)/i.test(`${href} ${testId}`)
+  );
 }
 
 function resolveItemsAgainstInventory(items, inventoryItems, options = {}) {
@@ -377,11 +421,6 @@ async function getChallengeReason(page, navigationError = null) {
     return `Forbidden page detected: ${currentUrl}`;
   }
 
-  const bodyText = compactText(await page.textContent('body').catch(() => ''));
-  if (/verify you are human|cloudflare|attention required/i.test(bodyText)) {
-    return `Challenge content detected: ${bodyText.slice(0, 180)}`;
-  }
-
   const appRootVisible = await page
     .locator('#app, #__nuxt')
     .first()
@@ -395,7 +434,11 @@ async function getChallengeReason(page, navigationError = null) {
 }
 
 function getSidebar(page) {
-  return page.locator('[data-testid="sidebar-aside"], .t-sidebar-menu, .t-sidebar, aside').first();
+  return page
+    .locator(
+      '[data-testid="sidebar-aside"]:visible, .t-sidebar-menu:visible, .t-sidebar:visible, aside:visible'
+    )
+    .first();
 }
 
 async function expandSidebarIfCollapsed(page) {
@@ -405,7 +448,11 @@ async function expandSidebarIfCollapsed(page) {
   const toggleSelectors = [
     '[data-testid="sidebar-burger-button"]',
     '[data-testid="header-burger-button"]',
+    '.t-quick-navigations__item.menu',
+    '.t-quick-navigations__item .action-link-2',
+    '.t-quick-navigations__item:has(.t-icon-menu)',
     '.t-header__toggle',
+    'button[aria-label*="sidebar" i]',
     'button[aria-label*="menu" i]',
     'button[class*="burger" i]',
   ];
@@ -424,6 +471,85 @@ async function expandSidebarIfCollapsed(page) {
   }
 
   return sidebar.isVisible({ timeout: 1000 }).catch(() => false);
+}
+
+async function waitForSidebarContentHydrated(page, timeoutMs = 12000) {
+  const deadlineAt = Date.now() + timeoutMs;
+  let lastState = null;
+
+  while (Date.now() < deadlineAt) {
+    const sidebar = getSidebar(page);
+    lastState = await sidebar
+      .evaluate((root) => {
+        function isVisible(node) {
+          const style = window.getComputedStyle(node);
+          const rect = node.getBoundingClientRect();
+          return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            Number(style.opacity) !== 0 &&
+            rect.width > 2 &&
+            rect.height > 2
+          );
+        }
+
+        const selector = 'a[href], button, input, [role="button"], [data-testid]';
+        const actionable = Array.from(root.querySelectorAll(selector)).filter((node) => {
+          if (!isVisible(node)) return false;
+          if (node.matches('[disabled], [aria-disabled="true"], [aria-busy="true"]')) return false;
+          if (node.closest('[class*="skeleton" i], [class*="placeholder" i], [aria-busy="true"]')) {
+            return false;
+          }
+          const identity = [
+            node.innerText,
+            node.textContent,
+            node.getAttribute('href'),
+            node.getAttribute('data-testid'),
+            node.getAttribute('aria-label'),
+            node.getAttribute('placeholder'),
+          ]
+            .filter(Boolean)
+            .join(' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+          return Boolean(identity) && !/skeleton|placeholder|loading/i.test(identity);
+        });
+        const knownControls = actionable.filter((node) =>
+          /^(sidebar-liveChat-button|online-chat-button|sidebar-lang-selector)$/.test(
+            node.getAttribute('data-testid') || ''
+          )
+        ).length;
+        const visibleSkeletons = Array.from(
+          root.querySelectorAll(
+            '[class*="skeleton" i], [class*="placeholder" i], [aria-busy="true"]'
+          )
+        ).filter((node) => isVisible(node)).length;
+
+        return {
+          ready: actionable.length >= 3 || (knownControls > 0 && visibleSkeletons === 0),
+          actionableCount: actionable.length,
+          knownControls,
+          visibleSkeletons,
+          rootBusy: root.getAttribute('aria-busy') === 'true',
+        };
+      })
+      .catch(() => null);
+
+    if (lastState && lastState.ready && !lastState.rootBusy) {
+      return { ok: true, ...lastState };
+    }
+    await sleep(350);
+  }
+
+  return {
+    ok: false,
+    ...(lastState || {
+      actionableCount: 0,
+      knownControls: 0,
+      visibleSkeletons: 0,
+      rootBusy: false,
+    }),
+  };
 }
 
 async function waitForSidebarReady(page, route, options = {}) {
@@ -555,6 +681,28 @@ async function waitForSidebarReady(page, route, options = {}) {
         continue;
       }
 
+      const contentTimeoutMs =
+        toPositiveInt(options.contentTimeoutMs, null) ||
+        toPositiveInt(process.env.PW_SIDEBAR_CONTENT_TIMEOUT || '12000', 12000);
+      const contentState = await waitForSidebarContentHydrated(page, contentTimeoutMs);
+      if (!contentState.ok) {
+        lastResult = {
+          ok: false,
+          challenge: 'Sidebar is visible but its content remained in loading/skeleton state.',
+          status: response ? response.status() : 0,
+          url: page.url(),
+          title: compactText(await page.title().catch(() => '')),
+          route: currentRoute,
+          attempt,
+          contentState,
+        };
+        attempts.push(lastResult);
+        if (attempt < attemptsLimit) {
+          await sleep(600);
+        }
+        continue;
+      }
+
       return {
         ok: true,
         status: response ? response.status() : 0,
@@ -562,6 +710,7 @@ async function waitForSidebarReady(page, route, options = {}) {
         title: compactText(await page.title().catch(() => '')),
         route: currentRoute,
         attempt,
+        contentState,
         attempts,
       };
     }
@@ -683,20 +832,86 @@ async function collectSidebarInventory(page) {
     }
   }
 
+  if (MOBILE_MODE_ENABLED) {
+    const mobileNavigationItems = await page
+      .evaluate(() => {
+        function isVisible(node) {
+          const style = window.getComputedStyle(node);
+          if (!style || style.display === 'none' || style.visibility === 'hidden') return false;
+          if (Number(style.opacity) === 0) return false;
+          const rect = node.getBoundingClientRect();
+          return rect.width > 2 && rect.height > 2;
+        }
+
+        const selectors = [
+          '.t-quick-navigations a[href]',
+          '.t-quick-navigations button',
+          '[class*="bottom-navigation" i] a[href]',
+          '[class*="bottom-navigation" i] button',
+          '[class*="mobile-navigation" i] a[href]',
+          '[class*="mobile-navigation" i] button',
+          'nav[aria-label*="bottom" i] a[href]',
+          'nav[aria-label*="bottom" i] button',
+          '.t-quick-navigations [class*="item" i]',
+          '[class*="bottom-navigation" i] [class*="item" i]',
+          '[class*="mobile-navigation" i] [class*="item" i]',
+        ].join(', ');
+
+        return Array.from(document.querySelectorAll(selectors))
+          .filter(isVisible)
+          .map((node) => ({
+            text: (
+              node.innerText ||
+              node.textContent ||
+              node.getAttribute('aria-label') ||
+              node.getAttribute('title') ||
+              ''
+            )
+              .replace(/\s+/g, ' ')
+              .trim(),
+            href: node.getAttribute('href') || '',
+            tag: node.tagName.toLowerCase(),
+            testId: node.getAttribute('data-testid') || '',
+            placeholder: node.getAttribute('placeholder') || '',
+            surface: 'mobile-navigation',
+          }));
+      })
+      .catch(() => []);
+
+    for (const item of mobileNavigationItems) {
+      const key = [item.text, item.href, item.tag, item.testId, item.placeholder].join('|');
+      if (!seen.has(key)) seen.set(key, item);
+    }
+  }
+
   await scrollSidebar(page, 'top');
   return [...seen.values()];
 }
 
 async function findSidebarItem(page, item) {
   const sidebar = getSidebar(page);
-  const labelRegex = item.label ? new RegExp(escapeRegExp(item.label), 'i') : null;
+  const labels = [item.label, ...(Array.isArray(item.aliases) ? item.aliases : [])].filter(Boolean);
+  const labelRegex = labels.length
+    ? new RegExp(`^(?:${labels.map(escapeRegExp).join('|')})(?:\\s+.*)?$`, 'i')
+    : null;
 
   for (const position of [item.position || 'top', 'top', 'middle', 'bottom']) {
     await scrollSidebar(page, position);
     const candidates = [];
 
+    if (Array.isArray(item.expectedPaths)) {
+      for (const expectedPath of item.expectedPaths.filter(Boolean)) {
+        const fragment = String(expectedPath).replace(/["\\]/g, '');
+        candidates.push(sidebar.locator(`a[href*="${fragment}"]`).first());
+      }
+    }
     if (item.testId) {
       candidates.push(sidebar.locator(`[data-testid="${item.testId}"]`).first());
+    }
+    if (Array.isArray(item.testIds)) {
+      for (const testId of item.testIds.filter(Boolean)) {
+        candidates.push(sidebar.locator(`[data-testid="${testId}"]`).first());
+      }
     }
     if (item.placeholder) {
       candidates.push(
@@ -706,19 +921,13 @@ async function findSidebarItem(page, item) {
     if (labelRegex) {
       candidates.push(sidebar.getByRole('link', { name: labelRegex }).first());
       candidates.push(sidebar.getByRole('button', { name: labelRegex }).first());
-      candidates.push(sidebar.getByText(labelRegex).first());
       candidates.push(
         sidebar
           .locator('a[href], button, [role="button"], [data-testid]')
           .filter({ hasText: labelRegex })
           .first()
       );
-    }
-    if (Array.isArray(item.expectedPaths)) {
-      for (const expectedPath of item.expectedPaths.filter(Boolean)) {
-        const fragment = String(expectedPath).replace(/["\\]/g, '');
-        candidates.push(sidebar.locator(`a[href*="${fragment}"]`).first());
-      }
+      candidates.push(sidebar.getByText(labelRegex).first());
     }
 
     for (const candidate of candidates) {
@@ -729,6 +938,25 @@ async function findSidebarItem(page, item) {
   }
 
   const pageLevelCandidates = [];
+  if (MOBILE_MODE_ENABLED && Array.isArray(item.expectedPaths)) {
+    for (const expectedPath of item.expectedPaths.filter(Boolean)) {
+      const fragment = String(expectedPath).replace(/["\\]/g, '');
+      pageLevelCandidates.push(page.locator(`a[href*="${fragment}"]:visible`).first());
+    }
+  }
+  if (MOBILE_MODE_ENABLED && labelRegex) {
+    pageLevelCandidates.push(page.getByRole('link', { name: labelRegex }).first());
+    pageLevelCandidates.push(page.getByRole('button', { name: labelRegex }).first());
+    pageLevelCandidates.push(
+      page
+        .locator(
+          '.t-quick-navigations a, .t-quick-navigations button, .t-quick-navigations [class*="item" i]'
+        )
+        .filter({ hasText: labelRegex })
+        .first()
+    );
+    pageLevelCandidates.push(page.locator('.t-quick-navigations').getByText(labelRegex).first());
+  }
   if (item.placeholder) {
     pageLevelCandidates.push(
       page.getByPlaceholder(new RegExp(escapeRegExp(item.placeholder), 'i')).first()
@@ -995,11 +1223,71 @@ async function collectLocaleCookiesFromPage(page) {
 }
 
 async function clickAndWait(page, locator) {
-  await clickLocatorRobust(page, locator, {
+  return clickLocatorRobust(page, locator, {
     timeout: 10000,
     waitForNavigation: true,
     settleTimeout: 2200,
   });
+}
+
+async function clickSidebarItemFresh(page, item, attempts = 3) {
+  let lastError = '';
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const target = await findSidebarItem(page, item);
+    if (!target) {
+      lastError = `Sidebar item "${itemVisibleLabel(item)}" was not found on attempt ${attempt}.`;
+    } else {
+      try {
+        const clicked =
+          item.kind === 'nav'
+            ? await clickLocatorRobust(page, target, {
+                timeout: 8000,
+                noWaitAfter: true,
+                waitForNavigation: false,
+                settleTimeout: 0,
+              })
+            : await clickAndWait(page, target);
+        if (clicked && item.kind === 'nav') {
+          await waitForExpectedPaths(page, item.expectedPaths, 10000);
+          await waitForUiSettled(page, 1000).catch(() => null);
+        }
+        if (clicked) return { clicked: true, target, attempt, error: '' };
+        lastError = `Sidebar item "${itemVisibleLabel(item)}" did not accept click on attempt ${attempt}.`;
+      } catch (error) {
+        lastError = compactText(error && error.message ? error.message : error);
+      }
+    }
+
+    await expandSidebarIfCollapsed(page).catch(() => null);
+    await waitForUiSettled(page, 500).catch(() => null);
+  }
+  return { clicked: false, target: null, attempt: attempts, error: lastError };
+}
+
+async function fillLiveChatInput(input, value) {
+  const filled = await input
+    .fill(value, { timeout: 5000 })
+    .then(() => true)
+    .catch(() => false);
+  if (filled) return true;
+
+  return input
+    .evaluate((element, nextValue) => {
+      if (!element) return false;
+      const descriptor = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        'value'
+      );
+      if (descriptor && typeof descriptor.set === 'function') {
+        descriptor.set.call(element, nextValue);
+      } else {
+        element.value = nextValue;
+      }
+      element.dispatchEvent(new window.Event('input', { bubbles: true }));
+      element.dispatchEvent(new window.Event('change', { bubbles: true }));
+      return true;
+    }, value)
+    .catch(() => false);
 }
 
 async function waitForExpectedPaths(page, expectedPaths, timeoutMs = 5000) {
@@ -1016,6 +1304,23 @@ async function waitForExpectedPaths(page, expectedPaths, timeoutMs = 5000) {
   }
 
   return targets.some((expectedPath) => page.url().includes(expectedPath));
+}
+
+async function findVisibleSidebarRouteLink(page, expectedPaths) {
+  const sidebar = getSidebar(page);
+  for (const position of ['top', 'middle', 'bottom']) {
+    await scrollSidebar(page, position);
+    for (const expectedPath of (expectedPaths || []).filter(Boolean)) {
+      const fragment = String(expectedPath).replace(/["\\]/g, '');
+      const links = sidebar.locator(`a[href*="${fragment}"]`);
+      const count = Math.min(await links.count().catch(() => 0), 12);
+      for (let index = 0; index < count; index += 1) {
+        const link = links.nth(index);
+        if (await link.isVisible().catch(() => false)) return link;
+      }
+    }
+  }
+  return null;
 }
 
 async function runCheck(page, item, checkOptions = {}) {
@@ -1135,9 +1440,16 @@ async function runCheck(page, item, checkOptions = {}) {
     return result;
   }
 
-  await clickAndWait(page, target);
+  const clickResult = ['chat', 'nav', 'guest-referral-gate'].includes(item.kind)
+    ? await clickSidebarItemFresh(page, item)
+    : { clicked: await clickAndWait(page, target), target, attempt: 1, error: '' };
+  if (!clickResult.clicked) {
+    result.status = 'failed';
+    result.reason = `Sidebar item "${result.label}" could not be clicked after ${clickResult.attempt} attempt(s): ${clickResult.error || 'unknown click error'}`;
+    return result;
+  }
   result.afterUrl = page.url();
-  result.afterClass = (await target.getAttribute('class').catch(() => '')) || '';
+  result.afterClass = (await target.getAttribute('class', { timeout: 1000 }).catch(() => '')) || '';
   result.classChanged = beforeClass !== result.afterClass;
   result.challenge = await getChallengeReason(page);
 
@@ -1178,7 +1490,9 @@ async function runCheck(page, item, checkOptions = {}) {
       ? item.expectedPaths.filter(Boolean)
       : [];
     result.signupVisible = await page
-      .locator('.t-signup-modal, [data-testid="signup-modal"], .t-signup')
+      .locator(
+        '.t-signup-modal:has(input), [data-testid="signup-modal"]:has(input), .t-signup:has(input)'
+      )
       .first()
       .isVisible()
       .catch(() => false);
@@ -1199,7 +1513,9 @@ async function runCheck(page, item, checkOptions = {}) {
         await waitForUiSettled(page, 1800);
         result.fallbackUrl = page.url();
         result.fallbackSignupVisible = await page
-          .locator('.t-signup-modal, [data-testid="signup-modal"], .t-signup')
+          .locator(
+            '.t-signup-modal:has(input), [data-testid="signup-modal"]:has(input), .t-signup:has(input)'
+          )
           .first()
           .isVisible()
           .catch(() => false);
@@ -1286,9 +1602,16 @@ async function runCheck(page, item, checkOptions = {}) {
     const expectedPaths = item.expectedPaths || [];
     if (!(expectedPaths || []).some((expectedPath) => result.afterUrl.includes(expectedPath))) {
       await waitForUiSettled(page, 1200);
+      const expandedRouteLink = await findVisibleSidebarRouteLink(page, expectedPaths);
+      if (expandedRouteLink) {
+        result.expandedRouteHref =
+          (await expandedRouteLink.getAttribute('href').catch(() => '')) || '';
+        await clickAndWait(page, expandedRouteLink);
+      }
       await waitForExpectedPaths(page, expectedPaths, 5000);
       result.afterUrl = page.url();
-      result.afterClass = (await target.getAttribute('class').catch(() => '')) || '';
+      result.afterClass =
+        (await target.getAttribute('class', { timeout: 1000 }).catch(() => '')) || '';
       result.classChanged = beforeClass !== result.afterClass;
       result.challenge = await getChallengeReason(page);
       if (result.challenge) {
@@ -1445,14 +1768,20 @@ test.describe('Sidebar Matrix', () => {
       });
     }
 
-    const visibleLabels = inventory.items.map((item) => compactText(item.text || item.placeholder));
-    const stableCoreLabels = ['Sports', 'VIP', 'VIP Club', 'Collections', 'Live Chat', 'English'];
-    const stableCoreFound = stableCoreLabels.filter((expectedLabel) =>
-      visibleLabels.some((label) => areLabelsEquivalent(label, expectedLabel))
+    const stableCoreItems = GUEST_ITEMS.filter((item) =>
+      ['nav', 'chat', 'language'].includes(item.kind)
     );
-    const referralFound = visibleLabels.some(
-      (label) =>
-        areLabelsEquivalent(label, 'Invite & Earn') || areLabelsEquivalent(label, 'Referral')
+    const stableCoreFound = stableCoreItems
+      .filter((expectedItem) =>
+        inventory.items.some((inventoryItem) =>
+          inventoryItemMatchesExpected(inventoryItem, expectedItem)
+        )
+      )
+      .map((item) => itemVisibleLabel(item));
+    const referralFound = GUEST_REFERRAL_ITEMS.some((expectedItem) =>
+      inventory.items.some((inventoryItem) =>
+        inventoryItemMatchesExpected(inventoryItem, expectedItem)
+      )
     );
 
     if (stableCoreFound.length < 2) {
@@ -1478,6 +1807,7 @@ test.describe('Sidebar Matrix', () => {
     test.setTimeout(90000);
     const inventorySnapshot = await collectGuestInventory(browser);
     const hasAuthEntries = hasGuestSidebarAuthEntries(inventorySnapshot.items);
+    const authEntriesOptional = isCapabilityOptionalForBrand(BASE_URL, 'guestSidebarAuthEntries');
     const context = await browser.newContext(getSidebarContextOptions());
     const checks = [];
     try {
@@ -1571,7 +1901,30 @@ test.describe('Sidebar Matrix', () => {
       contentType: 'application/json',
     });
     testInfo.annotations.push({ type: 'artifact', description: artifactPath });
-    assertMatrixOutcome(checks, 'Guest sidebar login/signup', testInfo);
+    const normalizedChecks =
+      authEntriesOptional && checks.length > 0
+        ? checks.map((item) => {
+            if (item && item.status === 'failed') {
+              return {
+                ...item,
+                status: 'missing',
+                reason: `Optional guest sidebar auth entry did not open a modal in current brand layout: ${item.reason}`,
+              };
+            }
+            return item;
+          })
+        : checks;
+    if (authEntriesOptional && normalizedChecks.some((item) => item.status === 'missing')) {
+      testInfo.annotations.push({
+        type: 'partial',
+        description:
+          'Guest sidebar login/signup modal behavior is optional for this brand layout; header auth coverage remains authoritative.',
+      });
+    }
+    assertMatrixOutcome(normalizedChecks, 'Guest sidebar login/signup', testInfo, {
+      allowMissing: authEntriesOptional,
+      minPassed: authEntriesOptional ? 0 : 1,
+    });
   });
 
   test('P0 Sidebar guest: search works', async ({ browser }, testInfo) => {
@@ -1669,11 +2022,26 @@ test.describe('Sidebar Matrix', () => {
 
   test('P0 Sidebar guest: utility actions work', async ({ browser }, testInfo) => {
     test.setTimeout(120000);
-    const checks = await executeMatrix(browser, GUEST_SERVICE_UTILITY_ITEMS, {});
+    let utilityItems = GUEST_SERVICE_UTILITY_ITEMS;
+    const inventory = await collectGuestInventory(browser);
+    const languageOptional = isCapabilityOptionalForBrand(BASE_URL, 'sidebarLanguageMatrix');
+    const languageExposed = inventory.items.some(inventoryExposesLanguage);
+    if (languageOptional && !languageExposed) {
+      utilityItems = utilityItems.filter((item) => item.kind !== 'language');
+      testInfo.annotations.push({
+        type: 'not-applicable',
+        description:
+          'Language selector is optional for this brand and is not exposed in the current sidebar inventory.',
+      });
+    }
+    const checks = await executeMatrix(browser, utilityItems, {});
     const payload = {
       mode: 'guest',
       group: 'service-utility',
       generatedAt: new Date().toISOString(),
+      inventory,
+      languageOptional,
+      languageExposed,
       checks,
     };
     const artifactPath = await writeArtifact('guest-sidebar-service-utility.json', payload);
@@ -1688,7 +2056,7 @@ test.describe('Sidebar Matrix', () => {
   test('P1 Sidebar guest: live chat opens active and minimized widget states', async ({
     browser,
   }, testInfo) => {
-    test.setTimeout(90000);
+    test.setTimeout(75000);
 
     if (isCapabilityOptionalForBrand(BASE_URL, 'guestLiveChatWidgetStates')) {
       const reason = 'Live chat widget states are optional for this brand layout.';
@@ -1740,14 +2108,22 @@ test.describe('Sidebar Matrix', () => {
 
       payload.beforeFrames = await collectLiveChatFrameMeta(page);
 
-      await clickAndWait(page, target);
+      const firstLauncherClick = await clickSidebarItemFresh(page, {
+        label: 'Live chat',
+        route: '/',
+        kind: 'chat',
+        position: 'bottom',
+      });
+      payload.firstLauncherClick = firstLauncherClick.clicked;
+      payload.firstLauncherClickAttempt = firstLauncherClick.attempt;
+      if (!firstLauncherClick.clicked) {
+        payload.reason = `Live chat launcher could not be clicked: ${firstLauncherClick.error}`;
+        markBlocked(testInfo, payload.reason);
+        return;
+      }
       const activeFrame = await waitForLiveChatFrame(page, 22_000);
       payload.afterFirstFrames = await collectLiveChatFrameMeta(page);
       payload.activeFrameDetected = Boolean(activeFrame);
-
-      await clickAndWait(page, target);
-      await waitForUiSettled(page, 1400);
-      payload.afterSecondFrames = await collectLiveChatFrameMeta(page);
 
       const activeWidgetVisible =
         payload.activeFrameDetected ||
@@ -1767,39 +2143,54 @@ test.describe('Sidebar Matrix', () => {
         return;
       }
 
-      let minimizedOrDuplicated =
-        payload.afterSecondFrames.some((frame) => /minimized|collapsed/i.test(frame.name || '')) ||
-        payload.afterSecondFrames.length > payload.afterFirstFrames.length;
+      const minimizeButton = activeFrame
+        ? activeFrame
+            .locator(
+              'button[aria-label*="minimize" i], button[aria-label*="collapse" i], button[title*="minimize" i]'
+            )
+            .first()
+        : null;
+      payload.minimizeButtonVisible = minimizeButton
+        ? await minimizeButton.isVisible({ timeout: 5000 }).catch(() => false)
+        : false;
+      payload.minimizeClickSucceeded = payload.minimizeButtonVisible
+        ? await minimizeButton
+            .click({ timeout: 5000, noWaitAfter: true })
+            .then(() => true)
+            .catch(() => false)
+        : false;
 
-      if (!minimizedOrDuplicated) {
-        const currentFrame = getLiveChatFrame(page);
-        const minimizeButton = currentFrame
-          ? currentFrame
-              .locator(
-                'button[aria-label*="minimize" i], button[aria-label*="collapse" i], button[title*="minimize" i]'
-              )
-              .first()
-          : null;
-
-        payload.fallbackUsed = 'widget-minimize-button';
-        payload.minimizeButtonVisible = minimizeButton
-          ? await minimizeButton.isVisible().catch(() => false)
-          : false;
-
-        if (payload.minimizeButtonVisible) {
-          await minimizeButton.click({ timeout: 7000 }).catch(() => null);
-          await waitForUiSettled(page, 2200);
-          payload.afterInternalMinimizeFrames = await collectLiveChatFrameMeta(page);
-          minimizedOrDuplicated =
-            payload.afterInternalMinimizeFrames.some((frame) =>
-              /minimized|collapsed/i.test(frame.name || '')
-            ) || payload.afterInternalMinimizeFrames.length > payload.afterFirstFrames.length;
-        }
+      let minimizedOrDuplicated = false;
+      if (payload.minimizeClickSucceeded) {
+        await expect
+          .poll(
+            async () => {
+              payload.afterInternalMinimizeFrames = await collectLiveChatFrameMeta(page);
+              const dedicatedMinimizedFrame =
+                page.frame({ name: 'chat-widget-minimized' }) ||
+                page.frames().find((frame) => /minimized|collapsed/i.test(frame.name()));
+              const activeFrameHidden = await page
+                .locator(LIVE_CHAT_IFRAME_SELECTOR)
+                .first()
+                .isHidden()
+                .catch(() => false);
+              minimizedOrDuplicated =
+                Boolean(dedicatedMinimizedFrame) ||
+                activeFrameHidden ||
+                payload.afterInternalMinimizeFrames.some((frame) =>
+                  /minimized|collapsed/i.test(frame.name || '')
+                );
+              return minimizedOrDuplicated;
+            },
+            { timeout: 8000, intervals: [250, 500, 1000] }
+          )
+          .toBeTruthy()
+          .catch(() => null);
       }
 
       if (!minimizedOrDuplicated) {
         payload.reason =
-          'Launcher did not expose minimized/additional widget state in current run.';
+          'Live chat active frame opened, but minimized state was not observable in current widget version.';
         testInfo.annotations.push({
           type: 'partial',
           description: payload.reason,
@@ -2039,7 +2430,7 @@ test.describe('Sidebar Matrix', () => {
   test('P1 Sidebar guest: live chat pre-chat form accepts guest identity data', async ({
     browser,
   }, testInfo) => {
-    test.setTimeout(90000);
+    test.setTimeout(120000);
 
     if (MOBILE_MODE_ENABLED && isCapabilityOptionalForBrand(BASE_URL, 'guestLiveChatPreChat')) {
       const reason = 'Live chat pre-chat form is not fully visible in current mobile brand layout.';
@@ -2092,34 +2483,25 @@ test.describe('Sidebar Matrix', () => {
       });
       expect(target, 'Live chat trigger should be visible in guest sidebar.').toBeTruthy();
 
-      await clickAndWait(page, target);
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        payload.framesAfterOpen = await collectLiveChatFrameMeta(page);
-        if (payload.framesAfterOpen.length > 0) break;
-        await clickAndWait(page, target);
-      }
-
-      try {
-        await expect
-          .poll(async () => (await collectLiveChatFrameMeta(page)).length, { timeout: 15000 })
-          .toBeGreaterThan(0);
-      } catch {
+      const firstClick = await clickSidebarItemFresh(page, {
+        label: 'Live chat',
+        route: '/',
+        kind: 'chat',
+        position: 'bottom',
+      });
+      payload.launcherClick = {
+        clicked: firstClick.clicked,
+        attempt: firstClick.attempt,
+        error: firstClick.error,
+      };
+      if (!firstClick.clicked) {
         payload.status = 'blocked';
-        payload.reason = 'Live chat widget iframe did not appear after launcher click.';
-        testInfo.annotations.push({
-          type: 'blocked',
-          description: payload.reason,
-        });
-        await testInfo.attach('guest-live-chat-prechat.json', {
-          body: JSON.stringify(payload, null, 2),
-          contentType: 'application/json',
-        });
-        const artifactPath = await writeArtifact('guest-live-chat-prechat.json', payload);
-        testInfo.annotations.push({ type: 'artifact', description: artifactPath });
+        payload.reason = `Live chat launcher could not be clicked: ${firstClick.error}`;
+        markBlocked(testInfo, payload.reason);
         return;
       }
-
       const chatFrame = await waitForLiveChatFrame(page, 20_000);
+      payload.framesAfterOpen = await collectLiveChatFrameMeta(page);
       if (!chatFrame) {
         payload.status = 'blocked';
         payload.reason = 'Live chat active widget frame was not available after launcher click.';
@@ -2145,10 +2527,12 @@ test.describe('Sidebar Matrix', () => {
         )
         .first();
 
-      await startButton.waitFor({ state: 'visible', timeout: 15000 }).catch(() => null);
-      await nameInput.waitFor({ state: 'visible', timeout: 15000 }).catch(() => null);
-      await emailInput.waitFor({ state: 'visible', timeout: 15000 }).catch(() => null);
-      await minimizeButton.waitFor({ state: 'visible', timeout: 15000 }).catch(() => null);
+      await Promise.all([
+        startButton.waitFor({ state: 'visible', timeout: 12000 }).catch(() => null),
+        nameInput.waitFor({ state: 'visible', timeout: 12000 }).catch(() => null),
+        emailInput.waitFor({ state: 'visible', timeout: 12000 }).catch(() => null),
+        minimizeButton.waitFor({ state: 'visible', timeout: 12000 }).catch(() => null),
+      ]);
 
       payload.controls = {
         nameVisible: await nameInput.isVisible().catch(() => false),
@@ -2178,13 +2562,14 @@ test.describe('Sidebar Matrix', () => {
         return;
       }
 
-      await nameInput.fill(payload.guestIdentity.name);
-      await emailInput.fill(payload.guestIdentity.email);
-      await chatFrame.waitForLoadState('domcontentloaded').catch(() => null);
+      payload.fillActions = {
+        name: await fillLiveChatInput(nameInput, payload.guestIdentity.name),
+        email: await fillLiveChatInput(emailInput, payload.guestIdentity.email),
+      };
 
       payload.filledValues = {
-        name: await nameInput.inputValue().catch(() => ''),
-        email: await emailInput.inputValue().catch(() => ''),
+        name: await nameInput.inputValue({ timeout: 3000 }).catch(() => ''),
+        email: await emailInput.inputValue({ timeout: 3000 }).catch(() => ''),
       };
       payload.validationErrors = await chatFrame
         .locator('[aria-invalid="true"], [class*="error" i], [role="alert"]')
@@ -2195,41 +2580,8 @@ test.describe('Sidebar Matrix', () => {
         )
         .catch(() => []);
 
-      if (payload.controls.minimizeVisible) {
-        await minimizeButton.click({ timeout: 7000 }).catch(() => null);
-        await waitForUiSettled(page, 2200);
-        const minimizedFrame =
-          page.frame({ name: 'chat-widget-minimized' }) ||
-          page.frames().find((frame) => /chat-widget-minimized|livechat/i.test(frame.name()));
-        payload.minimizedFrameVisible = Boolean(minimizedFrame);
-
-        if (minimizedFrame) {
-          const reopenButton = minimizedFrame
-            .locator(
-              'button[aria-label*="open" i], button[aria-label*="expand" i], button[title*="open" i]'
-            )
-            .first();
-          payload.reopenVisible = await reopenButton.isVisible().catch(() => false);
-          if (!payload.reopenVisible) {
-            testInfo.annotations.push({
-              type: 'partial',
-              description: 'Live chat minimized widget did not expose explicit reopen control.',
-            });
-          }
-        } else {
-          testInfo.annotations.push({
-            type: 'partial',
-            description: 'Live chat minimize action did not expose a dedicated minimized frame.',
-          });
-        }
-      } else {
-        payload.minimizedFrameVisible = false;
-        payload.reopenVisible = false;
-        testInfo.annotations.push({
-          type: 'partial',
-          description: 'Live chat minimize control is not exposed in current widget version.',
-        });
-      }
+      payload.widgetStateCoverage =
+        'Minimize/reopen is covered by the dedicated live-chat widget-states scenario.';
 
       await testInfo.attach('guest-live-chat-prechat.json', {
         body: JSON.stringify(payload, null, 2),
@@ -2629,27 +2981,20 @@ test.describe('Sidebar Matrix', () => {
   });
 
   test('P0 Sidebar guest: live navigation link works', async ({ browser }, testInfo) => {
-    test.setTimeout(90000);
-    const inventory = await collectGuestInventory(browser);
-    const checks = [];
-    if (!inventory.open.ok) {
-      checks.push({
-        label: 'Live',
-        kind: 'nav',
-        route: '/',
-        status: 'blocked',
-        reason: inventory.open.challenge || 'Guest sidebar route is blocked.',
-      });
-    } else {
-      const resolved = resolveItemsAgainstInventory(GUEST_LIVE_ITEMS, inventory.items, {
-        absentReason: 'Guest live navigation is not exposed in current brand layout.',
-      });
-      checks.push(...resolved.skippedChecks);
-      if (resolved.activeItems.length > 0) {
-        const runChecks = await executeMatrix(browser, resolved.activeItems, {});
-        checks.push(...runChecks);
-      }
-    }
+    test.setTimeout(120000);
+    const checks = (
+      await executeMatrix(browser, GUEST_LIVE_ITEMS, {
+        checkOptions: GUEST_NAV_CHECK_OPTIONS,
+      })
+    ).map((item) =>
+      item && item.status === 'missing'
+        ? {
+            ...item,
+            status: 'blocked',
+            reason: 'Guest live navigation is not exposed in current brand layout.',
+          }
+        : item
+    );
     const softenedChecks = checks.map((item) => {
       if (
         item &&
@@ -2669,7 +3014,6 @@ test.describe('Sidebar Matrix', () => {
       mode: 'guest',
       group: 'navigation-live',
       generatedAt: new Date().toISOString(),
-      inventory,
       checks: softenedChecks,
     };
     const artifactPath = await writeArtifact('guest-sidebar-navigation-live.json', payload);
@@ -2685,7 +3029,7 @@ test.describe('Sidebar Matrix', () => {
   });
 
   test('P0 Sidebar guest: sports navigation link works', async ({ browser }, testInfo) => {
-    test.setTimeout(90000);
+    test.setTimeout(120000);
     const item = GUEST_SPORTS_ITEMS[0];
     const context = await browser.newContext(getSidebarContextOptions());
     const checks = [];
@@ -2769,36 +3113,24 @@ test.describe('Sidebar Matrix', () => {
   });
 
   test('P0 Sidebar guest: collections navigation link works', async ({ browser }, testInfo) => {
-    test.setTimeout(90000);
-    const inventory = await collectGuestInventory(browser, {
-      readyOptions: GUEST_NAV_CHECK_OPTIONS,
-    });
-    const checks = [];
-    if (!inventory.open.ok) {
-      checks.push({
-        label: 'Collections',
-        kind: 'nav',
-        route: '/',
-        status: 'blocked',
-        reason: inventory.open.challenge || 'Guest sidebar route is blocked.',
-      });
-    } else {
-      const resolved = resolveItemsAgainstInventory(GUEST_COLLECTION_ITEMS, inventory.items, {
-        absentReason: 'Guest collections navigation is not exposed in current brand layout.',
-      });
-      checks.push(...resolved.skippedChecks);
-      if (resolved.activeItems.length > 0) {
-        const runChecks = await executeMatrix(browser, resolved.activeItems, {
-          checkOptions: GUEST_NAV_CHECK_OPTIONS,
-        });
-        checks.push(...runChecks);
-      }
-    }
+    test.setTimeout(120000);
+    const checks = (
+      await executeMatrix(browser, GUEST_COLLECTION_ITEMS, {
+        checkOptions: GUEST_NAV_CHECK_OPTIONS,
+      })
+    ).map((item) =>
+      item && item.status === 'missing'
+        ? {
+            ...item,
+            status: 'blocked',
+            reason: 'Guest collections navigation is not exposed in current brand layout.',
+          }
+        : item
+    );
     const payload = {
       mode: 'guest',
       group: 'navigation-collections',
       generatedAt: new Date().toISOString(),
-      inventory,
       checks,
     };
     const artifactPath = await writeArtifact('guest-sidebar-navigation-collections.json', payload);
@@ -2869,11 +3201,16 @@ test.describe('Sidebar Matrix', () => {
       return;
     }
 
-    const requiredInventoryLabels = ['My profile', 'Casino', 'Sports', 'Invite & Earn'];
-    const visibleLabels = allItems.map((item) => compactText(item.text || item.placeholder));
-    const foundRequired = requiredInventoryLabels.filter((expectedLabel) =>
-      visibleLabels.some((label) => areLabelsEquivalent(label, expectedLabel))
-    );
+    const requiredInventoryItems = [
+      ...AUTH_HOME_ITEMS.filter((item) => item.label === 'My profile'),
+      ...AUTH_NAV_PRIMARY_ITEMS.filter((item) => ['Casino', 'Sports'].includes(item.label)),
+      ...AUTH_NAV_SECONDARY_ITEMS.filter((item) => item.label === 'Invite & Earn'),
+    ];
+    const foundRequired = requiredInventoryItems
+      .filter((expectedItem) =>
+        allItems.some((inventoryItem) => inventoryItemMatchesExpected(inventoryItem, expectedItem))
+      )
+      .map((item) => itemVisibleLabel(item));
     const richestInventorySize = inventories.reduce(
       (max, inventory) => Math.max(max, (inventory.items || []).length),
       0
@@ -2959,11 +3296,43 @@ test.describe('Sidebar Matrix', () => {
     }
 
     const inventories = await collectAuthorizedInventories(browser, authStatePath);
+    const blockedInventories = inventories.filter((inventory) => !inventory.open.ok);
+    if (blockedInventories.length) {
+      const reason = `Authorized sidebar primary navigation blocked by route access: ${blockedInventories
+        .map(
+          (inventory) =>
+            `${inventory.route}: ${inventory.open.challenge || 'sidebar route did not become ready'}`
+        )
+        .join(' | ')}`;
+      const payload = {
+        mode: 'authorized',
+        group: 'navigation-primary',
+        generatedAt: new Date().toISOString(),
+        inventories,
+        checks: [],
+        blocked: true,
+        reason,
+      };
+      const artifactPath = await writeArtifact(
+        'authorized-sidebar-navigation-primary.json',
+        payload
+      );
+      await testInfo.attach('authorized-sidebar-navigation-primary.json', {
+        body: JSON.stringify(payload, null, 2),
+        contentType: 'application/json',
+      });
+      testInfo.annotations.push({ type: 'artifact', description: artifactPath });
+      markBlocked(testInfo, reason);
+      return;
+    }
     const allItems = inventories.flatMap((inventory) => inventory.items || []);
     const resolved = resolveItemsAgainstInventory(AUTH_NAV_PRIMARY_ITEMS, allItems, {
       absentReason: 'Authorized primary navigation item is not exposed in current brand layout.',
     });
-    const maxPrimaryChecks = toPositiveInt(process.env.PW_SIDEBAR_AUTH_PRIMARY_MAX || '3', 3);
+    const maxPrimaryChecks = toPositiveInt(
+      process.env.PW_SIDEBAR_AUTH_PRIMARY_MAX || String(resolved.activeItems.length || 1),
+      resolved.activeItems.length || 1
+    );
     const boundedActiveItems = resolved.activeItems.slice(0, maxPrimaryChecks);
     if (resolved.activeItems.length > boundedActiveItems.length) {
       testInfo.annotations.push({

@@ -7,6 +7,9 @@ concurrency:
   group: qa-nightly-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   nightly_auth_bootstrap:
     name: Nightly Auth Bootstrap (${{ matrix.brand.slug }})
@@ -33,12 +36,14 @@ jobs:
             slug: chacha.bet
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22
+          node-version: 24.20.0
           cache: npm
 
       - name: Install dependencies
@@ -94,7 +99,7 @@ jobs:
 
       - name: Upload nightly auth bootstrap artifacts (${{ matrix.brand.slug }})
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nightly-auth-${{ matrix.brand.slug }}
           if-no-files-found: warn
@@ -136,12 +141,14 @@ jobs:
         mode: [desktop, mobile]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22
+          node-version: 24.20.0
           cache: npm
 
       - name: Install dependencies
@@ -153,7 +160,7 @@ jobs:
       - name: Download nightly auth bootstrap artifact
         id: nightly_auth_bootstrap_download
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: nightly-auth-${{ matrix.brand.slug }}
           path: .
@@ -213,7 +220,7 @@ jobs:
 
       - name: Upload nightly full artifacts (${{ matrix.brand.key }} | ${{ matrix.mode }})
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nightly-full-${{ matrix.brand.slug }}-${{ matrix.mode }}
           if-no-files-found: warn
@@ -249,12 +256,14 @@ jobs:
         shard: [1, 2]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22
+          node-version: 24.20.0
           cache: npm
 
       - name: Install dependencies
@@ -266,7 +275,7 @@ jobs:
       - name: Download nightly auth bootstrap artifact
         id: nightly_auth_bootstrap_download
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: nightly-auth-${{ matrix.brand.slug }}
           path: .
@@ -311,7 +320,7 @@ jobs:
 
       - name: Upload nightly providers artifacts (${{ matrix.brand.slug }} | shard ${{ matrix.shard }})
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nightly-providers-${{ matrix.brand.slug }}-shard-${{ matrix.shard }}
           if-no-files-found: warn
@@ -348,12 +357,14 @@ jobs:
         shard: [1, 2]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22
+          node-version: 24.20.0
           cache: npm
 
       - name: Install dependencies
@@ -365,7 +376,7 @@ jobs:
       - name: Download nightly auth bootstrap artifact
         id: nightly_auth_bootstrap_download
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: nightly-auth-${{ matrix.brand.slug }}
           path: .
@@ -408,7 +419,7 @@ jobs:
 
       - name: Upload nightly localization artifacts (${{ matrix.brand.key }} | ${{ matrix.mode }} | shard ${{ matrix.shard }})
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nightly-localization-${{ matrix.brand.slug }}-${{ matrix.mode }}-shard-${{ matrix.shard }}
           if-no-files-found: warn
@@ -444,12 +455,14 @@ jobs:
         shard: [1, 2]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22
+          node-version: 24.20.0
           cache: npm
 
       - name: Install dependencies
@@ -461,7 +474,7 @@ jobs:
       - name: Download nightly auth bootstrap artifact
         id: nightly_auth_bootstrap_download
         continue-on-error: true
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: nightly-auth-${{ matrix.brand.slug }}
           path: .
@@ -503,7 +516,7 @@ jobs:
 
       - name: Upload nightly sports artifacts (${{ matrix.brand.key }} | shard ${{ matrix.shard }})
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: nightly-sports-${{ matrix.brand.slug }}-shard-${{ matrix.shard }}
           if-no-files-found: warn

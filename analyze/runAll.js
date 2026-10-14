@@ -1,4 +1,7 @@
 const { execSync } = require('child_process');
+const { loadProjectEnv } = require('../scripts/lib/env');
+
+loadProjectEnv();
 
 function run(cmd) {
   console.log(`\n> ${cmd}`);

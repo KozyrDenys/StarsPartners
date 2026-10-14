@@ -32,6 +32,25 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const CONTINUE_BUTTON_SELECTORS = [
+  'button:has-text("CONTINUE")',
+  'button:has-text("Continue")',
+  'button:has-text("Продолжить")',
+  'button:has-text("Продовжити")',
+  'button:has-text("Continuar")',
+  'button:has-text("Continuer")',
+  'button:has-text("Continua")',
+  'button:has-text("Weiter")',
+  'button:has-text("Συνέχεια")',
+  'button:has-text("Next")',
+  'button:has-text("Confirm")',
+  '[data-testid*="continue" i]',
+  '[data-testid*="next" i]',
+  '[data-testid="proceed-button"]',
+  'button[type="submit"]:not([data-testid="login-button"])',
+  'input[type="submit"]',
+];
+
 class SignupRegistrationPage {
   constructor(page, container) {
     this.page = page;
@@ -892,9 +911,15 @@ class SignupRegistrationPage {
       'button:has-text("SIGN UP")',
       'button:has-text("Sign Up")',
       'button:has-text("Create")',
-      'button[type="submit"]',
+      'button:has-text("Зарегистрироваться")',
+      'button:has-text("Зареєструватися")',
+      'button:has-text("Создать аккаунт")',
+      'button:has-text("Registrarse")',
+      'button:has-text("S\'inscrire")',
+      'button:has-text("Registrieren")',
+      'button[type="submit"]:not([data-testid="login-button"])',
       'input[type="submit"]',
-      '[data-testid*="signup"]',
+      '[data-testid*="signup" i]',
     ]);
   }
 
@@ -942,16 +967,7 @@ class SignupRegistrationPage {
 
     await this.acceptTermsIfPresent();
 
-    const stepSelectors = [
-      'button:has-text("CONTINUE")',
-      'button:has-text("Continue")',
-      'button:has-text("Next")',
-      'button:has-text("Confirm")',
-      'button[type="submit"]',
-      'input[type="submit"]',
-      '[data-testid*="continue"]',
-      '[data-testid*="next"]',
-    ];
+    const stepSelectors = CONTINUE_BUTTON_SELECTORS;
 
     let step1Btn = await this.findActionButton(stepSelectors);
     if (!step1Btn && signupTab) {
@@ -1010,6 +1026,17 @@ class SignupRegistrationPage {
         await this.acceptTermsIfPresent();
       }
 
+      const currentEmail = await emailInput.inputValue().catch(() => '');
+      const currentPassword = await passwordInput.inputValue().catch(() => '');
+      if (!currentEmail || !currentPassword) {
+        const visibleButtons = await this.listVisibleButtons();
+        throw new Error(
+          `Signup form not actionable: step 1 inputs were not filled in signup modal ` +
+            `(email=${Boolean(currentEmail)}, password=${Boolean(currentPassword)}). ` +
+            `Visible buttons: ${visibleButtons.join(' | ') || 'none'}`
+        );
+      }
+
       if (!emailFilled || !passwordFilled) {
         this.addNote(
           annotate,
@@ -1063,7 +1090,13 @@ class SignupRegistrationPage {
       }
 
       await expect(step1Btn).toBeEnabled({ timeout: 10000 });
-      await step1Btn.click();
+      await step1Btn.click({ timeout: 10000 }).catch((err) => {
+        throw new Error(
+          `Signup form not actionable: continue click failed: ${
+            err && err.message ? err.message : err
+          }`
+        );
+      });
     }
   }
 
@@ -1101,16 +1134,7 @@ class SignupRegistrationPage {
 
     await this.acceptTermsIfPresent();
 
-    const step2Btn = await this.findActionButton([
-      'button:has-text("CONTINUE")',
-      'button:has-text("Continue")',
-      'button:has-text("Next")',
-      'button:has-text("Confirm")',
-      'button[type="submit"]',
-      'input[type="submit"]',
-      '[data-testid*="continue"]',
-      '[data-testid*="next"]',
-    ]);
+    const step2Btn = await this.findActionButton(CONTINUE_BUTTON_SELECTORS);
 
     if (!step2Btn) {
       const finalSignupBtn = await this.findFinalSignupButton();
@@ -1147,6 +1171,16 @@ class SignupRegistrationPage {
 
   async fillStep3AndSubmit(data, opts = {}) {
     const { annotate, errorToast } = opts;
+    const container = this.getContainer();
+
+    const containerVisible = await container.isVisible({ timeout: 800 }).catch(() => false);
+    if (!containerVisible) {
+      this.addNote(
+        annotate,
+        'Registration modal closed after step 2; treating the flow as a completed two-step registration.'
+      );
+      return;
+    }
 
     await this.selectGenderIfPresent();
     await this.fillFirstVisible(

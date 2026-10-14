@@ -3,6 +3,8 @@ const path = require('path');
 const { URL, pathToFileURL } = require('url');
 const { chromium } = require('playwright');
 const { resolveProjectPaths } = require('../tests/helpers/project-paths');
+const { sanitizeArtifactTree } = require('./lib/sanitize-artifact-tree');
+const { redactText } = require('./lib/redact-secrets');
 
 const cwd = process.cwd();
 const baseUrl = process.env.BASE_URL || 'https://gt.bet/';
@@ -146,6 +148,9 @@ const outHtmlPath = path.join(projectPaths.projectRoot, 'qa-report.html');
 const analyzeOutPath = path.join(projectPaths.analyzeDir, 'qa-report.md');
 const analyzeOutHtmlPath = path.join(projectPaths.analyzeDir, 'qa-report.html');
 const autotestReportDir = projectPaths.autotestReportDir;
+sanitizeArtifactTree(autotestReportDir);
+sanitizeArtifactTree(artifactsDir);
+sanitizeArtifactTree(path.join(projectPaths.artifactsDir, 'phase-test-results'));
 const brandOutPath = path.join(autotestReportDir, `${brandSlug}.md`);
 const brandOutHtmlPath = path.join(autotestReportDir, `${brandSlug}.html`);
 const brandOutPdfPath = path.join(autotestReportDir, `${brandSlug}.pdf`);
@@ -167,6 +172,12 @@ const providerMatrixPath = path.join(
   'providers-real',
   'providers-real-matrix.json'
 );
+const providerInventoryPath = path.join(
+  autotestReportDir,
+  'casino',
+  'providers-real',
+  'providers-inventory.json'
+);
 const depositInventoryArtifactPath = path.join(
   autotestReportDir,
   'deposit',
@@ -175,6 +186,7 @@ const depositInventoryArtifactPath = path.join(
 const depositArtifactPath = path.join(autotestReportDir, 'deposit', 'deposit-non-destructive.json');
 const authStateHealthArtifactPath = path.join(projectPaths.artifactsDir, 'auth-state-health.json');
 const kpiValidationArtifactPath = path.join(projectPaths.artifactsDir, 'kpi-validation.json');
+const executionJournalArtifactPath = path.join(projectPaths.artifactsDir, 'run-execution.json');
 
 function parsePositiveInt(value, fallback) {
   const parsed = Number.parseInt(String(value || ''), 10);
@@ -186,8 +198,13 @@ const reportCompact = String(process.env.QA_REPORT_COMPACT || '1')
   .trim()
   .toLowerCase();
 const reportCompactMode = !['0', 'false', 'no', 'off'].includes(reportCompact);
+const configuredExecutionMode = String(
+  process.env.QA_EXECUTION_MODE || process.env.PW_PROJECT_MATRIX || ''
+)
+  .trim()
+  .toLowerCase();
 const includeReportGuide = (() => {
-  const raw = String(process.env.QA_REPORT_INCLUDE_GUIDE || (reportCompactMode ? '0' : '1'))
+  const raw = String(process.env.QA_REPORT_INCLUDE_GUIDE || '1')
     .trim()
     .toLowerCase();
   return ['1', 'true', 'yes', 'on'].includes(raw);
@@ -198,7 +215,7 @@ const sectionDetailRowsLimit = parsePositiveInt(
 );
 const providerMatrixRowsLimit = parsePositiveInt(
   process.env.QA_REPORT_PROVIDER_ROWS,
-  reportCompactMode ? 30 : 5000
+  reportCompactMode ? (configuredExecutionMode === 'mobile' ? 8 : 9) : 5000
 );
 
 function readJson(filePath) {
@@ -208,6 +225,53 @@ function readJson(filePath) {
   } catch {
     return null;
   }
+}
+
+function readCurrentRunJson(filePath) {
+  const payload = readJson(filePath);
+  const expectedRunId = String(process.env.QA_RUN_ID || '').trim();
+  if (!payload || !expectedRunId || process.env.QA_REPORT_ONLY === '1') return payload;
+  return String(payload.runId || '').trim() === expectedRunId ? payload : null;
+}
+
+function readPreviousComparableRun(historyDir, currentRunId, currentTimestamp) {
+  try {
+    if (!fs.existsSync(historyDir)) return null;
+    const currentTime = Date.parse(currentTimestamp || '') || Date.now();
+    return (
+      fs
+        .readdirSync(historyDir)
+        .filter((name) => name.endsWith('.json'))
+        .map((name) => readJson(path.join(historyDir, name)))
+        .filter(Boolean)
+        .filter((entry) => !currentRunId || String(entry.runId || '') !== String(currentRunId))
+        .filter((entry) => {
+          const timestamp = Date.parse(entry.timestamp || '');
+          return Number.isFinite(timestamp) && timestamp < currentTime;
+        })
+        .sort((left, right) => Date.parse(right.timestamp) - Date.parse(left.timestamp))[0] || null
+    );
+  } catch {
+    return null;
+  }
+}
+
+function signedDelta(currentValue, previousValue) {
+  const current = Number(currentValue);
+  const previous = Number(previousValue);
+  if (!Number.isFinite(current) || !Number.isFinite(previous)) return null;
+  return current - previous;
+}
+
+function formatSignedNumber(value) {
+  if (!Number.isFinite(value)) return '-';
+  if (value === 0) return '0';
+  return `${value > 0 ? '+' : ''}${value}`;
+}
+
+function findKpiCheck(kpi, id) {
+  const checks = Array.isArray(kpi && kpi.checks) ? kpi.checks : [];
+  return checks.find((item) => item && item.id === id) || null;
 }
 
 function readFirstJson(paths) {
@@ -316,6 +380,22 @@ function collectAnnotations(test, results) {
   return annotations;
 }
 
+function collectResultSteps(steps, depth = 0, acc = []) {
+  for (const step of Array.isArray(steps) ? steps : []) {
+    const title = oneLine(step && step.title ? step.title : 'Untitled step');
+    const error = oneLine((step && step.error && (step.error.message || step.error.value)) || '');
+    acc.push({
+      title,
+      depth,
+      duration: Number((step && step.duration) || 0),
+      status: error ? 'FAILED' : 'PASSED',
+      error,
+    });
+    collectResultSteps(step && step.steps, depth + 1, acc);
+  }
+  return acc;
+}
+
 function collectTests(suite, phase, acc = [], suitePath = []) {
   if (!suite) return acc;
   const nextSuitePath = suite.title ? [...suitePath, suite.title] : suitePath;
@@ -336,6 +416,7 @@ function collectTests(suite, phase, acc = [], suitePath = []) {
           : uniquePathParts([...specPath, t.title]);
         const titlePath = explicitTitlePath.join(' > ') || title;
         const duration = results.reduce((sum, result) => sum + Number(result.duration || 0), 0);
+        const steps = collectResultSteps(final.steps);
 
         acc.push({
           phase,
@@ -358,6 +439,7 @@ function collectTests(suite, phase, acc = [], suitePath = []) {
             '',
           attachments: Array.isArray(final.attachments) ? final.attachments : [],
           annotations,
+          steps,
         });
       }
     }
@@ -385,7 +467,11 @@ function formatPercent(value, digits = 2) {
 }
 
 function oneLine(value) {
-  return String(value || '')
+  return redactText(value).replace(/\s+/g, ' ').trim();
+}
+
+function credentialValue(value) {
+  return String(value == null ? '' : value)
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -456,6 +542,46 @@ function normalizeReason(value, limit = TOP_REASON_TEXT_LIMIT) {
   return truncateText(withMaskedTokens, limit);
 }
 
+function translateProviderNote(value) {
+  const note = normalizeReason(value || '-') || '-';
+  const exact = new Map([
+    ['Cloudflare/WAF challenge gate', 'Защитная проверка Cloudflare/WAF'],
+    ['Captcha gate', 'Проверка Captcha'],
+    [
+      'Provider non-demo launch/health check did not pass',
+      'Проверка запуска провайдера без demo не пройдена',
+    ],
+    ['Credentials not valid', 'Учётные данные недействительны'],
+    ['Product surface blocked', 'Интерфейс продукта заблокирован'],
+    [
+      'Authorized sidebar items blocked (layout/challenge)',
+      'Пункты авторизованного меню недоступны из-за интерфейса или challenge',
+    ],
+    ['Auth state/storage issue', 'Проблема auth state или storage'],
+    ['Challenge text is visible.', 'Обнаружен текст защитной проверки'],
+  ]);
+  if (exact.has(note)) return exact.get(note);
+
+  return note
+    .replace(
+      /No game cards found for provider\s+["“]?([^"”]+)["”]?\.?/i,
+      'Карточки игр провайдера «$1» не найдены.'
+    )
+    .replace(/Filter panel not visible\.?/gi, 'Панель фильтров не отображается.')
+    .replace(
+      /Demo-mode action button is not visible on first game cards\.?/gi,
+      'Кнопка demo не отображается на первых карточках игр.'
+    )
+    .replace(
+      /Demo availability was not collected in this run\.?/gi,
+      'Доступность demo не была собрана в этом прогоне.'
+    )
+    .replace(
+      /No demo games found in sampled games API response for provider\.?/gi,
+      'В выборке ответа games API не найдены demo-игры провайдера.'
+    );
+}
+
 function formatPathForDisplay(filePath) {
   if (!filePath) return '-';
   const rel = oneLine(toRelative(filePath));
@@ -470,7 +596,14 @@ function formatLocation(test) {
 }
 
 function escapeMdCell(value) {
-  return String(value || '-')
+  return redactText(value === undefined || value === null || value === '' ? '-' : value)
+    .replace(/\|/g, '\\|')
+    .replace(/\n/g, ' ')
+    .trim();
+}
+
+function escapeCredentialMdCell(value) {
+  return String(value === undefined || value === null || value === '' ? '-' : value)
     .replace(/\|/g, '\\|')
     .replace(/\n/g, ' ')
     .trim();
@@ -482,7 +615,16 @@ function toRelative(filePath) {
 }
 
 function escapeHtml(value) {
-  return String(value)
+  return redactText(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function escapeCredentialHtml(value) {
+  return String(value == null ? '' : value)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
@@ -496,9 +638,18 @@ function isFailureStatus(status) {
 
 function getStatusTotals(tests) {
   const failedTests = tests.filter((t) => isFailureStatus(t.status));
-  const failedInfraBlocked = failedTests.filter((t) =>
-    (t.annotations || []).some((ann) => String(ann.type || '').toLowerCase() === 'infra-blocked')
-  ).length;
+  const failedInfraBlocked = failedTests.filter((t) => {
+    const productBlocked = (t.annotations || []).some(
+      (ann) => String(ann.type || '').toLowerCase() === 'product-blocked'
+    );
+    return (
+      !productBlocked &&
+      (String(t.status || '') === 'timedOut' ||
+        (t.annotations || []).some((ann) =>
+          ['infra-blocked', 'test-infra-timeout'].includes(String(ann.type || '').toLowerCase())
+        ))
+    );
+  }).length;
   const failedProductBlocked = failedTests.filter((t) =>
     (t.annotations || []).some((ann) => String(ann.type || '').toLowerCase() === 'product-blocked')
   ).length;
@@ -509,7 +660,7 @@ function getStatusTotals(tests) {
     const hasProduct = (t.annotations || []).some(
       (ann) => String(ann.type || '').toLowerCase() === 'product-blocked'
     );
-    return !hasInfra && !hasProduct;
+    return !hasInfra && !hasProduct && String(t.status || '') !== 'timedOut';
   }).length;
 
   return {
@@ -580,123 +731,105 @@ function resolveSection(test) {
 
 const SECTION_EXPLANATIONS = {
   'Report Guide':
-    'Embedded explanation of every main report block so the md/html/pdf output is self-explanatory.',
+    'Справочник по структуре отчёта, статусам, флагам, счётчикам и формулам. Он объясняет, как интерпретировать результат без знания реализации тестов.',
   Highlights:
-    'Short executive summary of the run with status, failure/blocked ratios, and dominant blocker patterns.',
+    'Краткий управленческий итог: статус прогона, доля hard-fail/blocked и наиболее частая причина проблем.',
   Summary:
-    'Top-level result of the full run: totals, skips, diagnostic signals, and total duration.',
+    'Сводные показатели всего прогона: количество тестов, строгие и сырые результаты, диагностические сигналы, повторы и длительность.',
   'Mobile Stability':
-    'Mobile-only stability summary: mobile totals, failures/timeouts, blocked signals, and the most frequent blocker reasons.',
+    'Стабильность mobile-сценариев: результаты, тайм-ауты, blocked-сигналы и наиболее частые причины ограниченного покрытия.',
   Sections:
-    'Aggregates tests by product area so it is easy to see where runtime and blocked signals are concentrated.',
-  Accessibility: 'Accessibility smoke checks and their most important findings.',
-  Visual: 'Visual smoke checks and screenshots captured from key routes and flows in this run.',
-  Casino:
-    'Casino catalog, filters, game launch checks, and provider-level non-demo launch coverage.',
+    'Агрегация тестов по продуктовым областям. Позволяет увидеть, где сосредоточены ошибки, ограничения покрытия и основное время выполнения.',
+  Accessibility: 'Smoke-проверки доступности интерфейса (a11y) и критические находки анализатора.',
+  Visual: 'Визуальные smoke-проверки и скриншоты ключевых страниц и пользовательских потоков.',
+  Casino: 'Каталог Casino, поиск, фильтры, категории, LOAD MORE, избранное, Recent и запуск игр.',
+  Sports:
+    'Sportsbook: загрузка виджета, навигация по видам спорта, события, коэффициенты, betslip, metadata и сетевые диагностики.',
   Deposit:
-    'Deposit UI and API alignment, plus working surface checks for each visible deposit category.',
-  Contracts:
-    'API contract and fuzz checks for auth/payment OpenAPI surfaces via Spectral and Schemathesis.',
+    'Соответствие Deposit UI данным API и открытие рабочей формы каждого видимого платёжного метода.',
+  Withdraw:
+    'Проверка доступности Withdraw, основных контролов и безопасного открытия формы без выполнения реального вывода.',
+  Contracts: 'Проверки API-контрактов auth/payment по OpenAPI с помощью Spectral и Schemathesis.',
   Sidebar:
-    'Full sidebar coverage for guest and authorized users, including inventory, navigation, utilities, and gating.',
+    'Меню для гостя и авторизованного игрока: состав пунктов, навигация, сервисные действия, языки и ограничения доступа.',
   'Live Chat':
-    'Sidebar live chat widget checks, including launcher, pre-chat form, and destructive send/reply coverage when enabled.',
-  Login: 'Login flow, auth-sensitive checks, and authorization-dependent sweeps.',
+    'Виджет поддержки: launcher, pre-chat форма, отправка сообщения и получение активности/ответа, если destructive-проверка включена.',
+  Login: 'Авторизация, проверка сессии и сценарии, которым требуется авторизованный игрок.',
   'My Profile':
-    'Profile route access, account/security sections, persistence checks, visual and accessibility smoke.',
-  'Navigation & Core': 'Homepage, precheck, key navigation, and generic site-health smoke checks.',
+    'Доступность profile-маршрутов, account/security, валидации, сохранение данных, visual и accessibility smoke.',
+  'Navigation & Core':
+    'Precheck, главная страница, ключевая навигация и базовая работоспособность сайта.',
   Registration:
-    'Registration-specific checks, including real signup API validation and registration-dependent bootstrap flows.',
+    'Регистрация нового игрока, проверка ответа signup API и подготовка авторизованного состояния для следующих фаз.',
   'Registration & Player':
-    'Compact registration status plus current manual-login credentials and validation state.',
+    'Результат регистрации, источник данных игрока, доступность ручного входа и состояние проверки credentials.',
   'Casino Providers Matrix':
-    'Provider-by-provider non-demo launch matrix, showing whether a provider launched strongly, weakly, or was blocked/absent.',
+    'Матрица реальных non-demo запусков по каждому провайдеру: сильный/слабый успех, блокировка, отсутствие провайдера и evidence игрового surface.',
   'Deposit Coverage':
-    'Compact combined view of deposit inventory + method readiness with key availability and blocked diagnostics.',
+    'Сводка Deposit inventory и готовности методов, включая доступность ключевых категорий и причины blocked.',
   'Auth State Health':
-    'Freshness and usability diagnostics for storageState used by authorized suites (especially provider/history checks).',
+    'Свежесть и пригодность storageState, используемого авторизованными тестами, особенно provider/history сценариями.',
   'Run KPI Validation':
-    'Run-level validity gates (blocked ratios, provider success minimum, deposit UI/API consistency) that can fail an otherwise green run.',
+    'Контроль валидности прогона: допустимые blocked ratios, минимальное число provider launches, чистый precheck и Deposit UI/API consistency.',
   'Failed Tests':
-    'Only the tests that hard-failed in the run, with condensed failure context and attachment references.',
+    'Только hard-fail тесты: ошибка, местоположение, длительность, флаги и ссылки на evidence.',
   'Registration Diagnostics':
-    'Detailed registration network and console evidence captured for debugging signup issues.',
+    'Сетевые ответы, request failures, console/toast errors и auth responses, собранные при регистрации.',
+  Other: 'Тесты, которые не удалось однозначно отнести к одной из основных продуктовых областей.',
 };
 
 const FLAG_EXPLANATIONS = [
   {
     flag: 'blocked',
     meaning:
-      'The test finished with a classified external blocker such as WAF, captcha, missing route, or unavailable UI.',
+      'Тест завершён с внешней блокировкой: WAF, captcha, отсутствующий маршрут или недоступный интерфейс.',
   },
   {
     flag: 'infra blocked',
     meaning:
-      'Blocked by infrastructure constraints (WAF/challenge/auth state/session/network/provider bootstrap).',
+      'Покрытие заблокировано инфраструктурой: WAF/challenge, auth state, сессией, сетью или запуском провайдера.',
   },
   {
     flag: 'product blocked',
     meaning:
-      'Blocked by product surface constraints (feature not rendered/interactive in the current brand layout).',
+      'Функция отсутствует, не отрисована или недоступна для взаимодействия в текущем интерфейсе бренда.',
   },
   {
     flag: 'partial',
-    meaning:
-      'The test completed with useful evidence, but the intended coverage was intentionally incomplete.',
+    meaning: 'Тест собрал полезные данные, но предусмотренное покрытие выполнено не полностью.',
   },
   {
     flag: 'n/a',
-    meaning:
-      'Capability is marked optional for this brand in brand-capabilities matrix and is reported as not applicable.',
+    meaning: 'Возможность отмечена как необязательная для бренда и не применяется к этому прогону.',
   },
   {
     flag: 'weak surface',
     meaning:
-      'A flow launched, but the visible surface was weaker than the strict success criteria.',
+      'Сценарий запустился, но видимый результат не соответствует строгим критериям успешности.',
   },
   {
     flag: 'provider absent',
-    meaning:
-      'The provider is included in the target matrix but was not present on the brand in this run.',
+    meaning: 'Провайдер включён в целевую матрицу, но не найден на бренде в этом прогоне.',
   },
   {
     flag: 'provider blocked',
     meaning:
-      'The provider launch was blocked by challenge text, cancelled bootstrap, or another launch-level blocker.',
+      'Запуск провайдера остановлен защитной проверкой, отменённой загрузкой или другим блокером запуска.',
   },
   {
     flag: 'retried',
-    meaning: 'The test needed a retry or recovery attempt before reaching its final result.',
+    meaning: 'Для получения итогового результата потребовался повторный запуск или восстановление.',
   },
 ];
 
-const REPORT_GUIDE_ROWS = [
-  { section: 'Highlights', meaning: SECTION_EXPLANATIONS.Highlights },
-  { section: 'Summary', meaning: SECTION_EXPLANATIONS.Summary },
-  { section: 'Mobile Stability', meaning: SECTION_EXPLANATIONS['Mobile Stability'] },
-  { section: 'Sections', meaning: SECTION_EXPLANATIONS.Sections },
-  { section: 'Accessibility', meaning: SECTION_EXPLANATIONS.Accessibility },
-  { section: 'Visual', meaning: SECTION_EXPLANATIONS.Visual },
-  { section: 'Casino', meaning: SECTION_EXPLANATIONS.Casino },
-  { section: 'Deposit', meaning: SECTION_EXPLANATIONS.Deposit },
-  { section: 'Contracts', meaning: SECTION_EXPLANATIONS.Contracts },
-  { section: 'Sidebar', meaning: SECTION_EXPLANATIONS.Sidebar },
-  { section: 'Live Chat', meaning: SECTION_EXPLANATIONS['Live Chat'] },
-  { section: 'Login', meaning: SECTION_EXPLANATIONS.Login },
-  { section: 'My Profile', meaning: SECTION_EXPLANATIONS['My Profile'] },
-  { section: 'Navigation & Core', meaning: SECTION_EXPLANATIONS['Navigation & Core'] },
-  { section: 'Registration', meaning: SECTION_EXPLANATIONS.Registration },
-  { section: 'Registration & Player', meaning: SECTION_EXPLANATIONS['Registration & Player'] },
-  { section: 'Casino Providers Matrix', meaning: SECTION_EXPLANATIONS['Casino Providers Matrix'] },
-  { section: 'Deposit Coverage', meaning: SECTION_EXPLANATIONS['Deposit Coverage'] },
-  { section: 'Auth State Health', meaning: SECTION_EXPLANATIONS['Auth State Health'] },
-  { section: 'Run KPI Validation', meaning: SECTION_EXPLANATIONS['Run KPI Validation'] },
-  { section: 'Failed Tests', meaning: SECTION_EXPLANATIONS['Failed Tests'] },
-  {
-    section: 'Registration Diagnostics',
-    meaning: SECTION_EXPLANATIONS['Registration Diagnostics'],
-  },
-];
+const COMPACT_REPORT_GUIDE_FLAGS = new Set([
+  'blocked',
+  'infra blocked',
+  'test infra timeout',
+  'product blocked',
+  'partial',
+  'n/a',
+]);
 
 function getSectionExplanation(name) {
   return SECTION_EXPLANATIONS[name] || '';
@@ -714,6 +847,19 @@ function renderSectionIntroHtml(name) {
 
 function yesNo(value) {
   return value ? 'Yes' : 'No';
+}
+
+function formatKpiVerdict(kpi) {
+  if (!kpi) return 'N/A';
+  if (
+    String(kpi.verdict || '').toLowerCase() === 'inconclusive' ||
+    Boolean(kpi.waivers && kpi.waivers.wafGraceApplied)
+  ) {
+    return 'Inconclusive (WAF grace)';
+  }
+  if (String(kpi.verdict || '').toLowerCase() === 'failed') return 'Failed';
+  if (String(kpi.verdict || '').toLowerCase() === 'passed') return 'Passed';
+  return kpi.valid ? 'Passed' : 'Failed';
 }
 
 function blockedAwareCount(value, blocked) {
@@ -759,68 +905,44 @@ function resolveCoverageMode(uiAvailable, apiAvailable) {
 }
 
 function renderReportGuideMd() {
+  const flagRows = reportCompactMode
+    ? FLAG_EXPLANATIONS.filter((entry) => COMPACT_REPORT_GUIDE_FLAGS.has(entry.flag))
+    : FLAG_EXPLANATIONS;
   return [
-    '## Report Guide',
+    '## Flag Legend',
     '',
-    renderSectionIntroMd('Report Guide').trim(),
-    '',
-    '| Section | Meaning |',
+    '| Flag | Значение |',
     '| --- | --- |',
-    ...REPORT_GUIDE_ROWS.map(
-      (entry) => `| ${escapeMdCell(entry.section)} | ${escapeMdCell(entry.meaning)} |`
-    ),
-    '',
-    '### Flag Legend',
-    '',
-    '| Flag | Meaning |',
-    '| --- | --- |',
-    ...FLAG_EXPLANATIONS.map(
-      (entry) => `| ${escapeMdCell(entry.flag)} | ${escapeMdCell(entry.meaning)} |`
-    ),
+    ...flagRows.map((entry) => `| ${escapeMdCell(entry.flag)} | ${escapeMdCell(entry.meaning)} |`),
     '',
   ].join('\n');
 }
 
 function renderReportGuideHtml() {
+  const flagRows = reportCompactMode
+    ? FLAG_EXPLANATIONS.filter((entry) => COMPACT_REPORT_GUIDE_FLAGS.has(entry.flag))
+    : FLAG_EXPLANATIONS;
   return `
-      <section>
-        <h2>Report Guide</h2>
-        ${renderSectionIntroHtml('Report Guide')}
-        <table>
-          <thead>
-            <tr>
-              <th>Section</th>
-              <th>Meaning</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${REPORT_GUIDE_ROWS.map(
-              (entry) => `
-                <tr>
-                  <td>${escapeHtml(entry.section)}</td>
-                  <td>${escapeHtml(entry.meaning)}</td>
-                </tr>
-              `
-            ).join('')}
-          </tbody>
-        </table>
-        <h3>Flag Legend</h3>
+      <section id="flag-legend">
+        <h2>Flag Legend</h2>
         <table>
           <thead>
             <tr>
               <th>Flag</th>
-              <th>Meaning</th>
+              <th>Значение</th>
             </tr>
           </thead>
           <tbody>
-            ${FLAG_EXPLANATIONS.map(
-              (entry) => `
+            ${flagRows
+              .map(
+                (entry) => `
                 <tr>
                   <td>${escapeHtml(entry.flag)}</td>
                   <td>${escapeHtml(entry.meaning)}</td>
                 </tr>
               `
-            ).join('')}
+              )
+              .join('')}
           </tbody>
         </table>
       </section>
@@ -864,10 +986,31 @@ function hasAnnotation(test, type) {
   return (test.annotations || []).some((annotation) => annotation.type === type);
 }
 
+function resolveScenarioStatus(test) {
+  if (
+    String((test && test.status) || '') === 'timedOut' ||
+    hasAnnotation(test, 'test-infra-timeout')
+  )
+    return 'TEST INFRA';
+  if (isFailureStatus(test && test.status)) return 'FAILED';
+  if (hasAnnotation(test, 'product-blocked')) return 'PRODUCT BLOCKED';
+  if (hasAnnotation(test, 'infra-blocked')) return 'INFRA BLOCKED';
+  if (hasAnnotation(test, 'blocked') || hasAnnotation(test, 'provider-blocked')) return 'BLOCKED';
+  if (hasAnnotation(test, 'not-applicable')) return 'N/A';
+  if (hasAnnotation(test, 'partial') || hasAnnotation(test, 'deposit-method-limit'))
+    return 'PARTIAL';
+  if (String((test && test.status) || '') === 'flaky' || hasAnnotation(test, 'flaky'))
+    return 'FLAKY';
+  if (String((test && test.status) || '') === 'skipped') return 'SKIPPED';
+  if (String((test && test.status) || '') === 'passed') return 'PASSED';
+  return String((test && test.status) || 'UNKNOWN').toUpperCase();
+}
+
 const ISSUE_ANNOTATION_TYPES = new Set([
   'blocked',
   'infra-blocked',
   'product-blocked',
+  'product-warning',
   'provider-blocked',
   'provider-absent',
   'partial',
@@ -909,6 +1052,9 @@ function sliceWithMeta(items, limit) {
 
 function getFlagLabels(test) {
   const flags = [];
+  if (String(test.status || '') === 'timedOut' || hasAnnotation(test, 'test-infra-timeout')) {
+    flags.push('test infra timeout');
+  }
   if (hasAnnotation(test, 'provider-absent')) flags.push('provider absent');
   if (hasAnnotation(test, 'provider-blocked')) flags.push('provider blocked');
   else if (hasAnnotation(test, 'blocked')) {
@@ -916,6 +1062,7 @@ function getFlagLabels(test) {
     else if (hasAnnotation(test, 'product-blocked')) flags.push('product blocked');
     else flags.push('blocked');
   }
+  if (hasAnnotation(test, 'product-warning')) flags.push('product warning');
   if (hasAnnotation(test, 'not-applicable')) flags.push('n/a');
   if (hasAnnotation(test, 'weak-surface')) flags.push('weak surface');
   if (hasAnnotation(test, 'partial') || hasAnnotation(test, 'deposit-method-limit'))
@@ -950,11 +1097,120 @@ function noteSummary(test) {
   return truncateText(note || '-', NOTE_TEXT_LIMIT);
 }
 
+function firstAnnotationDescription(test, types = []) {
+  const wanted = new Set(types.map((type) => String(type)));
+  const annotations = Array.isArray(test && test.annotations) ? test.annotations : [];
+  const annotation =
+    annotations.find((item) => wanted.has(String(item.type || ''))) ||
+    annotations.find((item) => item && item.description);
+  return oneLine(annotation && annotation.description ? annotation.description : '');
+}
+
+function resolveRegistrationCoverage({
+  registrationPrimaryTest,
+  newPlayerRegisteredInRun,
+  registrationDataFromCurrentRun,
+  registrationData,
+}) {
+  if (!registrationPrimaryTest) {
+    return {
+      state: 'not-found',
+      status: 'not-found',
+      rawStatus: 'not-found',
+      reason: 'Registration success test was not found in the collected reports.',
+    };
+  }
+
+  const rawStatus = String(registrationPrimaryTest.status || 'unknown');
+  const blocked = hasAnnotation(registrationPrimaryTest, 'blocked');
+  if (blocked) {
+    return {
+      state: 'blocked',
+      status: 'blocked',
+      rawStatus,
+      reason:
+        normalizeReason(
+          firstAnnotationDescription(registrationPrimaryTest, [
+            'infra-blocked',
+            'product-blocked',
+            'blocked',
+          ]) || noteSummary(registrationPrimaryTest)
+        ) || 'Registration flow was blocked in this run.',
+    };
+  }
+
+  if (newPlayerRegisteredInRun) {
+    return {
+      state: 'registered',
+      status: rawStatus,
+      rawStatus,
+      reason: 'New player artifacts were created and validated in this run.',
+    };
+  }
+
+  if (isFailureStatus(rawStatus)) {
+    return {
+      state: 'failed',
+      status: rawStatus,
+      rawStatus,
+      reason: noteSummary(registrationPrimaryTest),
+    };
+  }
+
+  if (rawStatus === 'skipped') {
+    return {
+      state: 'skipped',
+      status: rawStatus,
+      rawStatus,
+      reason: noteSummary(registrationPrimaryTest),
+    };
+  }
+
+  if (!registrationDataFromCurrentRun) {
+    const hasReusableData = Boolean(
+      registrationData && registrationData.email && registrationData.password
+    );
+    return {
+      state: hasReusableData ? 'stale-artifacts' : 'missing-artifacts',
+      status: rawStatus,
+      rawStatus,
+      reason: hasReusableData
+        ? 'Registration data exists, but it does not belong to the current run.'
+        : 'Registration test did not produce current-run player artifacts.',
+    };
+  }
+
+  return {
+    state: 'unknown',
+    status: rawStatus,
+    rawStatus,
+    reason: noteSummary(registrationPrimaryTest),
+  };
+}
+
 function getSignalTotals(tests) {
+  const degradedTypes = new Set([
+    'blocked',
+    'infra-blocked',
+    'test-infra-timeout',
+    'product-blocked',
+    'product-warning',
+    'provider-blocked',
+    'not-applicable',
+    'partial',
+    'deposit-method-limit',
+    'weak-surface',
+    'provider-absent',
+  ]);
   return {
     blocked: tests.filter((test) => hasAnnotation(test, 'blocked')).length,
     infraBlocked: tests.filter((test) => hasAnnotation(test, 'infra-blocked')).length,
+    testInfraTimeout: tests.filter(
+      (test) =>
+        String(test.status || '') === 'timedOut' || hasAnnotation(test, 'test-infra-timeout')
+    ).length,
     productBlocked: tests.filter((test) => hasAnnotation(test, 'product-blocked')).length,
+    productWarnings: tests.filter((test) => hasAnnotation(test, 'product-warning')).length,
     notApplicable: tests.filter((test) => hasAnnotation(test, 'not-applicable')).length,
     partial: tests.filter(
       (test) => hasAnnotation(test, 'partial') || hasAnnotation(test, 'deposit-method-limit')
@@ -964,6 +1220,21 @@ function getSignalTotals(tests) {
     ).length,
     weakSurface: tests.filter((test) => hasAnnotation(test, 'weak-surface')).length,
     providerAbsent: tests.filter((test) => hasAnnotation(test, 'provider-absent')).length,
+    strictClean: tests.filter((test) => {
+      const title = String(test.title || '');
+      const weakOddsSmoke = /odds click.*betslip surface.*interaction smoke/i.test(title);
+      return (
+        test.status === 'passed' &&
+        Number(test.retries || 0) === 0 &&
+        !/\bdiagnostics?\b/i.test(title) &&
+        (!weakOddsSmoke || hasAnnotation(test, 'strong-evidence')) &&
+        !(test.annotations || []).some((annotation) =>
+          degradedTypes.has(
+            String(annotation && annotation.type ? annotation.type : '').toLowerCase()
+          )
+        )
+      );
+    }).length,
   };
 }
 
@@ -974,7 +1245,9 @@ function extractReason(test) {
       [
         'blocked',
         'infra-blocked',
+        'test-infra-timeout',
         'product-blocked',
+        'product-warning',
         'provider-blocked',
         'not-applicable',
       ].includes(String(item.type || '').toLowerCase()) && oneLine(item.description)
@@ -1016,23 +1289,49 @@ function resolveMobileTests(allTests, executionMode) {
   );
 }
 
-function summarizeProviderMatrix(payload) {
+function summarizeProviderMatrix(payload, inventoryPayload) {
   const results = Array.isArray(payload && payload.results) ? payload.results : [];
   const summary = payload && payload.summary ? payload.summary : {};
+  const normalizeProviderKey = (value) => {
+    const key = String(value || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '');
+    return key === 'truelab' ? 'truelabs' : key;
+  };
+  const resultProviderKeys = new Set(
+    results.map((item) => normalizeProviderKey((item && item.provider) || '')).filter(Boolean)
+  );
+  const inventoryProviderNames = Array.isArray(inventoryPayload && inventoryPayload.providers)
+    ? inventoryPayload.providers
+        .map((item) => String(item && item.name ? item.name : item || '').trim())
+        .filter(Boolean)
+    : [];
+  const discoveredUntested = inventoryProviderNames.filter(
+    (provider) => !resultProviderKeys.has(normalizeProviderKey(provider))
+  );
   const targetDeclared = Number(
     (payload && (payload.providersTargetCountAll || payload.providersTargetCount)) ||
       results.length ||
       0
   );
-  const providersDiscovered = Number((payload && payload.providersDiscovered) || 0);
+  const inventoryProviders = Array.isArray(inventoryPayload && inventoryPayload.providers)
+    ? inventoryPayload.providers.length
+    : 0;
+  const providersDiscovered = Number(
+    (payload && payload.providersDiscovered) ||
+      (inventoryPayload &&
+        (inventoryPayload.providersCount || inventoryPayload.providersDiscovered)) ||
+      inventoryProviders ||
+      0
+  );
   return {
     targetDeclared,
     resultsCaptured: results.length,
     providersDiscovered,
+    discoveredUntested,
     total: Number(summary.total || results.length || 0),
-    passed: Number(
-      summary.passed || results.filter((item) => item.status === 'passed').length || 0
-    ),
+    passed: Number(summary.passedStrong || 0) + Number(summary.passedWeakSurface || 0),
     failed: Number(
       summary.failed || results.filter((item) => item.status === 'failed').length || 0
     ),
@@ -1057,17 +1356,57 @@ function summarizeProviderMatrix(payload) {
         results.filter((item) => item.outcome === 'provider-launch-blocked').length ||
         0
     ),
+    blockedInfraWaf: Number(
+      summary.blockedInfraWaf ??
+        results.filter((item) => item.outcome === 'infra-waf-blocked').length ??
+        0
+    ),
     blockedOther: Number(
-      summary.blockedOther ||
+      summary.blockedOther ??
         results.filter(
           (item) =>
             item.status === 'blocked' &&
-            !['provider-absent', 'provider-launch-blocked'].includes(item.outcome)
-        ).length ||
+            !['provider-absent', 'provider-launch-blocked', 'infra-waf-blocked'].includes(
+              item.outcome
+            )
+        ).length ??
         0
     ),
     retriedRecovered: Number(
       summary.retriedRecovered || results.filter((item) => Boolean(item.flakyRecovered)).length || 0
+    ),
+    optionalStageTimeoutProviders: Number(
+      summary.optionalStageTimeoutProviders ||
+        results.filter((item) =>
+          (item.modes || []).some((mode) =>
+            (mode.launches || []).some((launch) =>
+              (launch.stageTelemetry || []).some((stage) => stage.status === 'timed-out-optional')
+            )
+          )
+        ).length ||
+        0
+    ),
+    optionalStageTimeouts: Number(
+      summary.optionalStageTimeouts ||
+        results.reduce(
+          (total, item) =>
+            total +
+            (item.modes || []).reduce(
+              (modeTotal, mode) =>
+                modeTotal +
+                (mode.launches || []).reduce(
+                  (launchTotal, launch) =>
+                    launchTotal +
+                    (launch.stageTelemetry || []).filter(
+                      (stage) => stage.status === 'timed-out-optional'
+                    ).length,
+                  0
+                ),
+              0
+            ),
+          0
+        ) ||
+        0
     ),
   };
 }
@@ -1206,6 +1545,7 @@ const totals = getStatusTotals(tests);
 const signalTotals = getSignalTotals(tests);
 const authStateHealth = readJson(authStateHealthArtifactPath);
 const kpiValidation = readJson(kpiValidationArtifactPath);
+const executionJournal = readCurrentRunJson(executionJournalArtifactPath);
 const failed = tests.filter((t) => isFailureStatus(t.status));
 const softPrecheckFailureTests = failed.filter((test) => isSoftPrecheckFailure(test));
 const effectiveFailedCount = failed.length - softPrecheckFailureTests.length;
@@ -1214,25 +1554,27 @@ const runStatusBase = getRunStatus({
   failed: Math.max(0, effectiveFailedCount),
 });
 function resolveKpiRunStatus(baseStatus, kpi) {
-  if (!kpi || kpi.valid !== false) return baseStatus;
-  const failedChecks = Array.isArray(kpi.failedChecks) ? kpi.failedChecks : [];
+  const failedChecks = Array.isArray(kpi && kpi.failedChecks) ? kpi.failedChecks : [];
   const wafSignals = [
-    kpi.waivers && kpi.waivers.wafGraceApplied,
-    kpi.waivers && kpi.waivers.precheckCloudflareSignal,
+    kpi && kpi.waivers && kpi.waivers.wafGraceApplied,
+    kpi && kpi.waivers && kpi.waivers.precheckCloudflareSignal,
     failedChecks.some((item) =>
-      /waf|cloudflare|challenge|blocked-ratio|infra-blocked|precheck-waf/i.test(
+      /waf|cloudflare|turnstile|captcha|cdn-cgi|__cf_chl|challenge/i.test(
         `${item && item.id ? item.id : ''} ${item && item.detail ? item.detail : ''}`
       )
     ),
   ].some(Boolean);
 
+  if (baseStatus === 'PASSED' && signalTotals.testInfraTimeout > 0 && !wafSignals) {
+    return 'TEST_INFRA_TIMEOUT';
+  }
   if (baseStatus === 'PASSED' && wafSignals) return 'WAF_DEGRADED';
+  if (!kpi || kpi.valid !== false) return baseStatus;
   return 'INVALID_RUN';
 }
 const runStatus = resolveKpiRunStatus(runStatusBase, kpiValidation);
-const executionMode = String(process.env.QA_EXECUTION_MODE || process.env.PW_PROJECT_MATRIX || '')
-  .trim()
-  .toLowerCase();
+const executionMode = configuredExecutionMode;
+const platformLabel = executionMode === 'mobile' ? 'Mobile' : 'Desktop';
 const mobileTests = resolveMobileTests(tests, executionMode);
 const mobileTotals = getStatusTotals(mobileTests);
 const mobileBlockedCount = mobileTests.filter((test) => hasAnnotation(test, 'blocked')).length;
@@ -1256,18 +1598,45 @@ const durationMs = reportSources.reduce(
   (sum, src) => sum + Number(src.data.stats?.duration || 0),
   0
 );
+const executionAttempts = Array.isArray(executionJournal && executionJournal.attempts)
+  ? executionJournal.attempts
+  : [];
+const orchestrationDurationMs = Number(
+  (executionJournal && executionJournal.durationMs) || durationMs
+);
+const orchestrationRetryAttempts = executionAttempts.filter((attempt) => attempt.retry).length;
+const orchestrationFailedAttempts = executionAttempts.filter(
+  (attempt) => Number(attempt.code || 0) !== 0
+).length;
+const orchestrationWafAttempts = executionAttempts.filter((attempt) => attempt.wafSignal).length;
+const orchestrationPlaywrightAttempts = executionAttempts.filter(
+  (attempt) => !attempt.kind || attempt.kind === 'playwright'
+).length;
+const orchestrationStorageStateAttempts = executionAttempts.filter(
+  (attempt) => attempt.kind === 'storage-state'
+).length;
+const orchestrationStorageStateFailedAttempts = executionAttempts.filter(
+  (attempt) => attempt.kind === 'storage-state' && Number(attempt.code || 0) !== 0
+).length;
+const recoveredPhases = (() => {
+  const attemptsByPhase = new Map();
+  for (const attempt of executionAttempts) {
+    if (attempt.kind && attempt.kind !== 'playwright') continue;
+    const phase = oneLine(attempt.phase || 'unknown');
+    if (!attemptsByPhase.has(phase)) attemptsByPhase.set(phase, []);
+    attemptsByPhase.get(phase).push(attempt);
+  }
+  return [...attemptsByPhase.entries()]
+    .filter(([, attempts]) => {
+      const finalAttempt = attempts[attempts.length - 1];
+      return (
+        attempts.some((attempt) => Number(attempt.code || 0) !== 0) &&
+        Number(finalAttempt && finalAttempt.code ? finalAttempt.code : 0) === 0
+      );
+    })
+    .map(([phase]) => phase);
+})();
 const generatedAt = new Date().toISOString();
-
-const phaseSummary = reportSources.map((src) => {
-  const phaseTests = tests.filter((t) => t.phase === src.phase);
-  const phaseTotals = getStatusTotals(phaseTests);
-  return {
-    phase: src.phase,
-    sourcePath: src.path,
-    totals: phaseTotals,
-    durationMs: Number(src.data.stats?.duration || 0),
-  };
-});
 
 const sectionMap = new Map();
 for (const testItem of tests) {
@@ -1319,6 +1688,9 @@ quickHighlights.push(
     effectiveFailedRatio,
     1
   )}).`
+);
+quickHighlights.push(
+  `Raw Playwright passed/completed: ${totals.passed}/${totals.total}; strict clean functional evidence: ${signalTotals.strictClean}/${totals.total}. Blocked/partial/N/A annotations are not product passes.`
 );
 quickHighlights.push(
   `Blocked signals: ${signalTotals.blocked}/${totals.total} (${formatPercent(blockedRatio, 1)}).`
@@ -1375,12 +1747,12 @@ const manualLoginPlayerResolved = isManualLoginReadyPlayer(registrationData)
     : { data: null, path: null };
 const manualLoginPlayerData = manualLoginPlayerResolved.data;
 const manualLoginPlayerDataSource = manualLoginPlayerResolved.path || '-';
-const currentManualLoginEmail = oneLine(
+const currentManualLoginEmail = credentialValue(
   (manualLoginPlayerData && manualLoginPlayerData.email) ||
     (registrationData && registrationData.email) ||
     ''
 );
-const currentManualLoginPassword = oneLine(
+const currentManualLoginPassword = credentialValue(
   (manualLoginPlayerData && manualLoginPlayerData.password) ||
     (registrationData && registrationData.password) ||
     ''
@@ -1413,10 +1785,19 @@ const newPlayerRegisteredInRun = Boolean(
   registrationPrimaryTest.status === 'passed' &&
   registrationDataFromCurrentRun
 );
+const registrationCoverage = resolveRegistrationCoverage({
+  registrationPrimaryTest,
+  newPlayerRegisteredInRun,
+  registrationDataFromCurrentRun,
+  registrationData,
+});
 const registrationOutcome = {
   testFound: Boolean(registrationPrimaryTest),
   newPlayerRegisteredInRun,
-  testStatus: registrationPrimaryTest ? registrationPrimaryTest.status : 'not-found',
+  coverageState: registrationCoverage.state,
+  testStatus: registrationCoverage.status,
+  rawTestStatus: registrationCoverage.rawStatus,
+  blockedReason: registrationCoverage.reason,
   flags: registrationPrimaryTest ? flagsMd(registrationPrimaryTest) : '-',
   note: registrationPrimaryTest
     ? noteSummary(registrationPrimaryTest)
@@ -1444,6 +1825,20 @@ const registrationOutcome = {
     registrationData && registrationData.loginValidationAt
       ? registrationData.loginValidationAt
       : '-',
+  lastLoginCheckStatus:
+    registrationData && registrationData.lastLoginCheckStatus
+      ? registrationData.lastLoginCheckStatus
+      : '-',
+  lastLoginCheckMethod:
+    registrationData && registrationData.lastLoginCheckMethod
+      ? registrationData.lastLoginCheckMethod
+      : '-',
+  lastLoginCheckReason:
+    registrationData && registrationData.lastLoginCheckReason
+      ? registrationData.lastLoginCheckReason
+      : '-',
+  lastLoginCheckAt:
+    registrationData && registrationData.lastLoginCheckAt ? registrationData.lastLoginCheckAt : '-',
   manualLoginPlayerAvailable: Boolean(manualLoginPlayerData),
   manualLoginPlayerSource: manualLoginPlayerDataSource,
   manualLoginPlayerFromCurrentRun: Boolean(
@@ -1469,8 +1864,20 @@ const registrationOutcome = {
       (registrationPrimaryTest.titlePath || registrationPrimaryTest.title)) ||
     '-',
 };
-const providerMatrix = readJson(providerMatrixPath);
-const providerMatrixSummary = summarizeProviderMatrix(providerMatrix);
+if (registrationOutcome.coverageState === 'blocked') {
+  quickHighlights.push(`Registration blocked: ${registrationOutcome.blockedReason}`);
+} else if (
+  registrationOutcome.testFound &&
+  !registrationOutcome.newPlayerRegisteredInRun &&
+  registrationOutcome.coverageState !== 'registered'
+) {
+  quickHighlights.push(
+    `Registration did not create a current-run player: ${registrationOutcome.blockedReason}`
+  );
+}
+const providerMatrix = readCurrentRunJson(providerMatrixPath);
+const providerInventory = readCurrentRunJson(providerInventoryPath);
+const providerMatrixSummary = summarizeProviderMatrix(providerMatrix, providerInventory);
 const providerMatrixAllResults = Array.isArray(providerMatrix && providerMatrix.results)
   ? providerMatrix.results
   : [];
@@ -1491,9 +1898,9 @@ const providerMatrixOrderedResults = reportCompactMode
 const providerMatrixSlice = sliceWithMeta(providerMatrixOrderedResults, providerMatrixRowsLimit);
 const providerMatrixResults = providerMatrixSlice.items;
 const providerMatrixOmitted = providerMatrixSlice.omitted;
-const depositInventoryArtifact = readJson(depositInventoryArtifactPath);
+const depositInventoryArtifact = readCurrentRunJson(depositInventoryArtifactPath);
 const depositInventorySummary = summarizeDepositInventory(depositInventoryArtifact);
-const depositArtifact = readJson(depositArtifactPath);
+const depositArtifact = readCurrentRunJson(depositArtifactPath);
 const depositSummary = summarizeDepositArtifact(depositArtifact);
 const depositInventoryCoverageBlocked = Boolean(
   depositInventoryArtifact && depositInventoryArtifact.blocked
@@ -1555,12 +1962,198 @@ const kpiChecks = Array.isArray(kpiValidation && kpiValidation.checks) ? kpiVali
 const kpiFailedChecks = Array.isArray(kpiValidation && kpiValidation.failedChecks)
   ? kpiValidation.failedChecks
   : [];
+const isKpiWaivedUnmet = (item) =>
+  Boolean(
+    item &&
+    (item.waived === true ||
+      (item.applicable === false && /\bwaived\b/i.test(String(item.detail || ''))))
+  );
+const kpiWaivedChecks = Array.isArray(kpiValidation && kpiValidation.waivedChecks)
+  ? kpiValidation.waivedChecks
+  : kpiChecks.filter(isKpiWaivedUnmet);
+const qualityGate = (() => {
+  const kpiFailed = Boolean(kpiValidation && kpiValidation.valid === false);
+  if (effectiveFailedCount > 0 || kpiFailed) {
+    return {
+      verdict: 'NO-GO',
+      cssClass: 'decision-no-go',
+      summary: `${Math.max(0, effectiveFailedCount)} hard failure(s); KPI: ${formatKpiVerdict(
+        kpiValidation
+      )}. Release confidence is insufficient.`,
+    };
+  }
+  if (
+    signalTotals.testInfraTimeout > 0 ||
+    signalTotals.blocked > 0 ||
+    !['PASSED'].includes(runStatus)
+  ) {
+    return {
+      verdict: 'CONDITIONAL',
+      cssClass: 'decision-conditional',
+      summary: `No hard failures and KPI passed, but ${signalTotals.testInfraTimeout} test-infrastructure timeout(s) and ${signalTotals.blocked} blocked signal(s) limit confidence.`,
+    };
+  }
+  return {
+    verdict: 'GO',
+    cssClass: 'decision-go',
+    summary:
+      'No hard failures, failed KPI checks, blocked signals, or test-infrastructure timeouts were detected.',
+  };
+})();
+const previousRun = readPreviousComparableRun(
+  path.join(projectPaths.artifactsDir, 'history', 'runs'),
+  executionJournal && executionJournal.runId,
+  generatedAt
+);
+const previousTotals = (previousRun && previousRun.totals) || {};
+const currentProviderPassed = Number(providerMatrixSummary.passed || 0);
+const previousProviderPassed = Number(
+  (findKpiCheck(previousRun && previousRun.kpi, 'provider-passed') || {}).actual
+);
+const comparisonMetrics = [
+  {
+    label: 'Hard failures',
+    current: Math.max(0, effectiveFailedCount),
+    previous: previousTotals.failed,
+    lowerIsBetter: true,
+  },
+  {
+    label: 'Blocked signals',
+    current: signalTotals.blocked,
+    previous: previousTotals.blockedSignals,
+    lowerIsBetter: true,
+  },
+  {
+    label: 'External infrastructure',
+    current: signalTotals.infraBlocked,
+    previous: previousTotals.infraBlockedSignals,
+    lowerIsBetter: true,
+  },
+  {
+    label: 'Test infrastructure timeouts',
+    current: signalTotals.testInfraTimeout,
+    previous: previousTotals.testInfraTimeoutSignals,
+    lowerIsBetter: true,
+  },
+  {
+    label: 'Product limitations',
+    current: signalTotals.productBlocked,
+    previous: previousTotals.productBlockedSignals,
+    lowerIsBetter: true,
+  },
+  {
+    label: 'Not applicable',
+    current: signalTotals.notApplicable,
+    previous: previousTotals.notApplicableSignals,
+    lowerIsBetter: null,
+  },
+  {
+    label: 'Partial coverage',
+    current: signalTotals.partial,
+    previous: previousTotals.partialSignals,
+    lowerIsBetter: true,
+  },
+  {
+    label: 'Provider launches passed',
+    current: currentProviderPassed,
+    previous: Number.isFinite(previousProviderPassed) ? previousProviderPassed : null,
+    lowerIsBetter: false,
+  },
+].map((item) => ({ ...item, delta: signedDelta(item.current, item.previous) }));
+const issueCategories = [
+  {
+    category: 'Hard failures',
+    count: Math.max(0, effectiveFailedCount),
+    severity: effectiveFailedCount > 0 ? 'Critical' : 'OK',
+    meaning: 'Product assertion failed without an accepted limitation or infrastructure cause.',
+    action: effectiveFailedCount > 0 ? 'Block release and investigate failed tests.' : 'No action.',
+  },
+  {
+    category: 'Product limitations',
+    count: signalTotals.productBlocked,
+    severity: signalTotals.productBlocked > 0 ? 'High' : 'OK',
+    meaning: 'Expected user flow is unavailable or incomplete in the product.',
+    action: signalTotals.productBlocked > 0 ? 'Create or update product defects.' : 'No action.',
+  },
+  {
+    category: 'Test infrastructure',
+    count: signalTotals.testInfraTimeout,
+    severity: signalTotals.testInfraTimeout > 0 ? 'High' : 'OK',
+    meaning: 'The check timed out or the automation could not collect conclusive evidence.',
+    action:
+      signalTotals.testInfraTimeout > 0
+        ? 'Stabilize the affected test path and rerun.'
+        : 'No action.',
+  },
+  {
+    category: 'External infrastructure',
+    count: signalTotals.infraBlocked,
+    severity: signalTotals.infraBlocked > 0 ? 'Medium' : 'OK',
+    meaning: 'WAF, provider, network, or another external dependency limited coverage.',
+    action:
+      signalTotals.infraBlocked > 0
+        ? 'Retry in an allowed environment and preserve evidence.'
+        : 'No action.',
+  },
+  {
+    category: 'Partial coverage',
+    count: signalTotals.partial,
+    severity: signalTotals.partial > 0 ? 'Medium' : 'OK',
+    meaning: 'Only part of the intended scenario was verified.',
+    action:
+      signalTotals.partial > 0
+        ? 'Review gaps before treating the run as full coverage.'
+        : 'No action.',
+  },
+  {
+    category: 'Not applicable',
+    count: signalTotals.notApplicable,
+    severity: 'Info',
+    meaning: 'The feature or condition does not apply to this brand or platform.',
+    action: 'Confirm the exclusion is expected and keep it visible in scope.',
+  },
+];
+const executionStepRows = tests.flatMap((test, testIndex) => {
+  const scenarioStatus = resolveScenarioStatus(test);
+  const scenarioRow = {
+    number: testIndex + 1,
+    phase: test.phase || '-',
+    section: resolveSection(test),
+    type: 'Scenario',
+    title: test.title || test.titlePath || '(untitled)',
+    status: scenarioStatus,
+    duration: Number(test.duration || 0),
+    flags: flagsMd(test),
+    depth: 0,
+  };
+  const explicitSteps = (test.steps || []).map((step) => ({
+    number: '',
+    phase: test.phase || '-',
+    section: resolveSection(test),
+    type: 'Playwright step',
+    title: step.title,
+    status: step.status,
+    duration: Number(step.duration || 0),
+    flags: step.error || '-',
+    depth: Number(step.depth || 0) + 1,
+  }));
+  return [scenarioRow, ...explicitSteps];
+});
+const explicitStepCount = executionStepRows.filter(
+  (item) => item.type === 'Playwright step'
+).length;
+const testsWithExplicitSteps = tests.filter((test) => (test.steps || []).length > 0).length;
+const scenarioStatusCounts = tests.reduce((acc, test) => {
+  const status = resolveScenarioStatus(test);
+  acc[status] = Number(acc[status] || 0) + 1;
+  return acc;
+}, {});
 const kpiRowsMd = kpiChecks.length
   ? kpiChecks.map(
       (item) =>
-        `| ${escapeMdCell(item.label || item.id || '-')} | ${yesNo(item.applicable !== false)} | ${yesNo(
-          item.passed
-        )} | ${escapeMdCell(item.actual)} | ${escapeMdCell(item.threshold)} | ${escapeMdCell(
+        `| ${escapeMdCell(item.label || item.id || '-')} | ${yesNo(item.applicable !== false)} | ${
+          isKpiWaivedUnmet(item) ? 'Waived (unmet)' : yesNo(item.passed)
+        } | ${escapeMdCell(item.actual)} | ${escapeMdCell(item.threshold)} | ${escapeMdCell(
           oneLine(item.detail || '-') || '-'
         )} |`
     )
@@ -1574,8 +2167,9 @@ const kpiValidationMd = kpiValidation
       '| Metric | Value |',
       '| --- | --- |',
       `| Generated At | ${escapeMdCell(kpiValidation.generatedAt || '-')} |`,
-      `| Valid | ${yesNo(kpiValidation.valid)} |`,
+      `| Verdict | ${escapeMdCell(formatKpiVerdict(kpiValidation))} |`,
       `| Failed Checks | ${kpiFailedChecks.length} |`,
+      `| Waived Unmet Checks | ${kpiWaivedChecks.length} |`,
       `| Blocked Ratio | ${escapeMdCell(
         formatPercent(
           Number((kpiValidation.totals && kpiValidation.totals.blockedSignals) || 0) /
@@ -1632,12 +2226,7 @@ const registrationPlayerMd = (() => {
     registrationOutcome.manualLoginPlayerEmail ||
     registrationOutcome.playerEmail ||
     '-';
-  const primaryPassword =
-    registrationOutcome.currentManualLoginPassword ||
-    (manualLoginPlayerData &&
-      (manualLoginPlayerData.password || manualLoginPlayerData.passwordMasked)) ||
-    (registrationData && (registrationData.password || registrationData.passwordMasked)) ||
-    '-';
+  const primaryPassword = registrationOutcome.currentManualLoginPassword || '-';
   const sourcePath = formatPathForDisplay(registration.path || manualLoginPlayerDataSource || '-');
 
   return [
@@ -1648,15 +2237,22 @@ const registrationPlayerMd = (() => {
     '| Field | Value |',
     '| --- | --- |',
     `| Registration Test Present | ${yesNo(registrationOutcome.testFound)} |`,
+    `| Registration Coverage State | ${escapeMdCell(registrationOutcome.coverageState)} |`,
     `| Registration Test Status | ${escapeMdCell(registrationOutcome.testStatus)} |`,
+    `| Registration Test Raw Status | ${escapeMdCell(registrationOutcome.rawTestStatus)} |`,
+    `| Registration Blocked/Incomplete Reason | ${escapeMdCell(registrationOutcome.blockedReason)} |`,
     `| New Player Registered In This Run | ${yesNo(registrationOutcome.newPlayerRegisteredInRun)} |`,
     `| Player Data Belongs To Current Run | ${yesNo(registrationOutcome.playerDataFromCurrentRun)} |`,
     `| Manual Password Login Ready | ${yesNo(registrationOutcome.manualLoginReady)} |`,
     `| Login Validation Status | ${escapeMdCell(registrationOutcome.loginValidationStatus)} |`,
     `| Login Validation At | ${escapeMdCell(registrationOutcome.loginValidationAt)} |`,
+    `| Latest Login Attempt Status | ${escapeMdCell(registrationOutcome.lastLoginCheckStatus)} |`,
+    `| Latest Login Attempt Method | ${escapeMdCell(registrationOutcome.lastLoginCheckMethod)} |`,
+    `| Latest Login Attempt Reason | ${escapeMdCell(registrationOutcome.lastLoginCheckReason)} |`,
+    `| Latest Login Attempt At | ${escapeMdCell(registrationOutcome.lastLoginCheckAt)} |`,
     `| Manual Login Player Available | ${yesNo(registrationOutcome.manualLoginPlayerAvailable)} |`,
-    `| Email For Manual Login | ${escapeMdCell(primaryEmail)} |`,
-    `| Password For Manual Login | ${escapeMdCell(primaryPassword)} |`,
+    `| Email For Manual Login | ${escapeCredentialMdCell(primaryEmail)} |`,
+    `| Password For Manual Login | ${escapeCredentialMdCell(primaryPassword)} |`,
     `| Player Generated At | ${escapeMdCell(registrationOutcome.playerGeneratedAt)} |`,
     `| Data Source | ${escapeMdCell(sourcePath)} |`,
     `| Source Test | ${escapeMdCell(registrationOutcome.sourceTest)} |`,
@@ -1675,19 +2271,26 @@ const providerMatrixMd =
         `| Target Providers Declared | ${providerMatrixSummary.targetDeclared} |`,
         `| Provider Results Captured | ${providerMatrixSummary.resultsCaptured} |`,
         `| Providers Discovered On Brand | ${providerMatrixSummary.providersDiscovered || '-'} |`,
-        `| Passed | ${providerMatrixSummary.passed} |`,
+        `| Discovered But Not Launch-Tested | ${providerMatrixSummary.discoveredUntested.length} |`,
+        `| Discovered But Not Launch-Tested (preview) | ${escapeMdCell(
+          providerMatrixSummary.discoveredUntested.slice(0, 12).join(', ') || '-'
+        )} |`,
+        `| Functional Passed | ${providerMatrixSummary.passed} |`,
         `| Passed Strong | ${providerMatrixSummary.passedStrong} |`,
         `| Passed Weak Surface | ${providerMatrixSummary.passedWeakSurface} |`,
         `| Failed | ${providerMatrixSummary.failed} |`,
         `| Blocked | ${providerMatrixSummary.blocked} |`,
         `| Provider Absent | ${providerMatrixSummary.blockedProviderAbsent} |`,
         `| Provider Launch Blocked | ${providerMatrixSummary.blockedProviderLaunch} |`,
+        `| Infrastructure WAF Blocked | ${providerMatrixSummary.blockedInfraWaf} |`,
         `| Blocked Other | ${providerMatrixSummary.blockedOther} |`,
         `| Retried and Recovered | ${providerMatrixSummary.retriedRecovered} |`,
+        `| Providers With Optional Stage Timeout | ${providerMatrixSummary.optionalStageTimeoutProviders} |`,
+        `| Optional Stage Timeouts | ${providerMatrixSummary.optionalStageTimeouts} |`,
         `| Rows In Report | ${providerMatrixResults.length} |`,
         `| Omitted Rows | ${providerMatrixOmitted} |`,
         '',
-        '| Provider | Status | Outcome | Launch | Surface | Controls | Note |',
+        '| Provider | Status | Outcome | Launch | Surface | Controls | Примечание |',
         '| --- | --- | --- | --- | --- | --- | --- |',
         ...providerMatrixResults.map(
           (item) =>
@@ -1696,13 +2299,13 @@ const providerMatrixMd =
             )} | ${escapeMdCell(item.launchState || '-')} | ${escapeMdCell(
               item.gameSurface || '-'
             )} | ${escapeMdCell(item.controlsClicked || 0)} | ${escapeMdCell(
-              normalizeReason(item.reason || '-') || '-'
+              translateProviderNote(item.reason || '-')
             )} |`
         ),
         ...(providerMatrixOmitted > 0
           ? [
               `| ... | ... | ... | ... | ... | ... | ${escapeMdCell(
-                `Omitted ${providerMatrixOmitted} provider rows in compact report.`
+                `В компактном отчёте скрыто строк провайдеров: ${providerMatrixOmitted}.`
               )} |`,
             ]
           : []),
@@ -1714,7 +2317,9 @@ const depositCoverageMd = (() => {
   const methodsBlocked = depositMethodCoverageBlocked;
   const overallState =
     inventoryBlocked && methodsBlocked
-      ? 'blocked'
+      ? depositInventorySummary.apiCoverageAvailable || depositSummary.apiCoverageAvailable
+        ? 'blocked-ui / api-only'
+        : 'blocked'
       : inventoryBlocked || methodsBlocked
         ? 'partial'
         : 'ready';
@@ -1739,17 +2344,18 @@ const depositCoverageMd = (() => {
   const availableMethods = depositSummary.discoveredMethods.length
     ? depositSummary.discoveredMethods
     : depositSummary.checkedMethods;
-  const availableMethodsMd = availableMethods.length
-    ? [
-        '',
-        '### Available Deposit Methods',
-        '',
-        '| # | Method |',
-        '| --- | --- |',
-        ...availableMethods.map((method, index) => `| ${index + 1} | ${escapeMdCell(method)} |`),
-        '',
-      ]
-    : [];
+  const availableMethodsMd =
+    !reportCompactMode && availableMethods.length
+      ? [
+          '',
+          '### Available Deposit Methods',
+          '',
+          '| # | Method |',
+          '| --- | --- |',
+          ...availableMethods.map((method, index) => `| ${index + 1} | ${escapeMdCell(method)} |`),
+          '',
+        ]
+      : [];
 
   return [
     '## Deposit Coverage',
@@ -1762,12 +2368,12 @@ const depositCoverageMd = (() => {
     `| Inventory Blocked | ${yesNo(inventoryBlocked)} |`,
     `| Methods Blocked | ${yesNo(methodsBlocked)} |`,
     `| Blocked Reason | ${escapeMdCell(reasons || '-')} |`,
-    `| API Coverage Available | ${blockedAwareBool(depositInventorySummary.apiCoverageAvailable, inventoryBlocked)} |`,
+    `| API Coverage Available | ${yesNo(depositInventorySummary.apiCoverageAvailable || depositSummary.apiCoverageAvailable)} |`,
     `| UI Coverage Available | ${blockedAwareBool(depositInventorySummary.uiCoverageAvailable, inventoryBlocked)} |`,
-    `| API Categories | ${blockedAwareCount(depositInventorySummary.apiCategories.length, inventoryBlocked)} |`,
+    `| API Categories | ${depositInventorySummary.apiCategories.length} |`,
     `| UI Categories | ${blockedAwareCount(depositInventorySummary.uiCategories.length, inventoryBlocked)} |`,
-    `| Methods Discovered | ${blockedAwareCount(depositSummary.discoveredCount, methodsBlocked)} |`,
-    `| Methods Checked | ${blockedAwareCount(depositSummary.checkedCount, methodsBlocked)} |`,
+    `| Methods Discovered | ${depositSummary.discoveredCount} |`,
+    `| Methods Checked | ${depositSummary.checkedCount} |`,
     `| Methods Ready | ${blockedAwareCount(depositSummary.readyCount, methodsBlocked)} |`,
     `| Submit Visible | ${blockedAwareBool(depositSummary.submitVisible, methodsBlocked)} |`,
     `| Submit Enabled | ${blockedAwareBool(depositSummary.submitEnabled, methodsBlocked)} |`,
@@ -1840,13 +2446,19 @@ const sidebarMd = sidebarSection
 let md = `# QA Report - ${brandName}\n\n`;
 md += `Generated: ${generatedAt}\n\n`;
 md += `Brand: ${brandName}\n\n`;
+md += `Platform: **${platformLabel}**\n\n`;
 md += `Run status: **${runStatus}**\n\n`;
-if (includeReportGuide) {
-  md += renderReportGuideMd();
-  md += '\n';
-}
-md += '## Highlights\n\n';
-md += renderSectionIntroMd('Highlights');
+md += '## Quality Gate\n\n';
+md += `**Decision: ${qualityGate.verdict}**\n\n`;
+md += `${qualityGate.summary}\n\n`;
+md += '| Decision input | Result |\n';
+md += '| --- | --- |\n';
+md += `| Hard failures | ${Math.max(0, effectiveFailedCount)} |\n`;
+md += `| KPI verdict | ${escapeMdCell(formatKpiVerdict(kpiValidation))} |\n`;
+md += `| Blocked signals | ${signalTotals.blocked} |\n`;
+md += `| Test infrastructure timeouts | ${signalTotals.testInfraTimeout} |\n`;
+md += `| Strict clean evidence | ${signalTotals.strictClean}/${totals.total} |\n\n`;
+md += '### Key Findings\n\n';
 if (quickHighlights.length) {
   for (const item of quickHighlights) {
     md += `- ${item}\n`;
@@ -1855,12 +2467,42 @@ if (quickHighlights.length) {
   md += '- No run highlights available.\n';
 }
 md += '\n';
-md += '## Summary\n\n';
-md += renderSectionIntroMd('Summary');
+md += '## Previous Run Comparison\n\n';
+if (previousRun) {
+  md += `Previous run: ${escapeMdCell(previousRun.timestamp || previousRun.runId || '-')}\n\n`;
+  md += '| Metric | Current | Previous | Delta |\n';
+  md += '| --- | --- | --- | --- |\n';
+  for (const item of comparisonMetrics) {
+    md += `| ${escapeMdCell(item.label)} | ${escapeMdCell(item.current)} | ${escapeMdCell(
+      Number.isFinite(Number(item.previous)) ? item.previous : '-'
+    )} | ${escapeMdCell(formatSignedNumber(item.delta))} |\n`;
+  }
+  md += '\n';
+  md +=
+    'Deltas show classification changes as well as real product changes; review the issue categories before interpreting them as improvement or regression.\n\n';
+} else {
+  md += 'No earlier comparable run was found for this brand and platform.\n\n';
+}
+md += '## Issue Categories\n\n';
+md += '| Category | Count | Severity | Meaning | Next action |\n';
+md += '| --- | --- | --- | --- | --- |\n';
+for (const item of issueCategories) {
+  md += `| ${escapeMdCell(item.category)} | ${item.count} | ${escapeMdCell(
+    item.severity
+  )} | ${escapeMdCell(item.meaning)} | ${escapeMdCell(item.action)} |\n`;
+}
+md +=
+  '\nCounts are diagnostic signals and may overlap; they must not be added together as unique failed tests.\n\n';
+md += '## Run Overview\n\n';
 md += '| Metric | Value |\n';
 md += '| --- | --- |\n';
 md += `| Total | ${totals.total} |\n`;
-md += `| Passed | ${totals.passed} |\n`;
+md += `| Raw Playwright Passed/Completed | ${totals.passed} |\n`;
+md += `| Strict Clean Functional Evidence | ${signalTotals.strictClean} |\n`;
+md += `| Strict Clean Evidence Ratio | ${formatPercent(
+  Number(signalTotals.strictClean || 0) / Math.max(1, Number(totals.total || 0)),
+  1
+)} |\n`;
 md += `| Failed | ${totals.failed} |\n`;
 md += `| Skipped | ${totals.skipped} |\n`;
 md += `| Flaky | ${totals.flaky} |\n`;
@@ -1868,22 +2510,63 @@ md += `| Blocked Signals | ${signalTotals.blocked} |\n`;
 md += `| Blocked Ratio | ${formatPercent(blockedRatio, 1)} |\n`;
 md += `| Failed Ratio | ${formatPercent(failedRatio, 1)} |\n`;
 md += `| Infra Blocked Signals | ${signalTotals.infraBlocked} |\n`;
+md += `| Test Infra Timeouts | ${signalTotals.testInfraTimeout} |\n`;
 md += `| Product Blocked Signals | ${signalTotals.productBlocked} |\n`;
+md += `| Product Warning Signals | ${signalTotals.productWarnings} |\n`;
 md += `| N/A Signals | ${signalTotals.notApplicable} |\n`;
 md += `| Partial Coverage Signals | ${signalTotals.partial} |\n`;
-md += `| Retried Signals | ${signalTotals.retried} |\n`;
+md += `| Test-level Retried Signals | ${signalTotals.retried} |\n`;
+md += `| Orchestration Attempts | ${executionAttempts.length || '-'} |\n`;
+md += `| Playwright Attempts | ${orchestrationPlaywrightAttempts || '-'} |\n`;
+md += `| storageState Refresh Attempts | ${orchestrationStorageStateAttempts} |\n`;
+md += `| Failed storageState Refresh Attempts | ${orchestrationStorageStateFailedAttempts} |\n`;
+md += `| Orchestration Retry Attempts | ${orchestrationRetryAttempts} |\n`;
+md += `| Failed Attempts Before Final Result | ${orchestrationFailedAttempts} |\n`;
+md += `| WAF-affected Attempts | ${orchestrationWafAttempts} |\n`;
+md += `| Recovered Phases | ${escapeMdCell(recoveredPhases.join(', ') || '-')} |\n`;
 md += `| Weak Surface Signals | ${signalTotals.weakSurface} |\n`;
 md += `| Provider Absent Signals | ${signalTotals.providerAbsent} |\n`;
-md += `| KPI Valid | ${kpiValidation ? yesNo(kpiValidation.valid) : 'N/A'} |\n`;
+md += `| KPI Verdict | ${escapeMdCell(formatKpiVerdict(kpiValidation))} |\n`;
 md += `| KPI Failed Checks | ${
   kpiValidation && Array.isArray(kpiValidation.failedChecks)
     ? kpiValidation.failedChecks.length
     : 'N/A'
 } |\n`;
+md += `| KPI Waived Unmet Checks | ${kpiWaivedChecks.length} |\n`;
+md += `| Registration Coverage State | ${escapeMdCell(registrationOutcome.coverageState)} |\n`;
 md += `| New Player Registered In This Run | ${yesNo(registrationOutcome.newPlayerRegisteredInRun)} |\n`;
 md += `| Manual Login Player Available | ${yesNo(registrationOutcome.manualLoginPlayerAvailable)} |\n`;
 md += `| Report Compact Mode | ${yesNo(reportCompactMode)} |\n`;
-md += `| Duration | ${formatDuration(durationMs)} |\n\n`;
+md += `| Final Phase Test Duration | ${formatDuration(durationMs)} |\n`;
+md += `| End-to-end Orchestration Duration | ${formatDuration(orchestrationDurationMs)} |\n\n`;
+
+md += '## Execution Steps & Statuses\n\n';
+md +=
+  'Каждый Scenario — выполненный автотест. Вложенные Playwright step — реальные шаги, записанные через `test.step`; для сценариев без такой инструментации внутренние шаги не выдумываются.\n\n';
+md += '| Metric | Value |\n';
+md += '| --- | --- |\n';
+md += `| Executed scenarios | ${tests.length} |\n`;
+md += `| Scenarios with explicit Playwright steps | ${testsWithExplicitSteps} |\n`;
+md += `| Explicit Playwright steps recorded | ${explicitStepCount} |\n`;
+md += `| Scenario PASSED | ${Number(scenarioStatusCounts.PASSED || 0)} |\n`;
+md += `| Scenario BLOCKED (all types) | ${
+  executionStepRows.filter(
+    (item) => item.type === 'Scenario' && /BLOCKED|TEST INFRA/.test(item.status)
+  ).length
+} |\n`;
+md += `| Scenario PARTIAL | ${Number(scenarioStatusCounts.PARTIAL || 0)} |\n`;
+md += `| Scenario N/A | ${Number(scenarioStatusCounts['N/A'] || 0)} |\n\n`;
+md += '| # | Phase | Section | Type | Step / Scenario | Status | Duration | Flags / Error |\n';
+md += '| --- | --- | --- | --- | --- | --- | --- | --- |\n';
+for (const item of executionStepRows) {
+  const title = `${item.depth > 0 ? `${'↳ '.repeat(item.depth)}` : ''}${item.title}`;
+  md += `| ${item.number || ''} | ${escapeMdCell(item.phase)} | ${escapeMdCell(
+    item.section
+  )} | ${escapeMdCell(item.type)} | ${escapeMdCell(title)} | ${escapeMdCell(
+    item.status
+  )} | ${escapeMdCell(formatDuration(item.duration))} | ${escapeMdCell(item.flags)} |\n`;
+}
+md += '\n';
 
 if (mobileStabilityMd) {
   md += mobileStabilityMd;
@@ -2030,27 +2713,77 @@ if (registrationNetwork) {
   );
 }
 
+if (includeReportGuide) {
+  md += renderReportGuideMd();
+  md += '\n';
+}
+
+const comparisonRowsHtml = previousRun
+  ? comparisonMetrics
+      .map((item) => {
+        const deltaClass =
+          item.delta === 0 || item.delta == null || item.lowerIsBetter == null
+            ? 'delta-neutral'
+            : item.delta < 0 === item.lowerIsBetter
+              ? 'delta-good'
+              : 'delta-bad';
+        return `
+          <tr>
+            <td>${escapeHtml(item.label)}</td>
+            <td>${escapeHtml(item.current)}</td>
+            <td>${escapeHtml(Number.isFinite(Number(item.previous)) ? item.previous : '-')}</td>
+            <td class="${deltaClass}">${escapeHtml(formatSignedNumber(item.delta))}</td>
+          </tr>`;
+      })
+      .join('')
+  : '';
+const issueCategoryRowsHtml = issueCategories
+  .map(
+    (item) => `
+      <tr>
+        <td>${escapeHtml(item.category)}</td>
+        <td>${item.count}</td>
+        <td>${escapeHtml(item.severity)}</td>
+        <td>${escapeHtml(item.meaning)}</td>
+        <td>${escapeHtml(item.action)}</td>
+      </tr>`
+  )
+  .join('');
+const executionStepRowsHtml = executionStepRows
+  .map((item) => {
+    const statusClass =
+      item.status === 'PASSED'
+        ? 'step-passed'
+        : item.status === 'FAILED'
+          ? 'step-failed'
+          : item.status === 'PARTIAL' || item.status === 'N/A' || item.status === 'SKIPPED'
+            ? 'step-partial'
+            : 'step-blocked';
+    const indent = Math.max(0, Number(item.depth || 0));
+    return `
+      <tr class="${statusClass}">
+        <td>${escapeHtml(item.number || '')}</td>
+        <td>${escapeHtml(item.phase)}</td>
+        <td>${escapeHtml(item.type)}</td>
+        <td><span class="step-title" style="padding-left:${indent * 12}px">${
+          indent > 0 ? '↳ ' : ''
+        }${escapeHtml(item.title)}</span></td>
+        <td><span class="step-status">${escapeHtml(item.status)}</span></td>
+        <td>${escapeHtml(formatDuration(item.duration))}</td>
+        <td>${escapeHtml(item.flags)}</td>
+      </tr>`;
+  })
+  .join('');
 const summaryCardsHtml = [
-  { label: 'Run Status', value: runStatus },
-  { label: 'KPI Valid', value: kpiValidation ? yesNo(kpiValidation.valid) : 'N/A' },
-  { label: 'Total', value: totals.total },
-  { label: 'Passed', value: totals.passed },
-  { label: 'Failed', value: totals.failed },
-  { label: 'Skipped', value: totals.skipped },
-  { label: 'Flaky', value: totals.flaky },
+  { label: 'Decision', value: qualityGate.verdict },
+  { label: 'KPI Verdict', value: formatKpiVerdict(kpiValidation) },
+  { label: 'Tests', value: totals.total },
+  { label: 'Hard Failures', value: Math.max(0, effectiveFailedCount) },
+  { label: 'Clean Evidence', value: `${signalTotals.strictClean}/${totals.total}` },
   { label: 'Blocked Signals', value: signalTotals.blocked },
-  { label: 'Blocked Ratio', value: formatPercent(blockedRatio, 1) },
-  { label: 'Failed Ratio', value: formatPercent(failedRatio, 1) },
-  { label: 'Infra Blocked', value: signalTotals.infraBlocked },
-  { label: 'Product Blocked', value: signalTotals.productBlocked },
-  { label: 'N/A Signals', value: signalTotals.notApplicable },
-  { label: 'Partial Signals', value: signalTotals.partial },
-  { label: 'Retried Signals', value: signalTotals.retried },
-  { label: 'New Player Registered', value: yesNo(registrationOutcome.newPlayerRegisteredInRun) },
-  { label: 'Manual Login Player', value: yesNo(registrationOutcome.manualLoginPlayerAvailable) },
-  { label: 'Compact Mode', value: yesNo(reportCompactMode) },
-  { label: 'Duration', value: formatDuration(durationMs) },
-  { label: 'Phases', value: phaseSummary.length },
+  { label: 'Test Infra Timeouts', value: signalTotals.testInfraTimeout },
+  { label: 'Not Applicable', value: signalTotals.notApplicable },
+  { label: 'End-to-end Duration', value: formatDuration(orchestrationDurationMs) },
 ]
   .map(
     (item) =>
@@ -2063,8 +2796,11 @@ const highlightsHtml = quickHighlights.length
       .join('')}</ul>`
   : '<p class="muted">No run highlights available.</p>';
 const reportTocItems = [
-  { href: '#highlights', label: 'Highlights' },
-  { href: '#summary', label: 'Summary' },
+  { href: '#quality-gate', label: 'Quality Gate' },
+  { href: '#previous-run', label: 'Previous Run' },
+  { href: '#issue-categories', label: 'Issue Categories' },
+  { href: '#summary', label: 'Run Overview' },
+  { href: '#execution-steps', label: 'Steps & Statuses' },
   { href: '#mobile-stability', label: 'Mobile Stability' },
   { href: '#sections', label: 'Sections' },
   { href: '#registration-player', label: 'Registration & Player' },
@@ -2076,7 +2812,13 @@ const reportTocItems = [
   { href: '#live-chat', label: 'Live Chat' },
   { href: '#failed-tests', label: 'Failed Tests' },
   { href: '#registration-diagnostics', label: 'Registration Diagnostics' },
-];
+  { href: '#flag-legend', label: 'Flag Legend' },
+].filter(
+  (item) =>
+    (showMobileStability || item.href !== '#mobile-stability') &&
+    (failed.length > 0 || item.href !== '#failed-tests') &&
+    (!reportCompactMode || item.href !== '#registration-diagnostics')
+);
 const reportTocHtml = `
   <nav class="toc" aria-label="Report sections">
     ${reportTocItems
@@ -2165,12 +2907,7 @@ const sectionRowsHtml = sectionSummary
 
 const sectionBlocksHtml =
   sectionDetailRowsLimit <= 0
-    ? `
-      <section>
-        <h3>Section Details</h3>
-        <p class="muted">Detailed section rows are omitted in compact mode.</p>
-      </section>
-    `
+    ? ''
     : sectionDetails
         .map((section) => {
           const rows = section.detailTests
@@ -2251,7 +2988,11 @@ const providerMatrixHtml =
               label: 'Providers Discovered On Brand',
               value: providerMatrixSummary.providersDiscovered || '-',
             },
-            { label: 'Passed', value: providerMatrixSummary.passed },
+            {
+              label: 'Discovered But Not Launch-Tested',
+              value: providerMatrixSummary.discoveredUntested.length,
+            },
+            { label: 'Functional Passed', value: providerMatrixSummary.passed },
             { label: 'Passed Strong', value: providerMatrixSummary.passedStrong },
             { label: 'Passed Weak Surface', value: providerMatrixSummary.passedWeakSurface },
             { label: 'Blocked', value: providerMatrixSummary.blocked },
@@ -2260,7 +3001,19 @@ const providerMatrixHtml =
               label: 'Provider Launch Blocked',
               value: providerMatrixSummary.blockedProviderLaunch,
             },
+            {
+              label: 'Infrastructure WAF Blocked',
+              value: providerMatrixSummary.blockedInfraWaf,
+            },
             { label: 'Retried Recovered', value: providerMatrixSummary.retriedRecovered },
+            {
+              label: 'Providers With Optional Stage Timeout',
+              value: providerMatrixSummary.optionalStageTimeoutProviders,
+            },
+            {
+              label: 'Optional Stage Timeouts',
+              value: providerMatrixSummary.optionalStageTimeouts,
+            },
             { label: 'Rows In Report', value: providerMatrixResults.length },
             { label: 'Omitted Rows', value: providerMatrixOmitted },
           ]
@@ -2272,7 +3025,7 @@ const providerMatrixHtml =
             )
             .join('')}
         </div>
-        <table>
+        <table class="provider-table">
           <thead>
             <tr>
               <th>Provider</th>
@@ -2281,7 +3034,7 @@ const providerMatrixHtml =
               <th>Launch</th>
               <th>Surface</th>
               <th>Controls</th>
-              <th>Note</th>
+              <th>Примечание</th>
             </tr>
           </thead>
           <tbody>
@@ -2297,7 +3050,7 @@ const providerMatrixHtml =
                     <td>${escapeHtml(item.launchState || '-')}</td>
                     <td>${escapeHtml(item.gameSurface || '-')}</td>
                     <td>${escapeHtml(item.controlsClicked || 0)}</td>
-                    <td>${escapeHtml(normalizeReason(item.reason || '-') || '-')}</td>
+                    <td>${escapeHtml(translateProviderNote(item.reason || '-'))}</td>
                   </tr>
                 `
               )
@@ -2306,7 +3059,7 @@ const providerMatrixHtml =
               providerMatrixOmitted > 0
                 ? `
                   <tr>
-                    <td colspan="7" class="muted">Omitted ${providerMatrixOmitted} provider rows in compact report.</td>
+                    <td colspan="7" class="muted">В компактном отчёте скрыто строк провайдеров: ${providerMatrixOmitted}.</td>
                   </tr>
                 `
                 : ''
@@ -2353,8 +3106,9 @@ const depositCoverageHtml = (() => {
   const availableMethods = depositSummary.discoveredMethods.length
     ? depositSummary.discoveredMethods
     : depositSummary.checkedMethods;
-  const availableMethodsHtml = availableMethods.length
-    ? `
+  const availableMethodsHtml =
+    !reportCompactMode && availableMethods.length
+      ? `
         <h3>Available Deposit Methods</h3>
         <table>
           <thead>
@@ -2377,7 +3131,7 @@ const depositCoverageHtml = (() => {
           </tbody>
         </table>
       `
-    : '';
+      : '';
 
   return `
       <section id="deposit-coverage">
@@ -2391,9 +3145,8 @@ const depositCoverageHtml = (() => {
             { label: 'Blocked Reason', value: reasons || '-' },
             {
               label: 'API Coverage Available',
-              value: blockedAwareBool(
-                depositInventorySummary.apiCoverageAvailable,
-                inventoryBlocked
+              value: yesNo(
+                depositInventorySummary.apiCoverageAvailable || depositSummary.apiCoverageAvailable
               ),
             },
             {
@@ -2405,10 +3158,7 @@ const depositCoverageHtml = (() => {
             },
             {
               label: 'API Categories',
-              value: blockedAwareCount(
-                depositInventorySummary.apiCategories.length,
-                inventoryBlocked
-              ),
+              value: depositInventorySummary.apiCategories.length,
             },
             {
               label: 'UI Categories',
@@ -2419,11 +3169,11 @@ const depositCoverageHtml = (() => {
             },
             {
               label: 'Methods Discovered',
-              value: blockedAwareCount(depositSummary.discoveredCount, methodsBlocked),
+              value: depositSummary.discoveredCount,
             },
             {
               label: 'Methods Checked',
-              value: blockedAwareCount(depositSummary.checkedCount, methodsBlocked),
+              value: depositSummary.checkedCount,
             },
             {
               label: 'Methods Ready',
@@ -2448,7 +3198,7 @@ const depositCoverageHtml = (() => {
         </div>
         <div class="key-grid">
           <div class="key">API Categories (preview)</div><div class="val">${escapeHtml(
-            blockedAwareList(apiCategoriesPreview, inventoryBlocked)
+            apiCategoriesPreview.join(', ') || '-'
           )}</div>
           <div class="key">UI Categories (preview)</div><div class="val">${escapeHtml(
             blockedAwareList(uiCategoriesPreview, inventoryBlocked)
@@ -2474,31 +3224,50 @@ const authStateHealthHtml = authStateHealth
         <h2>Auth State Health</h2>
         ${renderSectionIntroHtml('Auth State Health')}
         <div class="summary-grid">
-          ${[
-            { label: 'Checked At', value: authStateHealth.checkedAt || '-' },
-            { label: 'Phase', value: authStateHealth.phase || '-' },
-            {
-              label: 'Max Age',
-              value: authStateHealth.maxAgeSec ? `${authStateHealth.maxAgeSec}s` : '-',
-            },
-            {
-              label: 'Selected Path',
-              value: authStateHealth.selectedPath ? toRelative(authStateHealth.selectedPath) : '-',
-            },
-            { label: 'Selected Fresh', value: yesNo(authStateHealth.selectedFresh) },
-            {
-              label: 'Selected Session Artifacts',
-              value: yesNo(authStateHealth.selectedHasSessionArtifacts),
-            },
-            {
-              label: 'Selected Cookies/Origins',
-              value: `${Number(authStateHealth.selectedCookiesCount || 0)}/${Number(
-                authStateHealth.selectedOriginsCount || 0
-              )}`,
-            },
-            { label: 'Refresh Triggered', value: yesNo(authStateHealth.refreshTriggered) },
-            { label: 'Healthy', value: yesNo(authStateHealth.healthy) },
-          ]
+          ${(reportCompactMode
+            ? [
+                { label: 'Healthy', value: yesNo(authStateHealth.healthy) },
+                { label: 'State Fresh', value: yesNo(authStateHealth.selectedFresh) },
+                {
+                  label: 'Session Artifacts',
+                  value: yesNo(authStateHealth.selectedHasSessionArtifacts),
+                },
+                {
+                  label: 'Cookies/Origins',
+                  value: `${Number(authStateHealth.selectedCookiesCount || 0)}/${Number(
+                    authStateHealth.selectedOriginsCount || 0
+                  )}`,
+                },
+                { label: 'Refresh Triggered', value: yesNo(authStateHealth.refreshTriggered) },
+              ]
+            : [
+                { label: 'Checked At', value: authStateHealth.checkedAt || '-' },
+                { label: 'Phase', value: authStateHealth.phase || '-' },
+                {
+                  label: 'Max Age',
+                  value: authStateHealth.maxAgeSec ? `${authStateHealth.maxAgeSec}s` : '-',
+                },
+                {
+                  label: 'Selected Path',
+                  value: authStateHealth.selectedPath
+                    ? toRelative(authStateHealth.selectedPath)
+                    : '-',
+                },
+                { label: 'Selected Fresh', value: yesNo(authStateHealth.selectedFresh) },
+                {
+                  label: 'Selected Session Artifacts',
+                  value: yesNo(authStateHealth.selectedHasSessionArtifacts),
+                },
+                {
+                  label: 'Selected Cookies/Origins',
+                  value: `${Number(authStateHealth.selectedCookiesCount || 0)}/${Number(
+                    authStateHealth.selectedOriginsCount || 0
+                  )}`,
+                },
+                { label: 'Refresh Triggered', value: yesNo(authStateHealth.refreshTriggered) },
+                { label: 'Healthy', value: yesNo(authStateHealth.healthy) },
+              ]
+          )
             .map(
               (item) =>
                 `<article class="card"><div class="label">${escapeHtml(
@@ -2557,13 +3326,14 @@ const kpiValidationHtml = kpiValidation
         <div class="summary-grid">
           ${[
             { label: 'Generated At', value: kpiValidation.generatedAt || '-' },
-            { label: 'Valid', value: yesNo(kpiValidation.valid) },
+            { label: 'Verdict', value: formatKpiVerdict(kpiValidation) },
             {
               label: 'Failed Checks',
               value: Array.isArray(kpiValidation.failedChecks)
                 ? kpiValidation.failedChecks.length
                 : 0,
             },
+            { label: 'Waived Unmet Checks', value: kpiWaivedChecks.length },
             {
               label: 'Blocked Ratio',
               value: formatPercent(
@@ -2591,11 +3361,10 @@ const kpiValidationHtml = kpiValidation
           <thead>
             <tr>
               <th>Check</th>
-              <th>Applicable</th>
               <th>Passed</th>
               <th>Actual</th>
               <th>Threshold</th>
-              <th>Detail</th>
+              ${reportCompactMode ? '' : '<th>Applicable</th><th>Detail</th>'}
             </tr>
           </thead>
           <tbody>
@@ -2604,18 +3373,23 @@ const kpiValidationHtml = kpiValidation
                 ? kpiValidation.checks
                     .map(
                       (item) => `
-                        <tr class="status-${item.passed ? 'passed' : 'failed'}">
+                        <tr class="status-${isKpiWaivedUnmet(item) ? 'skipped' : item.passed ? 'passed' : 'failed'}">
                           <td>${escapeHtml(item.label || item.id || '-')}</td>
-                          <td>${yesNo(item.applicable !== false)}</td>
-                          <td>${yesNo(item.passed)}</td>
+                          <td>${isKpiWaivedUnmet(item) ? 'Waived (unmet)' : yesNo(item.passed)}</td>
                           <td>${escapeHtml(item.actual)}</td>
                           <td>${escapeHtml(item.threshold)}</td>
-                          <td>${escapeHtml(oneLine(item.detail || '-') || '-')}</td>
+                          ${
+                            reportCompactMode
+                              ? ''
+                              : `<td>${yesNo(item.applicable !== false)}</td><td>${escapeHtml(
+                                  oneLine(item.detail || '-') || '-'
+                                )}</td>`
+                          }
                         </tr>
                       `
                     )
                     .join('')
-                : '<tr><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td><td>-</td></tr>'
+                : `<tr>${'<td>-</td>'.repeat(reportCompactMode ? 4 : 6)}</tr>`
             }
           </tbody>
         </table>
@@ -2756,13 +3530,46 @@ const registrationPlayerHtml = (() => {
     registrationOutcome.manualLoginPlayerEmail ||
     registrationOutcome.playerEmail ||
     '-';
-  const primaryPassword =
-    registrationOutcome.currentManualLoginPassword ||
-    (manualLoginPlayerData &&
-      (manualLoginPlayerData.password || manualLoginPlayerData.passwordMasked)) ||
-    (registrationData && (registrationData.password || registrationData.passwordMasked)) ||
-    '-';
+  const primaryPassword = registrationOutcome.currentManualLoginPassword || '-';
   const sourcePath = formatPathForDisplay(registration.path || manualLoginPlayerDataSource || '-');
+
+  if (reportCompactMode) {
+    const compactRows = [
+      ['Coverage State', registrationOutcome.coverageState],
+      ['Test Status', registrationOutcome.testStatus],
+      ['New Player Registered', yesNo(registrationOutcome.newPlayerRegisteredInRun)],
+      ['Manual Password Login Ready', yesNo(registrationOutcome.manualLoginReady)],
+      ['Login Validation', registrationOutcome.loginValidationStatus],
+      ['Email For Manual Login', primaryEmail],
+      ['Password For Manual Login', primaryPassword],
+      ['Player Generated At', registrationOutcome.playerGeneratedAt],
+    ];
+    if (
+      /blocked|failed|incomplete/i.test(registrationOutcome.coverageState || '') &&
+      registrationOutcome.blockedReason &&
+      registrationOutcome.blockedReason !== '-'
+    ) {
+      compactRows.push(['Blocked/Incomplete Reason', registrationOutcome.blockedReason]);
+    }
+    return `
+      <section id="registration-player">
+        <h2>Registration &amp; Player</h2>
+        ${renderSectionIntroHtml('Registration & Player')}
+        <div class="key-grid">
+          ${compactRows
+            .map(
+              ([key, value]) =>
+                `<div class="key">${escapeHtml(key)}</div><div class="val">${
+                  /Email|Password/.test(key)
+                    ? escapeCredentialHtml(value)
+                    : escapeHtml(value == null ? '-' : value)
+                }</div>`
+            )
+            .join('')}
+        </div>
+      </section>
+    `;
+  }
 
   return `
       <section id="registration-player">
@@ -2772,8 +3579,17 @@ const registrationPlayerHtml = (() => {
           <div class="key">Registration Test Present</div><div class="val">${escapeHtml(
             yesNo(registrationOutcome.testFound)
           )}</div>
+          <div class="key">Registration Coverage State</div><div class="val">${escapeHtml(
+            registrationOutcome.coverageState
+          )}</div>
           <div class="key">Registration Test Status</div><div class="val">${escapeHtml(
             registrationOutcome.testStatus
+          )}</div>
+          <div class="key">Registration Test Raw Status</div><div class="val">${escapeHtml(
+            registrationOutcome.rawTestStatus
+          )}</div>
+          <div class="key">Registration Blocked/Incomplete Reason</div><div class="val">${escapeHtml(
+            registrationOutcome.blockedReason
           )}</div>
           <div class="key">New Player Registered In This Run</div><div class="val">${escapeHtml(
             yesNo(registrationOutcome.newPlayerRegisteredInRun)
@@ -2790,11 +3606,23 @@ const registrationPlayerHtml = (() => {
           <div class="key">Login Validation At</div><div class="val">${escapeHtml(
             registrationOutcome.loginValidationAt
           )}</div>
+          <div class="key">Latest Login Attempt Status</div><div class="val">${escapeHtml(
+            registrationOutcome.lastLoginCheckStatus
+          )}</div>
+          <div class="key">Latest Login Attempt Method</div><div class="val">${escapeHtml(
+            registrationOutcome.lastLoginCheckMethod
+          )}</div>
+          <div class="key">Latest Login Attempt Reason</div><div class="val">${escapeHtml(
+            registrationOutcome.lastLoginCheckReason
+          )}</div>
+          <div class="key">Latest Login Attempt At</div><div class="val">${escapeHtml(
+            registrationOutcome.lastLoginCheckAt
+          )}</div>
           <div class="key">Manual Login Player Available</div><div class="val">${escapeHtml(
             yesNo(registrationOutcome.manualLoginPlayerAvailable)
           )}</div>
-          <div class="key">Email For Manual Login</div><div class="val">${escapeHtml(primaryEmail)}</div>
-          <div class="key">Password For Manual Login</div><div class="val">${escapeHtml(
+          <div class="key">Email For Manual Login</div><div class="val">${escapeCredentialHtml(primaryEmail)}</div>
+          <div class="key">Password For Manual Login</div><div class="val">${escapeCredentialHtml(
             primaryPassword
           )}</div>
           <div class="key">Player Generated At</div><div class="val">${escapeHtml(
@@ -2817,6 +3645,16 @@ function renderRegistrationNetworkHtml(network) {
   const consoleErrors = Array.isArray(network.consoleErrors) ? network.consoleErrors : [];
   const toastErrors = Array.isArray(network.toastErrors) ? network.toastErrors : [];
   const authResponses = Array.isArray(network.authResponses) ? network.authResponses : [];
+
+  if (
+    reportCompactMode &&
+    responseErrors.length === 0 &&
+    failedRequests.length === 0 &&
+    consoleErrors.length === 0 &&
+    toastErrors.length === 0
+  ) {
+    return '';
+  }
 
   const rowsFor = (items, mapRow) =>
     items.length
@@ -2928,7 +3766,14 @@ async function exportPdfFromHtml(htmlPath, pdfPath) {
       path: pdfPath,
       format: 'A4',
       printBackground: true,
-      margin: { top: '12mm', right: '10mm', bottom: '12mm', left: '10mm' },
+      displayHeaderFooter: true,
+      headerTemplate: `<div style="width:100%;padding:0 10mm;font:9px Arial,sans-serif;color:#667085;text-align:right;">${escapeHtml(
+        brandName
+      )} · ${escapeHtml(platformLabel)}</div>`,
+      footerTemplate: `<div style="width:100%;padding:0 10mm;font:9px Arial,sans-serif;color:#667085;display:flex;justify-content:space-between;"><span>${escapeHtml(
+        platformLabel
+      )}</span><span><span class="pageNumber"></span> / <span class="totalPages"></span></span></div>`,
+      margin: { top: '15mm', right: '10mm', bottom: '15mm', left: '10mm' },
     });
   } finally {
     await browser.close();
@@ -2940,7 +3785,7 @@ const html = `<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>QA Report - ${escapeHtml(brandName)}</title>
+    <title>QA Report - ${escapeHtml(brandName)} - ${escapeHtml(platformLabel)}</title>
     <style>
       :root {
         --bg: #f4f6f8;
@@ -3032,6 +3877,36 @@ const html = `<!doctype html>
         line-height: 1.6;
       }
 
+      .quality-gate {
+        border-left: 6px solid var(--warn);
+      }
+
+      .decision-row {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin-bottom: 14px;
+      }
+
+      .decision-badge {
+        display: inline-flex;
+        padding: 8px 14px;
+        border-radius: 999px;
+        font-size: 15px;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+        white-space: nowrap;
+      }
+
+      .decision-go { background: #dcf5ea; color: var(--ok); }
+      .decision-conditional { background: #fff3d7; color: #855f00; }
+      .decision-no-go { background: #fde4e4; color: var(--bad); }
+      .decision-summary { margin: 0; line-height: 1.55; }
+      .comparison-note { margin: 12px 0 0; color: var(--muted); font-size: 13px; }
+      .delta-good { color: var(--ok); font-weight: 700; }
+      .delta-bad { color: var(--bad); font-weight: 700; }
+      .delta-neutral { color: var(--muted); font-weight: 600; }
+
       .section-intro {
         margin: 0 0 14px;
         color: var(--muted);
@@ -3097,6 +3972,25 @@ const html = `<!doctype html>
 
       .muted { color: var(--muted); }
 
+      .platform-pill {
+        display: inline-flex;
+        margin-top: 10px;
+        padding: 5px 11px;
+        border-radius: 999px;
+        background: #e8f1ff;
+        color: #0059b8;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+      }
+
+      .compact #sidebar table,
+      .compact #live-chat table,
+      .compact #auth-state-health table {
+        display: none;
+      }
+
       .failure-list {
         display: grid;
         grid-template-columns: 1fr;
@@ -3155,6 +4049,53 @@ const html = `<!doctype html>
         background: #fbfdff;
       }
 
+      #sections th:first-child,
+      #sections td:first-child { width: 18%; }
+
+      .provider-table { font-size: 12px; }
+      .provider-table th,
+      .provider-table td { padding: 8px 7px; }
+      .provider-table th:nth-child(1) { width: 15%; }
+      .provider-table th:nth-child(2) { width: 13%; }
+      .provider-table th:nth-child(3) { width: 15%; }
+      .provider-table th:nth-child(4) { width: 14%; }
+      .provider-table th:nth-child(5) { width: 14%; }
+      .provider-table th:nth-child(6) { width: 10%; }
+      .provider-table th:nth-child(7) { width: 19%; }
+      .provider-table .badge {
+        padding: 3px 7px;
+        font-size: 10px;
+        white-space: nowrap;
+      }
+
+      #flag-legend { padding: 14px 18px; }
+      #flag-legend table { font-size: 12px; }
+      #flag-legend th,
+      #flag-legend td { padding: 7px 9px; line-height: 1.25; }
+
+      .steps-table { font-size: 10px; table-layout: fixed; }
+      .steps-table th,
+      .steps-table td { padding: 6px; line-height: 1.25; }
+      .steps-table th:nth-child(1) { width: 5%; }
+      .steps-table th:nth-child(2) { width: 9%; }
+      .steps-table th:nth-child(3) { width: 11%; }
+      .steps-table th:nth-child(4) { width: 42%; }
+      .steps-table th:nth-child(5) { width: 12%; }
+      .steps-table th:nth-child(6) { width: 9%; }
+      .steps-table th:nth-child(7) { width: 12%; }
+      .step-title { display: block; }
+      .step-status {
+        display: inline-block;
+        border-radius: 999px;
+        padding: 2px 5px;
+        font-size: 9px;
+        font-weight: 700;
+      }
+      .step-passed .step-status { background: #dcf5ea; color: var(--ok); }
+      .step-failed .step-status { background: #fde4e4; color: var(--bad); }
+      .step-blocked .step-status { background: #fff3d7; color: #855f00; }
+      .step-partial .step-status { background: #e8edf3; color: #4d5b68; }
+
       code {
         background: #edf2f7;
         border-radius: 6px;
@@ -3202,12 +4143,30 @@ const html = `<!doctype html>
           padding: 8px;
         }
       }
+
+      @media print {
+        body { background: #ffffff; }
+        .container { max-width: none; padding: 0; }
+        header, section { box-shadow: none; }
+        #quality-gate,
+        #registration-player,
+        #deposit-coverage,
+        #auth-state-health,
+        #sidebar,
+        #live-chat,
+        #failed-tests { break-inside: avoid-page; }
+        h1, h2, h3 { break-after: avoid-page; }
+        tr, .card, .failure-card { break-inside: avoid-page; }
+        thead { display: table-header-group; }
+        a { color: var(--text); }
+      }
     </style>
   </head>
-  <body>
+  <body class="${reportCompactMode ? 'compact' : 'full'}">
     <div class="container">
       <header>
         <h1>QA Report - ${escapeHtml(brandName)}</h1>
+        <div class="platform-pill">Platform: ${escapeHtml(platformLabel)}</div>
         <div class="meta">Generated: ${escapeHtml(generatedAt)}</div>
         <div class="status-line">Run status: <span class="badge ${runStatusBadgeClass(
           runStatus
@@ -3216,18 +4175,99 @@ const html = `<!doctype html>
 
       ${reportTocHtml}
 
-      ${includeReportGuide ? renderReportGuideHtml() : ''}
-
-      <section id="highlights">
-        <h2>Highlights</h2>
-        ${renderSectionIntroHtml('Highlights')}
+      <section id="quality-gate" class="quality-gate">
+        <h2>Quality Gate</h2>
+        <div class="decision-row">
+          <span class="decision-badge ${qualityGate.cssClass}">${escapeHtml(
+            qualityGate.verdict
+          )}</span>
+          <p class="decision-summary">${escapeHtml(qualityGate.summary)}</p>
+        </div>
+        <div class="summary-grid">
+          ${[
+            { label: 'Hard Failures', value: Math.max(0, effectiveFailedCount) },
+            { label: 'KPI Verdict', value: formatKpiVerdict(kpiValidation) },
+            { label: 'Blocked Signals', value: signalTotals.blocked },
+            { label: 'Test Infra Timeouts', value: signalTotals.testInfraTimeout },
+            {
+              label: 'Strict Clean Evidence',
+              value: `${signalTotals.strictClean}/${totals.total}`,
+            },
+          ]
+            .map(
+              (item) =>
+                `<article class="card"><div class="label">${escapeHtml(
+                  item.label
+                )}</div><div class="value">${escapeHtml(item.value)}</div></article>`
+            )
+            .join('')}
+        </div>
+        <h3 style="margin-top:16px">Key Findings</h3>
         ${highlightsHtml}
       </section>
 
+      <section id="previous-run">
+        <h2>Previous Run Comparison</h2>
+        ${
+          previousRun
+            ? `<p class="section-intro">Compared with ${escapeHtml(
+                previousRun.timestamp || previousRun.runId || '-'
+              )}.</p>
+        <table>
+          <thead><tr><th>Metric</th><th>Current</th><th>Previous</th><th>Delta</th></tr></thead>
+          <tbody>${comparisonRowsHtml}</tbody>
+        </table>
+        <p class="comparison-note">Deltas show classification changes as well as real product changes; review the issue categories before interpreting them as improvement or regression.</p>`
+            : '<p class="muted">No earlier comparable run was found for this brand and platform.</p>'
+        }
+      </section>
+
+      <section id="issue-categories">
+        <h2>Issue Categories</h2>
+        <table>
+          <thead><tr><th>Category</th><th>Count</th><th>Severity</th><th>Meaning</th><th>Next action</th></tr></thead>
+          <tbody>${issueCategoryRowsHtml}</tbody>
+        </table>
+        <p class="comparison-note">Counts are diagnostic signals and may overlap; they must not be added together as unique failed tests.</p>
+      </section>
+
       <section id="summary">
-        <h2>Summary</h2>
-        ${renderSectionIntroHtml('Summary')}
+        <h2>Run Overview</h2>
         <div class="summary-grid">${summaryCardsHtml}</div>
+      </section>
+
+      <section id="execution-steps">
+        <h2>Execution Steps &amp; Statuses</h2>
+        <p class="section-intro">Каждый Scenario — выполненный автотест. Вложенные Playwright step — реальные шаги, записанные через <code>test.step</code>; отсутствующие внутренние шаги не реконструируются и не выдумываются.</p>
+        <div class="summary-grid">
+          ${[
+            { label: 'Executed Scenarios', value: tests.length },
+            { label: 'Scenarios With Explicit Steps', value: testsWithExplicitSteps },
+            { label: 'Explicit Steps Recorded', value: explicitStepCount },
+            { label: 'Scenario Passed', value: Number(scenarioStatusCounts.PASSED || 0) },
+            {
+              label: 'Scenario Blocked',
+              value: executionStepRows.filter(
+                (item) => item.type === 'Scenario' && /BLOCKED|TEST INFRA/.test(item.status)
+              ).length,
+            },
+            { label: 'Scenario Partial', value: Number(scenarioStatusCounts.PARTIAL || 0) },
+            { label: 'Scenario N/A', value: Number(scenarioStatusCounts['N/A'] || 0) },
+          ]
+            .map(
+              (item) =>
+                `<article class="card"><div class="label">${escapeHtml(
+                  item.label
+                )}</div><div class="value">${escapeHtml(item.value)}</div></article>`
+            )
+            .join('')}
+        </div>
+        <table class="steps-table">
+          <thead>
+            <tr><th>#</th><th>Phase</th><th>Type</th><th>Step / Scenario</th><th>Status</th><th>Duration</th><th>Flags / Error</th></tr>
+          </thead>
+          <tbody>${executionStepRowsHtml}</tbody>
+        </table>
       </section>
 
       ${mobileStabilityHtml}
@@ -3270,13 +4310,19 @@ const html = `<!doctype html>
 
       ${liveChatHtml}
 
-      <section id="failed-tests">
+      ${
+        failed.length
+          ? `<section id="failed-tests">
         <h2>Failed Tests</h2>
         ${renderSectionIntroHtml('Failed Tests')}
         <div class="failure-list">${failedCardsHtml}</div>
-      </section>
+      </section>`
+          : ''
+      }
 
       ${renderRegistrationNetworkHtml(registrationNetwork)}
+
+      ${includeReportGuide ? renderReportGuideHtml() : ''}
     </div>
   </body>
 </html>`;

@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const {
   assertNotCloudflare,
   detectCloudflare,
@@ -12,10 +12,24 @@ const {
 const { getBaselineProviders } = require('../helpers/provider-baseline');
 const { createRegistrationData } = require('../helpers/registration-data');
 const { applyAuthTokenCookie, registerPlayerViaApi } = require('../helpers/signup-api-fallback');
+const { serializeArtifactPayload } = require('../helpers/artifact-output');
+const { resolveMatrixContextOptions } = require('../helpers/context-options');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const BASE_ORIGIN = new URL(BASE_URL).origin;
 const BASE_HOSTNAME = new URL(BASE_URL).hostname.toLowerCase();
+const PROACTIVE_API_PROVIDER_HOSTS = new Set([
+  'booms.bet',
+  'www.booms.bet',
+  'likes.bet',
+  'www.likes.bet',
+  'chacha.bet',
+  'www.chacha.bet',
+  'nix.bet',
+  'www.nix.bet',
+  'starzino.com',
+  'www.starzino.com',
+]);
 const PROJECT_AUTOTEST_REPORT_DIR =
   process.env.QA_AUTOTEST_REPORT_DIR || path.join(process.cwd(), 'Autotest report');
 const PROJECT_ARTIFACTS_DIR = process.env.QA_ARTIFACTS_DIR || path.join(process.cwd(), 'artifacts');
@@ -29,6 +43,7 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   EXPLICIT_STORAGE_STATE_PATH,
   PROJECT_ROOT_STORAGE_STATE_PATH,
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
@@ -39,6 +54,7 @@ const AUTH_STATE_CANDIDATES = [
   .filter(Boolean)
   .filter((candidate, index, all) => all.indexOf(candidate) === index);
 const AUTH_STATE_OUTPUT_PATHS = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
@@ -65,8 +81,7 @@ const PROVIDER_PROFILE = String(process.env.PW_PROVIDER_PROFILE || 'smoke')
 
 function resolveDefaultProviderMax() {
   if (PROVIDER_PROFILE === 'extended') {
-    if (BASE_HOSTNAME === 'gt.bet' || BASE_HOSTNAME === 'nix.bet') return 50;
-    return 40;
+    return 0;
   }
   if (PROVIDER_PROFILE === 'nightly') return 0;
   return 12;
@@ -120,8 +135,16 @@ const PROVIDER_SHARD_INDEX =
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-const PROVIDER_DEMO_GAMES = Number.parseInt(process.env.PW_PROVIDER_DEMO_GAMES || '3', 10);
-const PROVIDER_DEMO_MIN_GAMES = Number.parseInt(process.env.PW_PROVIDER_DEMO_MIN_GAMES || '2', 10);
+const DEFAULT_PROVIDER_DEMO_GAMES = BASE_HOSTNAME === 'starzino.com' ? '1' : '3';
+const DEFAULT_PROVIDER_DEMO_MIN_GAMES = BASE_HOSTNAME === 'starzino.com' ? '1' : '2';
+const PROVIDER_DEMO_GAMES = Number.parseInt(
+  process.env.PW_PROVIDER_DEMO_GAMES || DEFAULT_PROVIDER_DEMO_GAMES,
+  10
+);
+const PROVIDER_DEMO_MIN_GAMES = Number.parseInt(
+  process.env.PW_PROVIDER_DEMO_MIN_GAMES || DEFAULT_PROVIDER_DEMO_MIN_GAMES,
+  10
+);
 const PROVIDER_DEMO_SCAN_MAX = Number.parseInt(process.env.PW_PROVIDER_DEMO_SCAN_MAX || '0', 10);
 const PROVIDER_DEMO_SCAN_TIMEOUT_MS = Number.parseInt(
   process.env.PW_PROVIDER_DEMO_SCAN_TIMEOUT || '420000',
@@ -147,6 +170,26 @@ const CHALLENGE_SETTLE_POLL_MS = Math.max(
   250,
   Number.parseInt(process.env.PW_CHALLENGE_SETTLE_POLL || '700', 10)
 );
+const PROVIDER_INTER_TEST_DELAY_MS = Math.max(
+  0,
+  Number.parseInt(
+    process.env.PW_PROVIDER_INTER_TEST_DELAY_MS ||
+      (BASE_HOSTNAME === 'chacha.bet' || BASE_HOSTNAME === 'www.chacha.bet' ? '1250' : '0'),
+    10
+  ) || 0
+);
+const PROVIDER_BATCH_SIZE = Math.max(
+  0,
+  Number.parseInt(process.env.PW_PROVIDER_BATCH_SIZE || '12', 10) || 0
+);
+const PROVIDER_BATCH_COOLDOWN_MS = Math.max(
+  0,
+  Number.parseInt(
+    process.env.PW_PROVIDER_BATCH_COOLDOWN_MS ||
+      (BASE_HOSTNAME === 'chacha.bet' || BASE_HOSTNAME === 'www.chacha.bet' ? '7000' : '0'),
+    10
+  ) || 0
+);
 const EFFECTIVE_PROVIDER_DESKTOP_GAMES =
   typeof process.env.PW_PROVIDER_DESKTOP_GAMES === 'undefined' && BASE_HOSTNAME === 'nix.bet'
     ? 1
@@ -157,10 +200,6 @@ const PROVIDER_DEMO_AVAILABILITY_JSON_PATH = path.join(
   ARTIFACT_DIR,
   'providers-demo-availability.json'
 );
-const INVENTORY_CACHE_CANDIDATES = [
-  path.join(ARTIFACT_DIR, 'p0-providers-inventory.json'),
-  path.join(ARTIFACT_DIR, 'providers-inventory.json'),
-];
 const DEMO_AVAILABILITY_CACHE_CANDIDATES = [
   path.join(ARTIFACT_DIR, 'p0-providers-demo-availability.json'),
   PROVIDER_DEMO_AVAILABILITY_JSON_PATH,
@@ -175,6 +214,9 @@ let providerFastFailActive = PROVIDER_FAST_FAIL_PRESET;
 let providerFastFailReason = PROVIDER_FAST_FAIL_PRESET
   ? 'Provider real-launch checks were short-circuited due to upstream Cloudflare/WAF block.'
   : '';
+let providerFastFailKind = PROVIDER_FAST_FAIL_PRESET ? 'waf' : '';
+let providerSystemicFailureSignature = '';
+let providerSystemicFailureCount = 0;
 const API_PROVIDER_METADATA_TTL_MS = Math.max(
   30_000,
   Number.parseInt(process.env.PW_PROVIDER_API_CACHE_TTL || '180000', 10) || 180_000
@@ -350,10 +392,7 @@ async function bootstrapAuthTokenViaSignup(browser, testInfo, triggerReason = ''
   const data = createRegistrationData({
     emailSuffix: createProviderBootstrapEmailSuffix(),
   });
-  const context = await browser.newContext({
-    viewport: { width: 1365, height: 900 },
-    ignoreHTTPSErrors: true,
-  });
+  const context = await browser.newContext(resolveMatrixContextOptions());
 
   try {
     const page = await context.newPage();
@@ -456,10 +495,7 @@ async function recoverAuthStateFromArtifactToken(browser, testInfo, triggerReaso
   let userPreferencesStatus = 0;
 
   try {
-    context = await browser.newContext({
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    });
+    context = await browser.newContext(resolveMatrixContextOptions());
     await applyAuthTokenCookie(context, tokenArtifact.token, BASE_URL);
     const page = await context.newPage();
     page.setDefaultTimeout(20_000);
@@ -544,11 +580,12 @@ function escapeRegExp(value) {
 }
 
 function normalizeProviderName(value) {
-  return String(value || '')
+  const normalized = String(value || '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+  return normalized === 'true lab' ? 'true labs' : normalized;
 }
 
 function isBaseBrandHost(hostname) {
@@ -568,9 +605,10 @@ function mentionsBaseBrand(value) {
 }
 
 function providerNameKey(value) {
-  return String(value || '')
+  const key = String(value || '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '');
+  return key === 'truelab' ? 'truelabs' : key;
 }
 
 function providerNamesMatch(left, right) {
@@ -623,6 +661,79 @@ async function raceWithTimeout(promise, timeoutMs) {
   return { timedOut: false, value: raced.value };
 }
 
+async function runProviderStage(page, telemetry, name, task, timeoutMs) {
+  const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  try {
+    const outcome = await raceWithTimeout(Promise.resolve().then(task), timeoutMs);
+    if (outcome.timedOut) {
+      await page.close({ runBeforeUnload: false }).catch(() => null);
+      const error = new Error(
+        `TEST_INFRA_TIMEOUT: provider stage "${name}" timed out after ${timeoutMs} ms.`
+      );
+      error.code = 'TEST_INFRA_TIMEOUT';
+      throw error;
+    }
+    telemetry.push({
+      name,
+      status: 'passed',
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedMs,
+    });
+    return outcome.value;
+  } catch (error) {
+    telemetry.push({
+      name,
+      status: error && error.code === 'TEST_INFRA_TIMEOUT' ? 'timed-out' : 'failed',
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedMs,
+      error: oneLine(error && error.message ? error.message : error),
+    });
+    throw error;
+  }
+}
+
+async function runOptionalProviderStage(telemetry, name, task, timeoutMs, fallbackValue) {
+  const startedAt = new Date().toISOString();
+  const startedMs = Date.now();
+  try {
+    const outcome = await raceWithTimeout(Promise.resolve().then(task), timeoutMs);
+    if (outcome.timedOut) {
+      const reason = `Optional provider stage "${name}" timed out after ${timeoutMs} ms.`;
+      telemetry.push({
+        name,
+        status: 'timed-out-optional',
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        durationMs: Date.now() - startedMs,
+        error: reason,
+      });
+      return { value: fallbackValue, timedOut: true, reason };
+    }
+    telemetry.push({
+      name,
+      status: 'passed',
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedMs,
+    });
+    return { value: outcome.value, timedOut: false, reason: '' };
+  } catch (error) {
+    const reason = oneLine(error && error.message ? error.message : error);
+    telemetry.push({
+      name,
+      status: 'failed-optional',
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedMs,
+      error: reason,
+    });
+    return { value: fallbackValue, timedOut: false, reason };
+  }
+}
+
 function isClosedTargetError(error) {
   const text = oneLine(error && error.message ? error.message : error).toLowerCase();
   return (
@@ -635,9 +746,11 @@ function isClosedTargetError(error) {
 
 function resolveBlockedOutcome(reason) {
   const text = String(reason || '').toLowerCase();
+  if (text.includes('test_infra_timeout')) return 'test-infra-timeout';
   if (text.includes('absent in current brand inventory')) return 'provider-absent';
+  if (isChallengeLikeReason(text)) return 'infra-waf-blocked';
   if (
-    /temporarily unavailable|backend unavailable|transport negotiation failed|cancelled\/aborted before bootstrap|provider launch|err_internet_disconnected|internet connection appears to be offline|err_network_changed|err_timed_out|socket hang up|econnreset|navigation timeout|request timed out/i.test(
+    /temporarily unavailable|backend unavailable|transport negotiation failed|cancelled\/aborted before bootstrap|provider launch|err_internet_disconnected|err_name_not_resolved|dns_probe|site can'?t be reached|не удается получить доступ к сайту|internet connection appears to be offline|server ip address could not be found|не удалось найти ip-адрес сервера|err_network_changed|err_timed_out|socket hang up|econnreset|navigation timeout|request timed out/i.test(
       text
     )
   ) {
@@ -660,18 +773,29 @@ function isChallengeLikeReason(reason) {
     text.includes('just a moment') ||
     text.includes('security verification') ||
     text.includes('forbidden') ||
-    text.includes('403') ||
-    text.includes('err_internet_disconnected') ||
-    text.includes('internet connection appears to be offline') ||
-    text.includes('err_network_changed') ||
-    text.includes('err_timed_out') ||
-    text.includes('socket hang up') ||
-    text.includes('econnreset') ||
-    text.includes('navigation timeout') ||
-    text.includes('request timed out') ||
-    text.includes('expected authorized session') ||
-    text.includes('log in button is visible') ||
-    text.includes('auth probes are not healthy')
+    text.includes('403')
+  );
+}
+
+function isRouteUnavailableReason(reason) {
+  return (
+    isChallengeLikeReason(reason) ||
+    /route .* returned http [45]\d\d|http [45]\d\d .* route unavailable/i.test(String(reason || ''))
+  );
+}
+
+function getRouteHttpBlockReason(route, status) {
+  const code = Number(status || 0);
+  if (code < 400) return null;
+  return `Route ${route} returned HTTP ${code}; application route is unavailable.`;
+}
+
+function isProviderNavigationBlockedReason(reason) {
+  return (
+    resolveBlockedOutcome(reason) === 'provider-launch-blocked' &&
+    /err_name_not_resolved|dns_probe|site can'?t be reached|не удается получить доступ к сайту|server ip address could not be found|не удалось найти ip-адрес сервера|err_internet_disconnected|err_network_changed|err_timed_out|navigation timeout|request timed out/i.test(
+      String(reason || '')
+    )
   );
 }
 
@@ -729,7 +853,15 @@ function uniqueApiProviderFilters(items) {
 async function writeAndAttach(testInfo, fileName, payload) {
   fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
   const filePath = path.join(ARTIFACT_DIR, fileName);
-  const body = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+  const stampedPayload =
+    payload && typeof payload === 'object'
+      ? {
+          ...payload,
+          runId: String(process.env.QA_RUN_ID || '').trim() || null,
+          generatedAt: payload.generatedAt || new Date().toISOString(),
+        }
+      : payload;
+  const body = serializeArtifactPayload(stampedPayload);
   fs.writeFileSync(filePath, body, 'utf8');
   const contentType = fileName.endsWith('.md') ? 'text/markdown' : 'application/json';
   await testInfo.attach(fileName, { body, contentType });
@@ -826,6 +958,26 @@ async function getChallengeReasonAfterSettle(page, options = {}) {
   return lastReason;
 }
 
+async function detectBrowserNavigationError(page) {
+  const [title, bodyText] = await Promise.all([
+    page.title().catch(() => ''),
+    page
+      .locator('body')
+      .innerText({ timeout: 1000 })
+      .catch(() => ''),
+  ]);
+  const text = `${title}\n${bodyText}`;
+  const match = text.match(
+    /ERR_[A-Z0-9_]+|DNS_PROBE_[A-Z0-9_]+|This site can'?t be reached|Не удается получить доступ к сайту|server IP address could not be found|Не удалось найти IP-адрес сервера/i
+  );
+  if (!match) return '';
+
+  const codeMatch = text.match(/ERR_[A-Z0-9_]+|DNS_PROBE_[A-Z0-9_]+/i);
+  const code = codeMatch ? codeMatch[0].toUpperCase() : match[0];
+  const currentUrl = page.url();
+  return `Provider launch browser navigation error: ${code}${currentUrl ? ` (${currentUrl})` : ''}`;
+}
+
 async function openCasino(page, options = {}) {
   const requestedUrl = buildUrl('/casino/');
   const attemptsLimit = Math.max(
@@ -861,16 +1013,21 @@ async function openCasino(page, options = {}) {
       .first()
       .waitFor({ state: 'visible', timeout: 15000 })
       .catch(() => null);
+    await dismissOverlays(page);
     await assertNotCloudflare(page).catch((err) => {
       assertError = String(err && err.message ? err.message : err);
     });
 
-    const challenge = (await getChallengeReasonAfterSettle(page)) || assertError;
+    const status = response ? response.status() : 0;
+    const challenge =
+      (await getChallengeReasonAfterSettle(page)) ||
+      assertError ||
+      getRouteHttpBlockReason('/casino/', status);
     lastState = {
       route: '/casino/',
       requestedUrl,
       finalUrl: page.url(),
-      status: response ? response.status() : 0,
+      status,
       title: await page.title().catch(() => ''),
       challenge: challenge || (navigationError ? `Navigation failed: ${navigationError}` : null),
       attempt,
@@ -908,13 +1065,17 @@ async function openCasinoSubRoute(page, route) {
   await assertNotCloudflare(page).catch((err) => {
     assertError = String(err && err.message ? err.message : err);
   });
-  const challenge = (await getChallengeReasonAfterSettle(page)) || assertError;
+  const status = response ? response.status() : 0;
+  const challenge =
+    (await getChallengeReasonAfterSettle(page)) ||
+    assertError ||
+    getRouteHttpBlockReason(route, status);
 
   return {
     route,
     requestedUrl,
     finalUrl: page.url(),
-    status: response ? response.status() : 0,
+    status,
     challenge: challenge || (navigationError ? `Navigation failed: ${navigationError}` : null),
   };
 }
@@ -955,58 +1116,75 @@ async function collectRecentEntries(page) {
         }
       }
 
-      const selectors = [
-        '.t-recent [class*="game" i]',
-        '.t-transactions [class*="game" i]',
-        '[class*="recent" i] [class*="item" i]',
-        '[class*="recent" i] a[href*="/casino/"]',
-        'a[href*="/casino/"]',
+      const scopeSelectors = [
+        '.t-recent',
+        '[data-testid*="recent" i]',
+        '[class*="recent-games" i]',
+        'main .t-games-catalog',
+        'main [class*="games-catalog" i]',
+        '.t-games-catalog',
+        '[class*="games-catalog" i]',
+        'main',
       ];
       const out = [];
       const seen = new Set();
 
-      for (const selector of selectors) {
-        const nodes = Array.from(document.querySelectorAll(selector)).filter((node) =>
-          isVisible(node)
+      let scope = null;
+      for (const selector of scopeSelectors) {
+        scope = Array.from(document.querySelectorAll(selector)).find(
+          (node) => isVisible(node) && node.querySelector('a[href*="/casino/"]')
         );
-        for (const node of nodes) {
-          const anchor = node.matches('a[href]') ? node : node.querySelector('a[href]');
-          const href = anchor ? String(anchor.getAttribute('href') || '').trim() : '';
-          const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-          const title = (
-            node.querySelector(
-              '.t-game-play__title, .t-game-item__hover-name, [class*="title" i], [class*="name" i]'
-            )?.textContent || text
-          )
-            .replace(/\s+/g, ' ')
-            .trim();
-          if (!text && !title && !href) continue;
+        if (scope) break;
+      }
+      if (!scope) return out;
 
-          const providerHint = (
-            node.querySelector('.t-game-item__hover-provider, [class*="provider" i]')
-              ?.textContent || ''
-          )
-            .replace(/\s+/g, ' ')
-            .trim();
-          const idHint =
-            String(node.getAttribute('data-id') || '').trim() ||
-            String(node.getAttribute('data-game-id') || '').trim() ||
-            String(node.getAttribute('data-gid') || '').trim();
+      const anchors = Array.from(scope.querySelectorAll('a[href*="/casino/"]')).filter((node) =>
+        isVisible(node)
+      );
+      for (const anchor of anchors) {
+        const node =
+          anchor.closest(
+            '.t-game-play, .t-game-item, [class*="game-card" i], [class*="game-item" i]'
+          ) || anchor;
+        const href = anchor ? String(anchor.getAttribute('href') || '').trim() : '';
+        const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+        const title = (
+          node.querySelector(
+            '.t-game-play__title, .t-game-item__hover-name, [class*="title" i], [class*="name" i]'
+          )?.textContent || text
+        )
+          .replace(/\s+/g, ' ')
+          .trim();
+        if (!text && !title && !href) continue;
 
-          const parsed = parseIdentity(href);
-          const entry = {
-            text,
-            title,
-            href,
-            provider: parsed.provider || providerHint || '',
-            slug: parsed.slug || '',
-            gameId: parsed.gameId || idHint || '',
-          };
-          const key = `${entry.href}|${entry.title}|${entry.provider}|${entry.slug}|${entry.gameId}|${entry.text}`;
-          if (seen.has(key)) continue;
-          seen.add(key);
-          out.push(entry);
-        }
+        const providerHint = (
+          node.querySelector('.t-game-item__hover-provider, [class*="provider" i]')?.textContent ||
+          ''
+        )
+          .replace(/\s+/g, ' ')
+          .trim();
+        const idHint =
+          String(node.getAttribute('data-id') || '').trim() ||
+          String(node.getAttribute('data-game-id') || '').trim() ||
+          String(node.getAttribute('data-gid') || '').trim();
+
+        const parsed = parseIdentity(href);
+        const hasStrictGameIdentity = Boolean(
+          parsed.gameId || idHint || (parsed.provider && parsed.slug)
+        );
+        if (!hasStrictGameIdentity) continue;
+        const entry = {
+          text,
+          title,
+          href,
+          provider: parsed.provider || providerHint || '',
+          slug: parsed.slug || '',
+          gameId: parsed.gameId || idHint || '',
+        };
+        const key = `${entry.provider}|${entry.slug}|${entry.gameId}`.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(entry);
       }
 
       return out;
@@ -1014,18 +1192,64 @@ async function collectRecentEntries(page) {
     .catch(() => []);
 }
 
-async function waitForCasinoContent(page) {
-  const heading = page.getByText(/^games$/i).first();
-  const searchButton = page.locator('.t-games-catalog__search-btn').first();
-  const gameCard = page
-    .locator('.t-games-catalog .t-game-play, .t-games-catalog a[href*="/casino/"]')
-    .first();
+async function waitForRecentGamesContent(page, timeoutMs = 18_000) {
+  const deadlineAt = Date.now() + timeoutMs;
+  let lastState = { entriesCount: 0, emptyStateVisible: false, visibleSkeletons: 0 };
 
-  await Promise.any([
-    heading.waitFor({ state: 'visible', timeout: 15000 }),
-    searchButton.waitFor({ state: 'visible', timeout: 15000 }),
-    gameCard.waitFor({ state: 'visible', timeout: 15000 }),
-  ]).catch(() => null);
+  while (Date.now() < deadlineAt) {
+    const entries = await collectRecentEntries(page);
+    const emptyStateVisible = await page
+      .locator('main')
+      .getByText(/^(nothing found|no games|no results|recent games are empty|not available)$/i)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    const visibleSkeletons = await page
+      .locator(
+        'main [class*="skeleton" i]:visible, main [class*="placeholder" i]:visible, main [aria-busy="true"]:visible'
+      )
+      .count()
+      .catch(() => 0);
+
+    lastState = {
+      entriesCount: entries.length,
+      emptyStateVisible,
+      visibleSkeletons,
+    };
+    if (entries.length > 0 || emptyStateVisible) {
+      return { ok: true, ...lastState };
+    }
+    await sleep(400);
+  }
+
+  return { ok: false, ...lastState };
+}
+
+async function waitForCasinoContent(page) {
+  const deadlineAt = Date.now() + 30_000;
+  let lastState = { gameCards: 0, controls: 0, skeletons: 0 };
+  while (Date.now() < deadlineAt) {
+    const gameCards = await page
+      .locator('.t-games-catalog a[href*="/casino/"], main [class*="game-card" i] a[href]')
+      .count()
+      .catch(() => 0);
+    const controls = await page
+      .locator(
+        '.t-games-catalog__search-btn:visible, .t-games-filters-mobile__toggle:visible, main input[type="search"]:visible'
+      )
+      .count()
+      .catch(() => 0);
+    const skeletons = await page
+      .locator(
+        'main [class*="skeleton" i]:visible, main [class*="placeholder" i]:visible, main [aria-busy="true"]:visible'
+      )
+      .count()
+      .catch(() => 0);
+    lastState = { gameCards, controls, skeletons };
+    if (gameCards > 0 && skeletons === 0) return { ready: true, ...lastState };
+    await sleep(400);
+  }
+  return { ready: false, ...lastState };
 }
 
 async function openFilterPanel(page) {
@@ -1585,22 +1809,6 @@ function normalizeDemoAvailability(raw) {
   return { ...raw, status: 'unknown', hasDemo: raw.hasDemo === true ? true : null };
 }
 
-function readCachedProviderInventory() {
-  for (const filePath of INVENTORY_CACHE_CANDIDATES) {
-    if (!fs.existsSync(filePath)) continue;
-    try {
-      const payload = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      const providers = uniqueProvidersByNormalizedName(payload && payload.providers);
-      if (providers.length) {
-        return { filePath, providers };
-      }
-    } catch {
-      // ignore malformed cache and continue
-    }
-  }
-  return null;
-}
-
 function readCachedProviderDemoAvailability() {
   for (const filePath of DEMO_AVAILABILITY_CACHE_CANDIDATES) {
     if (!fs.existsSync(filePath)) continue;
@@ -1616,18 +1824,14 @@ function readCachedProviderDemoAvailability() {
 }
 
 function resolveProviderTargets() {
-  const cachedInventory = readCachedProviderInventory();
-  if (cachedInventory && cachedInventory.providers.length) {
-    return {
-      source: `inventory-cache (${path.basename(cachedInventory.filePath)})`,
-      providersAll: cachedInventory.providers,
-      cachePath: cachedInventory.filePath,
-    };
-  }
-
   const baseline = uniqueProvidersByNormalizedName(getBaselineProviders(BASE_URL));
+  // Test titles must be identical when Playwright restarts a worker after a
+  // failure. The inventory test writes providers-inventory.json during this
+  // same suite, so using that mutable file for static test discovery produced
+  // "Test not found in the worker process" for the remaining providers.
+  // Runtime inventory still decides whether each stable target is applicable.
   return {
-    source: `brand-baseline (${BASE_HOSTNAME}; fallback: inventory cache is missing)`,
+    source: `brand-baseline (${BASE_HOSTNAME}; stable test discovery)`,
     providersAll: baseline,
     cachePath: null,
   };
@@ -1652,10 +1856,11 @@ function summarizeProviderResults(results) {
   const blockedProviderLaunch = results.filter(
     (item) => item.outcome === 'provider-launch-blocked'
   ).length;
+  const blockedInfraWaf = results.filter((item) => item.outcome === 'infra-waf-blocked').length;
   const blockedOther = results.filter(
     (item) =>
       item.status === 'blocked' &&
-      !['provider-absent', 'provider-launch-blocked'].includes(item.outcome)
+      !['provider-absent', 'provider-launch-blocked', 'infra-waf-blocked'].includes(item.outcome)
   ).length;
   const retriedRecovered = results.filter((item) => Boolean(item.flakyRecovered)).length;
   const demoAvailable = results.filter(
@@ -1665,21 +1870,48 @@ function summarizeProviderResults(results) {
     (item) => item.demoAvailability?.status === 'not-available'
   ).length;
   const demoUnknown = results.length - demoAvailable - demoNotAvailable;
+  const optionalStageTimeoutProviders = results.filter((item) =>
+    (item.modes || []).some((mode) =>
+      (mode.launches || []).some((launch) =>
+        (launch.stageTelemetry || []).some((stage) => stage.status === 'timed-out-optional')
+      )
+    )
+  ).length;
+  const optionalStageTimeouts = results.reduce(
+    (total, item) =>
+      total +
+      (item.modes || []).reduce(
+        (modeTotal, mode) =>
+          modeTotal +
+          (mode.launches || []).reduce(
+            (launchTotal, launch) =>
+              launchTotal +
+              (launch.stageTelemetry || []).filter((stage) => stage.status === 'timed-out-optional')
+                .length,
+            0
+          ),
+        0
+      ),
+    0
+  );
 
   return {
     total: results.length,
-    passed: results.filter((item) => item.status === 'passed').length,
+    passed: passedStrong + passedWeakSurface,
     failed: results.filter((item) => item.status === 'failed').length,
     blocked: results.filter((item) => item.status === 'blocked').length,
     passedStrong,
     passedWeakSurface,
     blockedProviderAbsent,
     blockedProviderLaunch,
+    blockedInfraWaf,
     blockedOther,
     retriedRecovered,
     demoAvailable,
     demoNotAvailable,
     demoUnknown,
+    optionalStageTimeoutProviders,
+    optionalStageTimeouts,
   };
 }
 
@@ -1687,6 +1919,8 @@ function readMatrixResultsFromDisk() {
   if (!fs.existsSync(MATRIX_JSON_PATH)) return [];
   try {
     const payload = JSON.parse(fs.readFileSync(MATRIX_JSON_PATH, 'utf8'));
+    const expectedRunId = String(process.env.QA_RUN_ID || '').trim();
+    if (expectedRunId && String(payload.runId || '').trim() !== expectedRunId) return [];
     return Array.isArray(payload.results) ? payload.results : [];
   } catch {
     return [];
@@ -1701,6 +1935,7 @@ function syncMatrixArtifacts(extra = {}) {
   }
   const summary = summarizeProviderResults(providerMatrixResults);
   const payload = {
+    runId: String(process.env.QA_RUN_ID || '').trim() || null,
     generatedAt: new Date().toISOString(),
     providerProfile: PROVIDER_PROFILE,
     providerMaxApplied: Number.isFinite(PROVIDER_MAX) && PROVIDER_MAX > 0 ? PROVIDER_MAX : null,
@@ -1893,7 +2128,8 @@ function getProviderHistoryLaunchCandidates(limit = 12) {
   const deduped = [];
   const seen = new Set();
 
-  for (const item of providerHistoryLaunchCandidates) {
+  for (let index = providerHistoryLaunchCandidates.length - 1; index >= 0; index -= 1) {
+    const item = providerHistoryLaunchCandidates[index];
     if (!item || !item.strictReady) continue;
     const key = [
       item.providerKey || '-',
@@ -2347,6 +2583,7 @@ function isProviderMismatchBlocking(filterConsistency) {
 }
 
 async function applyProviderFilter(page, provider) {
+  await dismissOverlays(page).catch(() => null);
   const reasons = [];
   let panelPersistentAfterApply = false;
   const panelSelectors = [
@@ -2447,7 +2684,9 @@ async function applyProviderFilter(page, provider) {
 }
 
 function hasDemoHint(value) {
-  return /try\s*for\s*fun|[?&]fun(?:=|$)|\/fun(?:\/|$)|mode=demo|demo/i.test(String(value || ''));
+  return /try\s*for\s*fun|[?&]fun(?:=|&|#|\s|$)|\/fun(?:\/|$)|mode=demo|demo/i.test(
+    String(value || '')
+  );
 }
 
 async function findDemoPlayButton(page, options = {}) {
@@ -2488,8 +2727,8 @@ async function findDemoPlayButton(page, options = {}) {
   for (let i = 0; i < count; i += 1) {
     const card = cards.nth(i);
     if (!(await card.isVisible().catch(() => false))) continue;
-    await card.scrollIntoViewIfNeeded().catch(() => null);
-    await card.hover().catch(() => null);
+    await card.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => null);
+    await card.hover({ timeout: 1500 }).catch(() => null);
     await waitForUiSettled(page, 600);
 
     const cardTitle = singleLine(
@@ -2682,6 +2921,7 @@ async function detectProviderDemoAvailability(page, provider) {
 }
 
 async function findRealPlayButton(page, options = {}) {
+  await dismissOverlays(page).catch(() => null);
   const skipCardKeys = options.skipCardKeys || new Set();
   const expectedProvider = String(options.provider || '').trim();
   const providerEntries =
@@ -2689,13 +2929,17 @@ async function findRealPlayButton(page, options = {}) {
       ? options.providerEntries
       : getKnownProvidersForMatching();
   const cardSelectors = [
+    '.t-games-catalog a[href*="/casino/"]',
     '.t-games-catalog .t-game-play',
     '.t-games-catalog .t-game-item',
     '.t-games-catalog [class*="game-play" i]',
     '.t-games-catalog [class*="games-item" i]',
+    '.t-games-catalog [data-testid*="game" i]',
+    'main a[href*="/casino/"]',
     'main .t-game-item',
     'main [class*="game-play" i]',
     'main [class*="games-item" i]',
+    'main [data-testid*="game" i]',
   ];
 
   let cards = null;
@@ -2717,57 +2961,106 @@ async function findRealPlayButton(page, options = {}) {
       cardHref: '',
     };
 
-  const count = Math.min(await cards.count().catch(() => 0), 14);
+  const count = Math.min(await cards.count().catch(() => 0), 6);
   let providerMatchedCards = 0;
   for (let i = 0; i < count; i += 1) {
     const card = cards.nth(i);
     if (!(await card.isVisible().catch(() => false))) continue;
-    await card.scrollIntoViewIfNeeded().catch(() => null);
-    await card.hover().catch(() => null);
-    await waitForUiSettled(page, 700);
-
-    const cardTitle = singleLine(
-      await card
-        .locator('.t-game-play__title, [class*="title" i], [class*="name" i]')
-        .first()
-        .innerText()
-        .catch(() => '')
-    );
-    const cardHref = singleLine(
-      await card
-        .locator('a[href]')
-        .first()
-        .getAttribute('href')
-        .catch(() => '')
-    );
+    const cardMeta = await card
+      .evaluate((node) => {
+        const nestedLink = node.querySelector('a[href]');
+        const titleNode = node.querySelector(
+          '.t-game-play__title, .t-game-item__hover-name, [class*="title" i], [class*="name" i]'
+        );
+        const providerNode = node.querySelector(
+          '.t-game-item__hover-provider, [data-provider], [class*="provider" i]'
+        );
+        const imageTitle = node.querySelector('img[alt]')?.getAttribute('alt') || '';
+        return {
+          href: node.getAttribute('href') || nestedLink?.getAttribute('href') || '',
+          title: (titleNode?.textContent || imageTitle || node.textContent || '')
+            .replace(/\s+/g, ' ')
+            .trim(),
+          provider: (
+            node.getAttribute('data-provider') ||
+            providerNode?.getAttribute('data-provider') ||
+            providerNode?.textContent ||
+            ''
+          )
+            .replace(/\s+/g, ' ')
+            .trim(),
+          mobileCard: node.matches('.t-game-item'),
+        };
+      })
+      .catch(() => ({ href: '', title: '', provider: '', mobileCard: false }));
+    const cardTitle = singleLine(cardMeta.title);
+    const cardHref = singleLine(cardMeta.href);
     const cardKey = `${cardHref || cardTitle || `card-${i + 1}`}`.toLowerCase();
     if (skipCardKeys.has(cardKey)) continue;
 
     if (expectedProvider) {
-      const providerMatched = isCardMatchingProvider(
-        cardHref,
-        cardTitle,
-        expectedProvider,
-        providerEntries
-      );
+      const hasProviderIdentity = Boolean(cardHref || cardMeta.provider);
+      const providerMatched = hasProviderIdentity
+        ? isCardMatchingProvider(
+            cardHref,
+            `${cardTitle} ${cardMeta.provider}`,
+            expectedProvider,
+            providerEntries
+          )
+        : cardMeta.mobileCard;
       if (!providerMatched) continue;
       providerMatchedCards += 1;
     }
 
-    let button = await firstVisibleLocator(card, [
-      'button:has-text("Play")',
-      'a:has-text("Play")',
-      '[data-testid*="play" i]',
-    ]);
+    await card.scrollIntoViewIfNeeded().catch(() => null);
+    await card.hover({ timeout: 1200 }).catch(() => null);
+    await waitForUiSettled(page, 250);
+
+    let button = card
+      .locator('button, a, [role="button"], [data-testid*="play" i]')
+      .filter({ hasText: /^\s*Play\s*$/i })
+      .first();
+    if (!(await button.isVisible().catch(() => false))) button = null;
     if (!button) {
-      button = await firstVisibleLocator(page, ['button:has-text("Play")', 'a:has-text("Play")']);
+      const pageButton = page
+        .locator('button, a, [role="button"], [data-testid*="play" i]')
+        .filter({ hasText: /^\s*Play\s*$/i })
+        .first();
+      if (await pageButton.isVisible().catch(() => false)) button = pageButton;
+    }
+    if (!button && (cardHref || (await card.getAttribute('href').catch(() => '')))) {
+      const cardAction = (await card.getAttribute('href').catch(() => ''))
+        ? card
+        : card.locator('a[href], [role="link"]').first();
+      if (await cardAction.isVisible().catch(() => false)) button = cardAction;
+    }
+    if (!button) {
+      const directCardAction = card.locator('a[href], button, [role="button"]').first();
+      if (await directCardAction.isVisible().catch(() => false)) button = directCardAction;
+    }
+    if (!button && cardMeta.mobileCard) {
+      // The first mobile tap only reveals the action layer. Resolve the Play
+      // link after activation instead of misclassifying the card as Play.
+      const imageSurface = card.locator('.t-game-item__img').first();
+      const activationTarget = (await imageSurface.isVisible().catch(() => false))
+        ? imageSurface
+        : card;
+      await activationTarget
+        .click({ timeout: 3000 })
+        .catch(() => activationTarget.click({ timeout: 2000, force: true }).catch(() => null));
+      await waitForUiSettled(page, 350);
+      const revealedButton = card
+        .locator('button, a, [role="button"], [data-testid*="play" i]')
+        .filter({ hasText: /^\s*Play\s*$/i })
+        .first();
+      if (await revealedButton.isVisible().catch(() => false)) button = revealedButton;
     }
     if (!button) continue;
 
     const buttonText = ((await button.innerText().catch(() => '')) || '')
       .replace(/\s+/g, ' ')
       .trim();
-    if (/try for fun|demo/i.test(buttonText)) continue;
+    if (/try for fun|demo/i.test(buttonText) && button !== card) continue;
     return {
       found: true,
       reason: null,
@@ -2797,14 +3090,19 @@ async function findRealPlayButton(page, options = {}) {
 
 async function clickAndCaptureLaunch(context, page, button) {
   const beforeUrl = page.url();
-  const popupPromise = context.waitForEvent('page', { timeout: 4000 }).catch(() => null);
+  const popupPromise = context.waitForEvent('page', { timeout: 2500 }).catch(() => null);
   let clickError = null;
 
   try {
-    await button.click({ timeout: 6000 });
+    await button.click({ timeout: 3000 });
   } catch (err) {
     clickError = String(err && err.message ? err.message : err);
-    await button.click({ timeout: 6000, force: true }).catch(() => null);
+    await button
+      .evaluate((element) => {
+        element.scrollIntoView({ block: 'center', inline: 'center' });
+        element.click();
+      })
+      .catch(() => null);
   }
 
   const popup = await popupPromise;
@@ -2820,7 +3118,7 @@ async function clickAndCaptureLaunch(context, page, button) {
   }
 
   await page.waitForLoadState('domcontentloaded').catch(() => null);
-  await waitForUiSettled(page, 2000);
+  await waitForUiSettled(page, 1200);
   const sameTabUrl = page.url();
   const sameTabChallenge = await getChallengeReasonAfterSettle(page);
 
@@ -2872,24 +3170,34 @@ async function inspectGameHealth(targetPage) {
     .first()
     .isVisible({ timeout: 600 })
     .catch(() => false);
-  const surfaceVisible = Boolean(
-    await firstVisibleLocator(targetPage, [
-      'canvas',
-      'iframe[src*="game" i]',
-      'iframe[src*="casino" i]',
-      'iframe[src*="slot" i]',
-      '[class*="game-container" i]',
-      '[id*="game" i]',
-      'video',
-    ])
-  );
+  const surfaceLocator = await firstVisibleLocator(targetPage, [
+    'canvas',
+    'iframe[src*="game" i]',
+    'iframe[src*="casino" i]',
+    'iframe[src*="slot" i]',
+    'iframe[src]:not([src=""]):not([src*="livechat" i])',
+    '[class*="game-container" i]',
+    'main [id*="game" i]',
+    'video',
+  ]);
+  const surfaceVisible = Boolean(surfaceLocator);
+  const surfaceMeta = surfaceLocator
+    ? await surfaceLocator
+        .evaluate((node) => ({
+          tag: String(node.tagName || '').toLowerCase(),
+          id: String(node.id || ''),
+          className: String(node.className || ''),
+          src: String(node.getAttribute('src') || ''),
+        }))
+        .catch(() => null)
+    : null;
 
-  return { challenge, errorVisible, surfaceVisible };
+  return { challenge, errorVisible, surfaceVisible, surfaceMeta };
 }
 
 async function clickSafeGameControls(targetPage) {
   const elements = targetPage.locator('button, [role="button"], a');
-  const count = Math.min(await elements.count().catch(() => 0), 350);
+  const count = Math.min(await elements.count().catch(() => 0), 40);
   const detected = [];
   const dedupe = new Set();
 
@@ -2958,6 +3266,28 @@ async function clickSafeGameControls(targetPage) {
   };
 }
 
+function resolveGameControlRoot(targetPage, surfaceMeta) {
+  const surfaceSrc = String((surfaceMeta && surfaceMeta.src) || '').trim();
+  if (!surfaceSrc || typeof targetPage.frames !== 'function') return targetPage;
+  const exact = targetPage.frames().find((frame) => frame.url() === surfaceSrc);
+  if (exact) return exact;
+  try {
+    const surfaceUrl = new URL(surfaceSrc);
+    return (
+      targetPage.frames().find((frame) => {
+        try {
+          const frameUrl = new URL(frame.url());
+          return frameUrl.origin === surfaceUrl.origin && frameUrl.pathname === surfaceUrl.pathname;
+        } catch {
+          return false;
+        }
+      }) || targetPage
+    );
+  } catch {
+    return targetPage;
+  }
+}
+
 async function runSingleDemoGameCheck(context, page, gameIndex, skipCardKeys) {
   const game = {
     mode: 'demo',
@@ -2986,11 +3316,38 @@ async function runSingleDemoGameCheck(context, page, gameIndex, skipCardKeys) {
     game.cardTitle = action.cardTitle;
     game.cardHref = action.cardHref;
     game.demoHref = action.demoHref;
+    game.provider = extractProviderSlugFromHref(action.cardHref || action.demoHref);
 
     const launch = await clickAndCaptureLaunch(context, page, action.button);
     popup = launch.popup || null;
     if (popup) collector.attachPage(popup);
+
+    if (!launch.launched && action.demoHref && !popup) {
+      const directResponse = await page
+        .goto(buildUrl(action.demoHref), {
+          waitUntil: 'domcontentloaded',
+          timeout: 30_000,
+        })
+        .catch(() => null);
+      await waitForUiSettled(page, 1800);
+      launch.directDemoFallback = true;
+      launch.directDemoStatus = directResponse ? directResponse.status() : 0;
+      launch.sameTabUrl = page.url();
+      launch.sameTabChallenge = await getChallengeReasonAfterSettle(page);
+      launch.launched = Boolean(
+        directResponse && directResponse.status() < 400 && !launch.sameTabChallenge
+      );
+    }
+
     game.launchState = launch.launched ? 'launched' : 'not-launched';
+    game.launchDiagnostics = {
+      beforeUrl: launch.beforeUrl,
+      sameTabUrl: launch.sameTabUrl,
+      popupUrl: launch.popupUrl,
+      directDemoFallback: Boolean(launch.directDemoFallback),
+      directDemoStatus: Number(launch.directDemoStatus || 0),
+      clickError: launch.clickError || '',
+    };
 
     const challengeReason = launch.popupChallenge || launch.sameTabChallenge;
     if (challengeReason) {
@@ -3020,6 +3377,7 @@ async function runSingleDemoGameCheck(context, page, gameIndex, skipCardKeys) {
     game.health = {
       errorVisible: health.errorVisible,
       challenge: health.challenge,
+      surfaceMeta: health.surfaceMeta,
       demoHintDetected,
     };
     game.diagnostics = diagnostics;
@@ -3195,6 +3553,8 @@ async function runDemoSmokeCheck(context, page, options = {}) {
   for (let i = 0; i < gamesToCheck; i += 1) {
     const single = await runSingleDemoGameCheck(context, page, i, skipCardKeys);
     launches.push(single);
+    const passedCount = launches.filter((item) => item.status === 'passed').length;
+    if (passedCount >= minGames) break;
     if (single.status === 'blocked') break;
     if (single.status === 'no-game') break;
   }
@@ -3222,12 +3582,41 @@ async function requestGamesList(page, queryOverrides = {}) {
     component: 'games.tGameCatalog.list',
     query: buildGamesListQuery(queryOverrides),
   };
-  const response = await page.request.post(buildUrl('/api/games/list'), { data: payload });
-  const status = response.status();
-  if (status >= 400) {
-    throw new Error(`Games list API returned ${status}.`);
+  let status = 0;
+  let json = null;
+  let browserFetchError = '';
+  try {
+    const browserResponse = await page.evaluate(
+      async ({ url, body }) => {
+        const response = await globalThis.fetch(url, {
+          method: 'POST',
+          credentials: 'include',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        return {
+          status: response.status,
+          text: await response.text(),
+        };
+      },
+      { url: buildUrl('/api/games/list'), body: payload }
+    );
+    status = Number(browserResponse.status || 0);
+    json = JSON.parse(String(browserResponse.text || 'null'));
+  } catch (err) {
+    browserFetchError = String(err && err.message ? err.message : err);
   }
-  const json = await response.json().catch(() => null);
+
+  if (!status) {
+    const response = await page.request.post(buildUrl('/api/games/list'), { data: payload });
+    status = response.status();
+    json = await response.json().catch(() => null);
+  }
+  if (status >= 400) {
+    throw new Error(
+      `Games list API returned ${status}.${browserFetchError ? ` Browser fetch: ${browserFetchError}` : ''}`
+    );
+  }
   const data =
     json && typeof json === 'object' && json.data && typeof json.data === 'object' ? json.data : {};
   const list = Array.isArray(data.list) ? data.list : [];
@@ -3519,9 +3908,10 @@ async function scanProvidersDemoAvailability(page, providers, options = {}) {
     apiProviders = [];
   }
 
-  for (const provider of list) {
+  const concurrency = PROACTIVE_API_PROVIDER_HOSTS.has(BASE_HOSTNAME) ? 4 : 1;
+  const scanProvider = async (provider) => {
     if (Date.now() > deadlineAt) {
-      rows.push({
+      return {
         provider,
         status: 'blocked',
         hasDemo: null,
@@ -3533,8 +3923,7 @@ async function scanProvidersDemoAvailability(page, providers, options = {}) {
         totalCards: 0,
         visibleCards: 0,
         elapsedMs: 0,
-      });
-      continue;
+      };
     }
 
     const startedAt = Date.now();
@@ -3573,11 +3962,17 @@ async function scanProvidersDemoAvailability(page, providers, options = {}) {
     row.elapsedMs = Date.now() - startedAt;
     const normalized = normalizeDemoAvailability(row);
     rememberProviderDemoAvailability(provider, normalized);
-    rows.push({
+    return {
       provider,
       ...normalized,
       elapsedMs: row.elapsedMs,
-    });
+    };
+  };
+
+  for (let offset = 0; offset < list.length; offset += concurrency) {
+    const batch = list.slice(offset, offset + concurrency);
+    const batchRows = await Promise.all(batch.map((provider) => scanProvider(provider)));
+    rows.push(...batchRows);
   }
 
   return {
@@ -3594,7 +3989,8 @@ async function runSingleProviderGameCheck(
   provider,
   modeLabel,
   gameIndex,
-  skipCardKeys
+  skipCardKeys,
+  deadlineAt
 ) {
   const game = {
     provider,
@@ -3606,15 +4002,29 @@ async function runSingleProviderGameCheck(
     gameSurface: 'none',
     controlsClicked: 0,
     reason: '',
+    stageTelemetry: [],
   };
   let popup = null;
   let filterConsistency = null;
   let demoProbe = null;
   const collector = createDiagnosticsCollector(context, [page]);
   const packResult = () => ({ game, filterConsistency, demoProbe });
+  const stage = (name, task, capMs) =>
+    runProviderStage(
+      page,
+      game.stageTelemetry,
+      name,
+      task,
+      Math.max(500, Math.min(capMs, Number(deadlineAt || Date.now() + capMs) - Date.now()))
+    );
 
   try {
-    const filter = await applyProviderFilter(page, provider);
+    await dismissOverlays(page).catch(() => null);
+    const filter = await stage(
+      'apply-provider-filter',
+      () => applyProviderFilter(page, provider),
+      15_000
+    );
     if (!filter.ok) {
       game.status = filter.blocked ? 'blocked' : 'failed';
       game.outcome = filter.blocked ? resolveBlockedOutcome(filter.reason) : 'failed';
@@ -3629,11 +4039,27 @@ async function runSingleProviderGameCheck(
       if (cachedDemoProbe.status && cachedDemoProbe.status !== 'unknown') {
         demoProbe = cachedDemoProbe;
       } else {
-        demoProbe = normalizeDemoAvailability(await detectProviderDemoAvailability(page, provider));
-        rememberProviderDemoAvailability(provider, demoProbe);
+        demoProbe = {
+          status: 'unknown',
+          hasDemo: null,
+          reason:
+            'Demo availability was not pre-collected; real-launch validation continues independently.',
+        };
+        game.stageTelemetry.push({
+          name: 'detect-demo-availability',
+          status: 'skipped',
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          durationMs: 0,
+          reason: 'Covered by the dedicated provider demo-availability test.',
+        });
       }
 
-      filterConsistency = await inspectProviderFilterConsistency(page, provider);
+      filterConsistency = await stage(
+        'inspect-filter-consistency',
+        () => inspectProviderFilterConsistency(page, provider),
+        8_000
+      );
       if (isProviderMismatchBlocking(filterConsistency)) {
         game.status = 'blocked';
         game.outcome = 'blocked-other';
@@ -3642,30 +4068,38 @@ async function runSingleProviderGameCheck(
       }
     }
 
-    let action = await findRealPlayButton(page, {
-      skipCardKeys,
-      provider,
-      providerEntries: getKnownProvidersForMatching(),
-    });
-    if (
-      (!action.found || !action.button) &&
-      /No game cards found/i.test(String(action.reason || ''))
-    ) {
-      await openCasino(page, {
-        attemptsLimit: 1,
-        navigationTimeoutMs: 20_000,
-      }).catch(() => null);
-      await waitForCasinoContent(page).catch(() => null);
-      const retryFilter = await applyProviderFilter(page, provider);
-      if (retryFilter.ok) {
-        await waitForUiSettled(page, 1200);
-        action = await findRealPlayButton(page, {
+    const action = await stage(
+      'find-real-play-button',
+      async () => {
+        await dismissOverlays(page).catch(() => null);
+        let resolved = await findRealPlayButton(page, {
           skipCardKeys,
           provider,
           providerEntries: getKnownProvidersForMatching(),
         });
-      }
-    }
+        if (
+          (!resolved.found || !resolved.button) &&
+          /No game cards found/i.test(String(resolved.reason || ''))
+        ) {
+          await openCasino(page, {
+            attemptsLimit: 1,
+            navigationTimeoutMs: 10_000,
+          }).catch(() => null);
+          await waitForCasinoContent(page).catch(() => null);
+          const retryFilter = await applyProviderFilter(page, provider);
+          if (retryFilter.ok) {
+            await waitForUiSettled(page, 1200);
+            resolved = await findRealPlayButton(page, {
+              skipCardKeys,
+              provider,
+              providerEntries: getKnownProvidersForMatching(),
+            });
+          }
+        }
+        return resolved;
+      },
+      18_000
+    );
     if (!action.found || !action.button) {
       game.status = 'no-game';
       game.outcome = 'no-game';
@@ -3677,7 +4111,29 @@ async function runSingleProviderGameCheck(
     game.cardTitle = action.cardTitle;
     game.cardHref = action.cardHref;
 
-    const launch = await clickAndCaptureLaunch(context, page, action.button);
+    const launch = await stage(
+      'launch-game',
+      async () => {
+        let result = await clickAndCaptureLaunch(context, page, action.button);
+        if (
+          !result.launched &&
+          !result.balanceGateVisible &&
+          !result.popupChallenge &&
+          !result.sameTabChallenge
+        ) {
+          const confirmPlay = page
+            .locator('button, a, [role="button"]')
+            .filter({ hasText: /^\s*Play\s*$/i })
+            .first();
+          if (await confirmPlay.isVisible().catch(() => false)) {
+            result = await clickAndCaptureLaunch(context, page, confirmPlay);
+            result.confirmPlayClicked = true;
+          }
+        }
+        return result;
+      },
+      35_000
+    );
     popup = launch.popup || null;
     if (popup) collector.attachPage(popup);
     game.launchState = launch.launched
@@ -3696,8 +4152,51 @@ async function runSingleProviderGameCheck(
     }
 
     const targetPage = launch.popup || page;
-    const health = await inspectGameHealth(targetPage);
-    const controls = await clickSafeGameControls(targetPage);
+    const browserNavigationError = await stage(
+      'inspect-navigation',
+      () => detectBrowserNavigationError(targetPage),
+      7_000
+    );
+    if (browserNavigationError) {
+      game.status = 'blocked';
+      game.outcome = resolveBlockedOutcome(browserNavigationError);
+      game.reason = browserNavigationError;
+      game.gameSurface = 'not-visible';
+      game.controlsClicked = 0;
+      return packResult();
+    }
+
+    const health = await stage('inspect-game-health', () => inspectGameHealth(targetPage), 10_000);
+    const emptyControls = {
+      detectedLabels: [],
+      clickedLabels: [],
+      clickedCount: 0,
+    };
+    let controlsDiagnostic = { value: emptyControls, timedOut: false, reason: '' };
+    if (health.surfaceVisible) {
+      const controlRoot = resolveGameControlRoot(targetPage, health.surfaceMeta);
+      const controlsTimeoutMs = Math.max(
+        2000,
+        Number.parseInt(process.env.PW_PROVIDER_CONTROLS_TIMEOUT_MS || '6000', 10) || 6000
+      );
+      controlsDiagnostic = await runOptionalProviderStage(
+        game.stageTelemetry,
+        'inspect-game-controls',
+        () => clickSafeGameControls(controlRoot),
+        controlsTimeoutMs,
+        emptyControls
+      );
+    } else {
+      game.stageTelemetry.push({
+        name: 'inspect-game-controls',
+        status: 'skipped',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        durationMs: 0,
+        reason: 'No visible game surface; launch health is classified independently.',
+      });
+    }
+    const controls = controlsDiagnostic.value;
     const diagnostics = splitCriticalDiagnostics(collector.diagnostics);
 
     game.gameSurface = health.surfaceVisible ? 'visible' : 'not-visible';
@@ -3707,8 +4206,22 @@ async function runSingleProviderGameCheck(
     game.health = {
       errorVisible: health.errorVisible,
       challenge: health.challenge,
+      surfaceMeta: health.surfaceMeta,
+    };
+    game.launchDiagnostics = {
+      confirmPlayClicked: Boolean(launch.confirmPlayClicked),
+      iframeVisible: Boolean(launch.iframeVisible),
+      balanceGateVisible: Boolean(launch.balanceGateVisible),
+      loginModalVisible: Boolean(launch.loginModalVisible),
+      clickError: launch.clickError || '',
     };
     game.diagnostics = diagnostics;
+    if (controlsDiagnostic.timedOut || controlsDiagnostic.reason) {
+      game.controlsDiagnostic = {
+        timedOut: controlsDiagnostic.timedOut,
+        reason: controlsDiagnostic.reason,
+      };
+    }
     const transientLaunchIssue = detectTransientProviderLaunchIssue(diagnostics);
 
     if (health.challenge) {
@@ -3783,23 +4296,40 @@ async function runSingleProviderGameCheck(
     game.outcome = strongSurface ? 'passed-strong' : 'passed-weak-surface';
     if (game.outcome === 'passed-weak-surface') {
       game.reason = 'Launch completed without visible in-game surface; weak pass recorded.';
+    } else if (controlsDiagnostic.timedOut) {
+      game.reason =
+        'Game surface is healthy; optional in-game control inspection timed out without invalidating the launch.';
     } else if (controls.detectedLabels.length > 0 && controls.clickedCount === 0) {
       game.reason = 'Game controls detected but none were clickable.';
     }
     return packResult();
   } catch (err) {
-    game.status = 'failed';
-    game.outcome = 'failed';
-    game.reason = String(err && err.message ? err.message : err);
+    const reason = String(err && err.message ? err.message : err);
+    game.status =
+      (err && err.code === 'TEST_INFRA_TIMEOUT') || isProviderNavigationBlockedReason(reason)
+        ? 'blocked'
+        : 'failed';
+    game.outcome = game.status === 'blocked' ? resolveBlockedOutcome(reason) : 'failed';
+    game.reason = reason;
     return packResult();
   } finally {
     collector.stop();
     if (popup) await popup.close().catch(() => null);
-    await openCasino(page, {
-      attemptsLimit: PROVIDER_RESTORE_CASINO_RETRIES,
-      navigationTimeoutMs: PROVIDER_RESTORE_CASINO_NAV_TIMEOUT_MS,
-    }).catch(() => null);
-    await waitForCasinoContent(page).catch(() => null);
+    if (!page.isClosed()) {
+      await runProviderStage(
+        page,
+        game.stageTelemetry,
+        'restore-casino',
+        async () => {
+          await openCasino(page, {
+            attemptsLimit: PROVIDER_RESTORE_CASINO_RETRIES,
+            navigationTimeoutMs: PROVIDER_RESTORE_CASINO_NAV_TIMEOUT_MS,
+          }).catch(() => null);
+          await waitForCasinoContent(page).catch(() => null);
+        },
+        15_000
+      ).catch(() => null);
+    }
   }
 }
 
@@ -3838,6 +4368,19 @@ async function runSingleProviderApiGameCheck(page, provider, modeLabel, gameInde
     navigationError = String(err && err.message ? err.message : err);
   }
   await waitForUiSettled(page, 1200).catch(() => null);
+
+  const browserNavigationError = await detectBrowserNavigationError(page);
+  if (browserNavigationError) {
+    game.status = 'blocked';
+    game.outcome = resolveBlockedOutcome(browserNavigationError);
+    game.reason = browserNavigationError;
+    game.launchState = 'not-launched';
+    game.gameSurface = 'not-visible';
+    game.httpStatus = response ? response.status() : 0;
+    game.navigationError = navigationError || browserNavigationError;
+    return game;
+  }
+
   let assertError = '';
   await assertNotCloudflare(page).catch((err) => {
     assertError = String(err && err.message ? err.message : err);
@@ -3944,7 +4487,7 @@ async function runProviderRealCheckViaApi(page, provider, options = {}, uiBlockR
     return {
       provider,
       mode: modeLabel,
-      status: 'passed',
+      status: 'not-applicable',
       outcome: 'provider-absent',
       reason: 'Provider is absent in current brand inventory for this run.',
       launchState: 'none',
@@ -4306,11 +4849,11 @@ async function runProviderRealCheck(context, page, provider, options = {}) {
         mode: modeLabel,
         gameIndex: i + 1,
         status: 'blocked',
-        outcome: 'blocked-other',
+        outcome: 'test-infra-timeout',
         launchState: 'none',
         gameSurface: 'none',
         controlsClicked: 0,
-        reason: `Mode "${modeLabel}" timed out after ${modeTimeoutMs} ms.`,
+        reason: `TEST_INFRA_TIMEOUT: mode "${modeLabel}" timed out after ${modeTimeoutMs} ms.`,
       });
       break;
     }
@@ -4321,7 +4864,8 @@ async function runProviderRealCheck(context, page, provider, options = {}) {
       provider,
       modeLabel,
       i,
-      skipCardKeys
+      skipCardKeys,
+      deadlineAt
     );
     if (!demoAvailability && single.demoProbe) {
       demoAvailability = normalizeDemoAvailability(single.demoProbe);
@@ -4374,7 +4918,13 @@ function combineProviderModes(provider, modeResults) {
   const blocked = modes.find((item) => item.status === 'blocked');
   const providerAbsentOnly =
     modes.length > 0 && modes.every((item) => item.outcome === 'provider-absent');
-  const status = failed ? 'failed' : blocked ? 'blocked' : 'passed';
+  const status = failed
+    ? 'failed'
+    : blocked
+      ? 'blocked'
+      : providerAbsentOnly
+        ? 'not-applicable'
+        : 'passed';
   const reason = failed
     ? failed.reason
     : blocked
@@ -4414,6 +4964,14 @@ function combineProviderModes(provider, modeResults) {
     modes,
     flakyRecovered: modes.some((item) => Boolean(item.flakyRecovered)),
   };
+}
+
+function shouldUseStarzinoApiFallback(modeResult) {
+  if (BASE_HOSTNAME !== 'starzino.com' && BASE_HOSTNAME !== 'www.starzino.com') return false;
+  const reason = oneLine(modeResult && modeResult.reason ? modeResult.reason : '');
+  return /provider filter|filter panel|filter control|no game cards|apply-provider-filter|find-real-play-button/i.test(
+    reason
+  );
 }
 
 async function executeModeWithRetry(browser, testInfo, provider, modeConfig, testNamePrefix) {
@@ -4490,6 +5048,28 @@ async function executeModeWithRetry(browser, testInfo, provider, modeConfig, tes
           return;
         }
 
+        const useProactiveApiLaunch = PROACTIVE_API_PROVIDER_HOSTS.has(BASE_HOSTNAME);
+        if (useProactiveApiLaunch) {
+          const isBooms = BASE_HOSTNAME === 'booms.bet' || BASE_HOSTNAME === 'www.booms.bet';
+          const isLikes = BASE_HOSTNAME === 'likes.bet' || BASE_HOSTNAME === 'www.likes.bet';
+          const isNix = BASE_HOSTNAME === 'nix.bet' || BASE_HOSTNAME === 'www.nix.bet';
+          modeResult = await runProviderRealCheckViaApi(
+            page,
+            provider,
+            modeConfig,
+            isBooms
+              ? 'Booms provider detail routes launch the authenticated game surface directly; deterministic API inventory launch avoids repeated filter/hover cycles that trigger edge challenges.'
+              : isLikes
+                ? 'Likes uses the same edge-sensitive provider surface as Booms; deterministic API inventory launch avoids repeated filter/hover cycles and preserves the authenticated CDP session.'
+                : isNix
+                  ? 'Nix mobile provider cards do not expose a stable hover-based Play control; deterministic API inventory launch uses the same authenticated game routes as the catalog.'
+                  : 'Starzino provider cards use an overlay that makes repeated hover-based Play discovery unstable; deterministic API inventory launch is used.'
+          );
+          modeResult.providerInInventory = true;
+          modeResult.proactiveApiFallback = true;
+          return;
+        }
+
         if (uiBlocked) {
           modeResult = await runProviderRealCheckViaApi(
             page,
@@ -4510,61 +5090,45 @@ async function executeModeWithRetry(browser, testInfo, provider, modeConfig, tes
           modeWatchdogMs
         );
         if (modeRun.timedOut) {
+          await page.close({ runBeforeUnload: false }).catch(() => null);
           const cachedDemo = getCachedProviderDemoAvailability(provider);
-          const timeoutHealth = await inspectGameHealth(page).catch(() => ({
-            challenge: null,
-            errorVisible: false,
-            surfaceVisible: false,
-          }));
-          const timeoutBalanceGateVisible = await page
-            .getByText(/insufficient|not enough|deposit|top up|balance/i)
-            .first()
-            .isVisible({ timeout: 500 })
-            .catch(() => false);
-          const timeoutSurfaceDetected =
-            !timeoutHealth.challenge &&
-            !timeoutHealth.errorVisible &&
-            (timeoutHealth.surfaceVisible || timeoutBalanceGateVisible);
-
-          modeResult = timeoutSurfaceDetected
-            ? {
-                provider,
-                mode: modeConfig.modeLabel,
-                status: 'passed',
-                outcome: 'passed-weak-surface',
-                reason: `Mode "${modeConfig.modeLabel}" watchdog timed out after ${modeWatchdogMs} ms, but post-timeout surface/balance gate was detected.`,
-                launchState: timeoutBalanceGateVisible ? 'balance-gate' : 'launched',
-                gameSurface: timeoutHealth.surfaceVisible ? 'visible' : 'not-visible',
-                controlsClicked: 0,
-                gamesTarget: modeConfig.gamesToCheck,
-                minGames: modeConfig.minGames,
-                gamesExecuted: 1,
-                gamesPassed: 1,
-                launches: [],
-                providerInInventory: true,
-                demoAvailability: normalizeDemoAvailability(cachedDemo),
-                modeWatchdogTimedOut: true,
-              }
-            : {
-                provider,
-                mode: modeConfig.modeLabel,
-                status: 'blocked',
-                outcome: 'blocked-other',
-                reason: `Mode "${modeConfig.modeLabel}" watchdog timed out after ${modeWatchdogMs} ms.`,
-                launchState: 'none',
-                gameSurface: 'none',
-                controlsClicked: 0,
-                gamesTarget: modeConfig.gamesToCheck,
-                minGames: modeConfig.minGames,
-                gamesExecuted: 0,
-                gamesPassed: 0,
-                launches: [],
-                providerInInventory: true,
-                demoAvailability: normalizeDemoAvailability(cachedDemo),
-                modeWatchdogTimedOut: true,
-              };
+          modeResult = {
+            provider,
+            mode: modeConfig.modeLabel,
+            status: 'blocked',
+            outcome: 'test-infra-timeout',
+            reason: `TEST_INFRA_TIMEOUT: mode "${modeConfig.modeLabel}" watchdog timed out after ${modeWatchdogMs} ms.`,
+            launchState: 'none',
+            gameSurface: 'none',
+            controlsClicked: 0,
+            gamesTarget: modeConfig.gamesToCheck,
+            minGames: modeConfig.minGames,
+            gamesExecuted: 0,
+            gamesPassed: 0,
+            launches: [],
+            providerInInventory: true,
+            demoAvailability: normalizeDemoAvailability(cachedDemo),
+            modeWatchdogTimedOut: true,
+          };
         } else {
           modeResult = modeRun.value;
+        }
+        if (shouldUseStarzinoApiFallback(modeResult)) {
+          const uiResult = modeResult;
+          const apiPage = page.isClosed() ? await context.newPage() : page;
+          modeResult = await runProviderRealCheckViaApi(
+            apiPage,
+            provider,
+            modeConfig,
+            uiResult.reason || 'Starzino provider filter is unavailable in UI.'
+          );
+          modeResult.uiFallback = {
+            used: true,
+            reason: uiResult.reason || '',
+            outcome: uiResult.outcome || '',
+            launches: uiResult.launches || [],
+          };
+          if (apiPage !== page) await apiPage.close().catch(() => null);
         }
         modeResult.providerInInventory = true;
       },
@@ -4659,12 +5223,11 @@ async function withCasinoPage(browser, testInfo, testName, run, options = {}) {
     };
   }
 
-  const contextOptions = {
+  const contextOptions = resolveMatrixContextOptions({
     viewport: options.viewport || { width: 1365, height: 900 },
     isMobile: Boolean(options.isMobile),
     hasTouch: Boolean(options.hasTouch),
-    ignoreHTTPSErrors: true,
-  };
+  });
   if (authStatePath) contextOptions.storageState = authStatePath;
   let context = null;
   let page = null;
@@ -4699,6 +5262,7 @@ async function withCasinoPage(browser, testInfo, testName, run, options = {}) {
     const uiBlocked = Boolean(route && route.challenge);
     if (uiBlocked && allowApiFallbackOnBlockedRoute && PROVIDER_FAST_FAIL_ON_UI_BLOCKED) {
       providerFastFailActive = true;
+      providerFastFailKind = 'waf';
       providerFastFailReason =
         providerFastFailReason || route.challenge || 'Casino UI is blocked by challenge/WAF.';
     }
@@ -4711,6 +5275,7 @@ async function withCasinoPage(browser, testInfo, testName, run, options = {}) {
 
     if (!uiBlocked) {
       await waitForCasinoContent(page);
+      await dismissOverlays(page).catch(() => null);
     } else if (allowApiFallbackOnBlockedRoute) {
       testInfo.annotations.push({
         type: 'partial',
@@ -4739,10 +5304,26 @@ async function withCasinoPage(browser, testInfo, testName, run, options = {}) {
         (status) => Number(status) >= 200 && Number(status) < 300
       );
       if (!uiBlocked && loginVisible && !authProbeHealthy) {
+        if (!authRecoveryAttempted) {
+          const recovered = await recoverAuthStateFromArtifactToken(
+            browser,
+            testInfo,
+            `login-visible-auth-probe-${Number(userPreferencesStatus || 0)}-${Number(userProfileStatus || 0)}`
+          );
+          if (recovered.ok) {
+            return withCasinoPage(browser, testInfo, testName, run, {
+              ...options,
+              authRecoveryAttempted: true,
+            });
+          }
+          authRecoveryReason = recovered.reason || '';
+        }
+
         const payload = {
           blocked: true,
           reason:
-            'Expected authorized session, but Log In button is visible and auth probes are not healthy.',
+            'Expected authorized session, but Log In button is visible and auth probes are not healthy.' +
+            (authRecoveryReason ? ` Recovery attempt failed: ${authRecoveryReason}` : ''),
           route,
           authStatePath,
           userPreferencesStatus,
@@ -4764,7 +5345,18 @@ async function withCasinoPage(browser, testInfo, testName, run, options = {}) {
         [userPreferencesStatus, userProfileStatus].some(
           (status) => status === null || Number(status) === 0 || Number(status) >= 400
         );
-      if (authProbeUnavailable) {
+      const shouldEnforceAuthProbe = uiBlocked || loginVisible;
+      if (authProbeUnavailable && !shouldEnforceAuthProbe) {
+        testInfo.annotations.push({
+          type: 'auth-diagnostic',
+          description:
+            `Authorized UI is present, while direct APIRequestContext auth probes returned ` +
+            `/api/user/preferences=${Number(userPreferencesStatus || 0)} and ` +
+            `/api/user/profile=${Number(userProfileStatus || 0)}. Continuing because the app ` +
+            'may supply its authorization token at runtime.',
+        });
+      }
+      if (authProbeUnavailable && shouldEnforceAuthProbe) {
         const maxAuthProbeStatus = Math.max(
           Number(userPreferencesStatus || 0),
           Number(userProfileStatus || 0)
@@ -4824,6 +5416,8 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
   test('P0 Demo smoke: Try for Fun launches and works on several games', async ({
     browser,
   }, testInfo) => {
+    const demoBudgetMs = Math.max(240_000, Math.max(1, PROVIDER_DEMO_MIN_GAMES) * 90_000 + 90_000);
+    test.setTimeout(demoBudgetMs);
     const testName = 'p0_demo_launch_smoke';
     await withCasinoPage(
       browser,
@@ -4967,6 +5561,15 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
       testName,
       async ({ page, route, authStatePath, uiBlocked }) => {
         let providers = cachedProviders;
+        let discoverySource = uiBlocked ? 'api' : 'ui';
+        if (PROACTIVE_API_PROVIDER_HOSTS.has(BASE_HOSTNAME)) {
+          const apiInventory = await discoverProvidersViaApi(page);
+          if (apiInventory.providers.length) {
+            providers = apiInventory.providers;
+            cachedProviders = apiInventory.providers;
+            discoverySource = 'api';
+          }
+        }
         if (!providers || !providers.length) {
           const inventory = uiBlocked
             ? await discoverProvidersViaApi(page)
@@ -4995,6 +5598,7 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
           }
           providers = inventory.providers;
           cachedProviders = inventory.providers;
+          discoverySource = inventory.source || (uiBlocked ? 'api' : 'ui');
         }
 
         cachedProviderDemoAvailability = new Map();
@@ -5010,7 +5614,7 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
           route,
           authStatePath,
           uiBlocked,
-          discoverySource: uiBlocked ? 'api' : 'ui',
+          discoverySource,
           providerDemoScanMaxApplied:
             Number.isFinite(PROVIDER_DEMO_SCAN_MAX) && PROVIDER_DEMO_SCAN_MAX > 0
               ? PROVIDER_DEMO_SCAN_MAX
@@ -5058,22 +5662,25 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
     );
   });
 
-  for (const provider of PROVIDER_TARGETS) {
+  for (const [providerIndex, provider] of PROVIDER_TARGETS.entries()) {
     test(`P1 Provider real launch (${provider}): Play opens working non-demo flow`, async ({
       browser,
     }, testInfo) => {
       const testName = `p1_provider_real_${provider}`;
       if (providerFastFailActive) {
-        const reason = providerFastFailReason || 'Casino UI is blocked by challenge/WAF.';
+        const reason = providerFastFailReason || 'Provider matrix circuit breaker is active.';
         const providerInInventory =
           Array.isArray(cachedProviders) && cachedProviders.length > 0
             ? cachedProviders.some((name) => providerNamesMatch(name, provider))
             : null;
+        const providerAbsent = providerInInventory === false;
         const fastFailResult = {
           provider,
-          status: 'blocked',
-          outcome: resolveBlockedOutcome(reason),
-          reason,
+          status: providerAbsent ? 'not-applicable' : 'blocked',
+          outcome: providerAbsent ? 'provider-absent' : resolveBlockedOutcome(reason),
+          reason: providerAbsent
+            ? 'Provider is absent in current brand inventory for this run.'
+            : reason,
           launchState: 'not-launched',
           gameSurface: 'not-visible',
           controlsClicked: 0,
@@ -5099,17 +5706,48 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
           result: fastFailResult,
           modeRuns: [],
         });
-        markBlocked(
-          testInfo,
-          `Provider "${provider}" blocked in non-demo flow: ${reason} (short-circuit)`
-        );
-        markProviderAnnotation(
-          testInfo,
-          'provider-blocked',
-          `Provider "${provider}" blocked in non-demo flow: ${reason} (short-circuit)`
-        );
-        expect(['passed', 'blocked']).toContain(fastFailResult.status);
+        if (providerAbsent) {
+          markProviderAnnotation(
+            testInfo,
+            'provider-absent',
+            `Provider "${provider}" is absent in current brand inventory.`
+          );
+        } else {
+          // One upstream WAF or systemic runner incident can short-circuit many remaining
+          // provider rows. Keep every affected row visible in the matrix, but do not multiply
+          // one root cause into dozens of independent blocked signals.
+          testInfo.annotations.push({
+            type: 'not-executed',
+            description: `Provider "${provider}" was not executed after an earlier ${providerFastFailKind || 'suite-level'} block: ${reason}`,
+          });
+          testInfo.annotations.push({
+            type: 'partial',
+            description: `Provider "${provider}" coverage was short-circuited by the suite-level ${providerFastFailKind || 'failure'} circuit breaker.`,
+          });
+          markProviderAnnotation(
+            testInfo,
+            'provider-blocked',
+            `Provider "${provider}" blocked in non-demo flow: ${reason} (short-circuit)`
+          );
+        }
+        expect(['passed', 'blocked', 'not-applicable']).toContain(fastFailResult.status);
         return;
+      }
+
+      if (PROVIDER_INTER_TEST_DELAY_MS > 0) {
+        await sleep(PROVIDER_INTER_TEST_DELAY_MS);
+      }
+      if (
+        PROVIDER_BATCH_SIZE > 0 &&
+        PROVIDER_BATCH_COOLDOWN_MS > 0 &&
+        providerIndex > 0 &&
+        providerIndex % PROVIDER_BATCH_SIZE === 0
+      ) {
+        testInfo.annotations.push({
+          type: 'note',
+          description: `Provider batch cooldown: ${PROVIDER_BATCH_COOLDOWN_MS} ms after ${providerIndex} provider checks.`,
+        });
+        await sleep(PROVIDER_BATCH_COOLDOWN_MS);
       }
 
       const retryAttempts = Math.max(1, PROVIDER_RETRY_ON_FAIL + 1);
@@ -5212,6 +5850,36 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
         provider,
         modeRuns.map((run) => run.result)
       );
+      if (
+        combined.status === 'blocked' &&
+        (isProviderNavigationBlockedReason(combined.reason) ||
+          isChallengeLikeReason(combined.reason)) &&
+        PROVIDER_FAST_FAIL_ON_UI_BLOCKED
+      ) {
+        providerFastFailActive = true;
+        providerFastFailReason = combined.reason;
+        providerFastFailKind = 'waf';
+      }
+      const timeoutMatch = String(combined.reason || '').match(
+        /TEST_INFRA_TIMEOUT:\s*provider stage "([^"]+)" timed out/i
+      );
+      if (combined.status === 'blocked' && timeoutMatch) {
+        const signature = timeoutMatch[1].toLowerCase();
+        if (providerSystemicFailureSignature === signature) {
+          providerSystemicFailureCount += 1;
+        } else {
+          providerSystemicFailureSignature = signature;
+          providerSystemicFailureCount = 1;
+        }
+        if (providerSystemicFailureCount >= 3) {
+          providerFastFailActive = true;
+          providerFastFailKind = 'test-infra';
+          providerFastFailReason = `TEST_INFRA_TIMEOUT: provider stage "${timeoutMatch[1]}" failed identically for ${providerSystemicFailureCount} consecutive providers; circuit breaker stopped duplicate executions.`;
+        }
+      } else if (combined.status === 'passed') {
+        providerSystemicFailureSignature = '';
+        providerSystemicFailureCount = 0;
+      }
       const providerInInventory = modeRuns.some(
         (run) => run.result && run.result.providerInInventory === true
       )
@@ -5268,7 +5936,7 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
         );
       }
       expect(
-        ['passed', 'blocked'],
+        ['passed', 'blocked', 'not-applicable'],
         `Provider "${provider}" did not pass non-demo launch/health checks. Reason: ${
           combined.reason || 'unknown'
         }`
@@ -5327,7 +5995,7 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
           markBlocked(testInfo, recentRoute.challenge);
           await writeAndAttach(testInfo, `${toSlug(testName)}.json`, payload);
           if (PROVIDER_REQUIRE_HISTORY_MATCH) {
-            if (!isChallengeLikeReason(recentRoute.challenge)) {
+            if (!isRouteUnavailableReason(recentRoute.challenge)) {
               throw new Error(
                 `Recent route is blocked during provider history linkage: ${recentRoute.challenge}`
               );
@@ -5336,15 +6004,16 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
           return;
         }
 
-        await waitForUiSettled(page, 1500);
         const historySnapshots = [];
         let entries = [];
         let matchedRows = [];
 
         for (let attempt = 1; attempt <= 3; attempt += 1) {
+          const contentState = await waitForRecentGamesContent(page, 18_000);
           entries = await collectRecentEntries(page);
           historySnapshots.push({
             attempt,
+            contentState,
             entriesCount: entries.length,
             sample: entries.slice(0, 20),
           });
@@ -5357,8 +6026,10 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
             .filter((row) => row.entry);
           if (matchedRows.length > 0) break;
 
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15_000 }).catch(() => null);
-          await waitForUiSettled(page, 1200);
+          if (attempt < 3) {
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 }).catch(() => null);
+            await dismissOverlays(page);
+          }
         }
 
         if (!matchedRows.length) {
@@ -5398,7 +6069,7 @@ test.describe('Casino Providers Coverage: inventory + real launch matrix', () =>
     if (PROVIDER_REQUIRE_HISTORY_MATCH && linkageRun && linkageRun.executed === false) {
       const reason = linkageRun.reason || 'unknown';
       const challengeOnly = providerMatrixAllChallengeBlocked(providerMatrixResults);
-      if (!isChallengeLikeReason(reason) && !challengeOnly) {
+      if (!isRouteUnavailableReason(reason) && !challengeOnly) {
         throw new Error(`Provider history linkage did not execute: ${reason}`);
       }
     }

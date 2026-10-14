@@ -107,6 +107,9 @@ function bugFingerprint(runPayload, mode, bugEntry, bugMetadata) {
 function markdownBody({ runPayload, mode, bugEntry, bugMetadata, runPath }) {
   const manual =
     bugMetadata && bugMetadata.manualReproduction ? bugMetadata.manualReproduction : {};
+  const triage = bugMetadata && bugMetadata.triage ? bugMetadata.triage : {};
+  const player = bugMetadata && bugMetadata.playerCredentials ? bugMetadata.playerCredentials : {};
+  const preconditions = Array.isArray(manual.preconditions) ? manual.preconditions : [];
   const steps = Array.isArray(manual.steps) ? manual.steps : [];
   const expected = oneLine(manual.expectedResult || '');
   const actual = oneLine(manual.actualResult || bugMetadata?.error || '');
@@ -122,6 +125,10 @@ function markdownBody({ runPayload, mode, bugEntry, bugMetadata, runPath }) {
     steps.length > 0
       ? steps.map((step, idx) => `${idx + 1}. ${step}`).join('\n')
       : '- No explicit repro steps.';
+  const preconditionLines =
+    preconditions.length > 0
+      ? preconditions.map((item) => `- ${item}`).join('\n')
+      : '- Не указаны.';
   const artifacts = [
     bugEntry.folder ? `- Folder: \`${bugEntry.folder}\`` : '',
     bugEntry.pdfPath ? `- PDF: \`${bugEntry.pdfPath}\`` : '',
@@ -131,9 +138,21 @@ function markdownBody({ runPayload, mode, bugEntry, bugMetadata, runPath }) {
     .join('\n');
 
   return [
-    `# ${oneLine(bugEntry.title || bugEntry.bugId || 'QA bug')}`,
+    `# ${oneLine(bugMetadata?.issueTitle || bugEntry.title || bugEntry.bugId || 'QA bug')}`,
     '',
-    '## Context',
+    '## Триаж',
+    `- Статус: ${oneLine(triage.workflowStatus || 'Нужен триаж')}`,
+    `- Тип: ${oneLine(triage.type || '-')}`,
+    `- Серьёзность: ${oneLine(triage.severity || '-')}`,
+    `- Приоритет: ${oneLine(triage.priority || '-')}`,
+    `- Компонент: ${oneLine(triage.component || bugEntry.phase || '-')}`,
+    `- Подтверждение: ${oneLine(triage.confirmation || '-')}`,
+    `- Воспроизводимость: ${oneLine(triage.reproducibility || '-')}`,
+    '',
+    '## Влияние',
+    oneLine(triage.impact || '-'),
+    '',
+    '## Окружение',
     `- Brand: ${oneLine(runPayload.brandSlug || '-')}`,
     `- Base URL: ${oneLine(runPayload.baseUrl || '-')}`,
     `- Mode: ${oneLine(mode || '-')}`,
@@ -142,22 +161,36 @@ function markdownBody({ runPayload, mode, bugEntry, bugMetadata, runPath }) {
     `- Bug ID: ${oneLine(bugEntry.bugId || '-')}`,
     `- File: ${oneLine(bugEntry.file || '-')}`,
     '',
-    '## Steps To Reproduce',
+    '## Данные тестового игрока',
+    `- Почта: ${oneLine(player.email || 'Не найдена')}`,
+    `- Пароль: ${oneLine(player.password || 'Не найден')}`,
+    `- Источник: ${oneLine(player.source || 'Не указан')}`,
+    `- Статус проверки входа: ${oneLine(player.validationStatus || 'Не указан')}`,
+    '',
+    '## Предусловия',
+    preconditionLines,
+    '',
+    '## Шаги воспроизведения',
     stepLines,
     '',
-    '## Expected Result',
+    '## Ожидаемый результат',
     expected || '-',
     '',
-    '## Actual Result',
+    '## Фактический результат',
     actual || '-',
     '',
-    '## Network',
+    '## Критерии приёмки',
+    `- [ ] ${expected || 'Целевой сценарий работает без ошибки.'}`,
+    '- [ ] Повторный автотест проходит без блокирующей аннотации.',
+    '- [ ] Нет новых критичных ошибок в Console/Network.',
+    '',
+    '## Сеть',
     networkLine,
     '',
-    '## Command',
+    '## Команда повтора',
     command || '-',
     '',
-    '## Artifacts',
+    '## Артефакты',
     artifacts || '-',
     '',
   ].join('\n');
@@ -167,7 +200,7 @@ function buildTicketPayload({ runPayload, mode, bugEntry, bugMetadata, runPath }
   const fingerprint = bugFingerprint(runPayload, mode, bugEntry, bugMetadata);
   const runId = oneLine(runPayload.runId || path.basename(runPath, '.json'));
   const phase = oneLine(bugEntry.phase || 'unknown');
-  const title = oneLine(bugEntry.title || bugEntry.bugId || 'QA Bug');
+  const title = oneLine(bugMetadata?.issueTitle || bugEntry.title || bugEntry.bugId || 'QA Bug');
   const shortTitle = `[${oneLine(runPayload.brandSlug || 'brand')}] [${oneLine(mode)}] [${phase}] ${title}`;
   const body = markdownBody({ runPayload, mode, bugEntry, bugMetadata, runPath });
   return {
@@ -180,7 +213,10 @@ function buildTicketPayload({ runPayload, mode, bugEntry, bugMetadata, runPath }
       `brand:${oneLine(runPayload.brandSlug || 'unknown')}`,
       `mode:${oneLine(mode || 'legacy')}`,
       `phase:${phase}`,
-    ],
+      bugMetadata?.triage?.severity
+        ? `severity:${oneLine(bugMetadata.triage.severity).split(' ')[0].toLowerCase()}`
+        : '',
+    ].filter(Boolean),
     bug: {
       bugId: oneLine(bugEntry.bugId || ''),
       phase,

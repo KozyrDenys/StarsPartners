@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const { assertNotCloudflare, dismissOverlays, markBlocked } = require('../helpers/gt-utils');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';

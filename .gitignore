@@ -11,11 +11,11 @@ node_modules/
 test-results/
 playwright-report/
 blob-report/
-allure-results/
-allure-report/
 storageState.json
 --auto
 .lighthouseci/
+.playwright-cli/
+tmp/
 
 # generated analysis artifacts
 analyze/runs/
@@ -29,6 +29,7 @@ analyze/qa-report.html
 qa-report.md
 qa-report.html
 artifacts/
+output/
 
 # logs
 *.log

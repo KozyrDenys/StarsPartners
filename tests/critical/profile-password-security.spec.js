@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const {
   detectCloudflare,
   dismissOverlays,
@@ -9,7 +9,9 @@ const {
   waitForUiSettled,
 } = require('../helpers/gt-utils');
 const { pickBestAuthStatePath } = require('../helpers/auth-state');
+const { resolveMatrixContextOptions } = require('../helpers/context-options');
 const { maskValue } = require('../helpers/registration-data');
+const { serializeArtifactPayload } = require('../helpers/artifact-output');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const BASE_ORIGIN = new URL(BASE_URL).origin;
@@ -26,6 +28,7 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
@@ -435,7 +438,7 @@ function updatePlayerArtifacts({ email, newPassword, sourceTest }) {
 function writeArtifact(payload, fileName = 'profile-password-security.json') {
   fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
   const filePath = path.join(ARTIFACT_DIR, fileName);
-  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2), 'utf8');
+  fs.writeFileSync(filePath, serializeArtifactPayload(payload), 'utf8');
   return filePath;
 }
 
@@ -470,7 +473,7 @@ test('Profile security: change password and verify old password no longer signs 
     markBlocked(testInfo, payload.reason);
     const artifactPath = writeArtifact(payload);
     await testInfo.attach('profile-password-security.json', {
-      body: JSON.stringify(payload, null, 2),
+      body: serializeArtifactPayload(payload),
       contentType: 'application/json',
     });
     testInfo.annotations.push({ type: 'artifact', description: artifactPath });
@@ -483,7 +486,7 @@ test('Profile security: change password and verify old password no longer signs 
     markBlocked(testInfo, payload.reason);
     const artifactPath = writeArtifact(payload);
     await testInfo.attach('profile-password-security.json', {
-      body: JSON.stringify(payload, null, 2),
+      body: serializeArtifactPayload(payload),
       contentType: 'application/json',
     });
     testInfo.annotations.push({ type: 'artifact', description: artifactPath });
@@ -494,11 +497,9 @@ test('Profile security: change password and verify old password no longer signs 
   payload.newPassword = newPassword;
   payload.newPasswordMasked = maskValue(newPassword);
 
-  const context = await browser.newContext({
-    storageState: authStatePath,
-    viewport: { width: 1365, height: 900 },
-    ignoreHTTPSErrors: true,
-  });
+  const context = await browser.newContext(
+    resolveMatrixContextOptions({ storageState: authStatePath })
+  );
   const page = await context.newPage();
 
   try {
@@ -577,7 +578,7 @@ test('Profile security: change password and verify old password no longer signs 
     await context.close();
     const artifactPath = writeArtifact(payload);
     await testInfo.attach('profile-password-security.json', {
-      body: JSON.stringify(payload, null, 2),
+      body: serializeArtifactPayload(payload),
       contentType: 'application/json',
     });
     testInfo.annotations.push({ type: 'artifact', description: artifactPath });

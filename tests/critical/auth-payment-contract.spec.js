@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const { markBlocked } = require('../helpers/gt-utils');
 const { runAuthPaymentContractChecks } = require('../helpers/api-contract-checks');
 

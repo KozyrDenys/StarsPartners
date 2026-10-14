@@ -27,6 +27,11 @@ function withAutotestTag(value) {
   return `${clean}autotest`;
 }
 
+function buildRuntimePassword() {
+  const uniqueTag = `${Date.now().toString(36)}${faker.string.alphanumeric(6)}`;
+  return `Qa!${uniqueTag}A7`;
+}
+
 function sanitizeEmailSuffix(value, maxLength = 12) {
   const clean = String(value || '')
     .trim()
@@ -75,7 +80,7 @@ function createRegistrationData(options = {}) {
   return {
     email: buildRegistrationEmail(options),
     emailDateDisplay: options.emailDate || env.REG_EMAIL_DATE || formatDateTagForDisplay(),
-    password: options.password || env.REG_PASSWORD || 'Pass2app@W',
+    password: options.password || env.REG_PASSWORD || buildRuntimePassword(),
     firstName,
     lastName,
     country: options.country || env.REG_COUNTRY || 'Spain',
@@ -96,6 +101,7 @@ function maskValue(value, keep = 2) {
 
 module.exports = {
   buildRegistrationEmail,
+  buildRuntimePassword,
   createRegistrationData,
   formatDateTagForDisplay,
   formatTimeTagForEmail,

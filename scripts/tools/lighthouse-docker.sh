@@ -25,13 +25,14 @@ if ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-IMAGE="${LHCI_DOCKER_IMAGE:-mcr.microsoft.com/playwright:v1.58.0-jammy}"
+IMAGE="${LHCI_DOCKER_IMAGE:-mcr.microsoft.com/playwright:v1.62.1-noble@sha256:dcc5531e97840b9b5e794f2814476b21571c5124a3fca2267d73041f56e7580e}"
+LHCI_VERSION="${LHCI_VERSION:-0.15.1}"
 CONFIG_FILE="${LHCI_CONFIG_FILE:-.lighthouserc.js}"
 TARGET_URL="${BASE_URL:-https://gt.bet}"
 WORKDIR_IN_CONTAINER="${LHCI_WORKDIR_IN_CONTAINER:-/workspace}"
 SHM_SIZE="${LHCI_DOCKER_SHM_SIZE:-1g}"
 DOCKER_PLATFORM="${LHCI_DOCKER_PLATFORM:-}"
-CHROME_PATH_IN_CONTAINER="${LHCI_CHROME_PATH:-/ms-playwright/chromium-1208/chrome-linux/chrome}"
+CHROME_PATH_IN_CONTAINER="${LHCI_CHROME_PATH:-/ms-playwright/chromium-1234/chrome-linux/chrome}"
 CHROME_FLAGS="${LHCI_CHROME_FLAGS:---headless=new --no-sandbox --disable-dev-shm-usage --disable-gpu --no-zygote}"
 PWD_ABS="$(pwd)"
 
@@ -47,7 +48,10 @@ echo "BASE_URL: ${TARGET_URL}"
 echo "Config: ${CONFIG_FILE}"
 echo "Chrome path: ${CHROME_PATH_IN_CONTAINER}"
 
-lhci_args=(npx lhci "${MODE}" --config="${CONFIG_FILE}")
+# Lighthouse CI currently pulls an unpatched extract-zip advisory through
+# Puppeteer. Install it only inside this disposable container so the vulnerable
+# dependency is not part of the workstation or project dependency tree.
+lhci_args=(npx --yes --package="@lhci/cli@${LHCI_VERSION}" lhci "${MODE}" --config="${CONFIG_FILE}")
 if [[ "${MODE}" == "collect" || "${MODE}" == "autorun" ]]; then
   lhci_args+=(--collect.settings.chromeFlags="${CHROME_FLAGS}")
 fi

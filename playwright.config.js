@@ -1,7 +1,12 @@
+const { loadProjectEnv } = require('./scripts/lib/env');
+
+loadProjectEnv();
+
 const { defineConfig, devices } = require('@playwright/test');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { resolveExtraHTTPHeaders } = require('./tests/helpers/context-options');
 const { resolveProjectPaths } = require('./tests/helpers/project-paths');
 
 const isMacArm = process.platform === 'darwin' && process.arch === 'arm64';
@@ -53,6 +58,8 @@ function parseProjectMatrix(value) {
 }
 
 const projectMatrix = parseProjectMatrix(process.env.PW_PROJECT_MATRIX || 'desktop');
+
+const extraHTTPHeaders = resolveExtraHTTPHeaders();
 function readCdpMetaUserAgent(storagePath) {
   if (!storagePath) return '';
   try {
@@ -123,20 +130,11 @@ const reporters = [['line']];
 if (process.env.PW_REPORT_JSON === '1') {
   reporters.push(['json', { outputFile: reportJsonOutputFile }]);
 }
-if (process.env.PW_REPORT_ALLURE === '1') {
-  reporters.push(['allure-playwright', { outputFolder: 'allure-results', suiteTitle: false }]);
+if (process.env.PW_REPORT_JUNIT === '1' || process.env.CI) {
+  reporters.push(['junit', { outputFile: path.join(testOutputDir, 'junit.xml') }]);
 }
-if (process.env.PW_REPORT_REPORTPORTAL === '1') {
-  const rp = require('./reportportal.config');
-  if (rp && rp.endpoint && (rp.apiKey || rp.token) && rp.project) {
-    // Explicit resolve keeps dependency tracking tools aware of this optional reporter.
-    require.resolve('@reportportal/agent-js-playwright');
-    reporters.push(['@reportportal/agent-js-playwright', rp]);
-  } else {
-    console.warn(
-      'PW_REPORT_REPORTPORTAL=1 set, but RP_ENDPOINT / RP_API_KEY (or RP_TOKEN) / RP_PROJECT are not configured. Skipping ReportPortal reporter.'
-    );
-  }
+if (process.env.PW_REPORT_HTML === '1' || process.env.CI) {
+  reporters.push(['html', { outputFolder: 'playwright-report', open: 'never' }]);
 }
 
 module.exports = defineConfig({
@@ -152,6 +150,7 @@ module.exports = defineConfig({
     ...(storageStatePath ? { storageState: storageStatePath } : {}),
     headless: !headedRequested,
     ...(userAgent ? { userAgent } : {}),
+    ...(extraHTTPHeaders ? { extraHTTPHeaders } : {}),
     ...(useChromeChannel && browserName === 'chromium' ? { channel: 'chrome' } : {}),
     launchOptions: {
       ...(browserName === 'chromium'
@@ -176,6 +175,7 @@ module.exports = defineConfig({
             viewport: MOBILE_VIEWPORT,
             isMobile: true,
             hasTouch: true,
+            ...(userAgent ? { userAgent } : {}),
           },
         }
       : {

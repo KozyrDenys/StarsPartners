@@ -1,3 +1,8 @@
+const { loadProjectEnv } = require('../scripts/lib/env');
+const { resolveExtraHTTPHeaders } = require('../tests/helpers/context-options');
+
+loadProjectEnv();
+
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -38,10 +43,7 @@ function parseViewport(value) {
 }
 
 function getDefaultUserAgent() {
-  return (
-    process.env.PW_USER_AGENT ||
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'
-  );
+  return String(process.env.PW_USER_AGENT || '').trim();
 }
 
 async function isAnySelectorVisible(page, selectors) {
@@ -230,12 +232,15 @@ async function warmupRoutes(page, options = {}) {
   const contextViewport = parsedViewport || { width: 1365, height: 900 };
   const mobileContext = process.env.PW_SAVE_STATE_IS_MOBILE === '1';
 
+  const configuredUserAgent = getDefaultUserAgent();
+  const extraHTTPHeaders = resolveExtraHTTPHeaders();
   const contextOptions = {
-    userAgent: getDefaultUserAgent(),
     locale: process.env.PW_LOCALE || 'en-US',
     viewport: contextViewport,
     isMobile: mobileContext,
     hasTouch: mobileContext,
+    ...(configuredUserAgent ? { userAgent: configuredUserAgent } : {}),
+    ...(extraHTTPHeaders ? { extraHTTPHeaders } : {}),
   };
 
   let browser = null;

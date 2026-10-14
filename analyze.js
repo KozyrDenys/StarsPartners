@@ -1,3 +1,7 @@
+const { loadProjectEnv } = require('./scripts/lib/env');
+
+loadProjectEnv();
+
 const { chromium } = require('playwright');
 const { ollamaGenerate } = require('./analyze/ollamaChat');
 const { getTarget } = require('./analyze/target');

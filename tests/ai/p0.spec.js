@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const { detectCloudflare, dismissOverlays } = require('../helpers/gt-utils');
 
 async function skipIfBlocked(page, testInfo) {

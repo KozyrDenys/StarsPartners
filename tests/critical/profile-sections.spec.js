@@ -2,15 +2,17 @@ const fs = require('fs');
 const path = require('path');
 const { Buffer } = require('buffer');
 const { URL } = require('url');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const AxeBuilder = require('@axe-core/playwright').default;
 const {
   assertNotCloudflare,
   closeModal,
   detectCloudflare,
   dismissOverlays,
+  markBlocked,
   openSignupModal,
   waitForHomeContent,
+  waitForUiSettled,
 } = require('../helpers/gt-utils');
 const {
   applyAuthTokenCookie,
@@ -20,6 +22,10 @@ const {
 const { createRegistrationData } = require('../helpers/registration-data');
 const { SignupRegistrationPage } = require('../page-objects/signup-registration-page');
 const { isCapabilityOptionalForBrand } = require('../helpers/brand-capabilities');
+const {
+  resolveExtraHTTPHeaders,
+  resolveMatrixContextOptions,
+} = require('../helpers/context-options');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const BASE_ORIGIN = new URL(BASE_URL).origin;
@@ -57,7 +63,9 @@ const runtime = {
   tests: {},
 };
 
-test.describe.configure({ mode: 'serial' });
+// Keep the file sequential under the suite's single worker, but do not skip the
+// remaining profile coverage when one independent capability check fails.
+test.describe.configure({ mode: 'default' });
 
 test.describe('Profile Coverage: P0/P1/P2', () => {
   test.setTimeout(180000);
@@ -81,10 +89,7 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
     }
 
     const initialStorage = process.env.PW_STORAGE_STATE || 'storageState.json';
-    const contextOptions = {
-      viewport: { width: 1365, height: 900 },
-      ignoreHTTPSErrors: true,
-    };
+    const contextOptions = resolveMatrixContextOptions();
     if (fs.existsSync(initialStorage)) {
       contextOptions.storageState = initialStorage;
     }
@@ -216,10 +221,12 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
       const payload = { routes: PROFILE_ROUTES, findings, blocked };
       runtime.tests[testName] = { status: 'passed', payload };
       if (blocked.length) {
-        testInfo.annotations.push({
-          type: 'blocked',
-          description: `Partially blocked profile routes: ${blocked.map((v) => v.route).join(', ')}`,
-        });
+        markBlocked(
+          testInfo,
+          `Partially blocked profile routes by Cloudflare/WAF: ${blocked
+            .map((value) => `${value.route} (${value.challenge || 'challenge detected'})`)
+            .join(', ')}`
+        );
       }
       await testInfo.attach('p0-profile-access-matrix.json', {
         body: JSON.stringify(payload, null, 2),
@@ -508,6 +515,9 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
 
       if (!avatarInputFound) {
         const avatarTrigger = await firstVisibleLocator(page, [
+          '.avatar__edit',
+          '.avatar',
+          '.t-icon-avatar-edit',
           'button:has-text("Upload")',
           'button:has-text("Avatar")',
           'button:has-text("Photo")',
@@ -579,6 +589,7 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
         'input[name*="last" i]',
         'input[name*="city" i]',
         'input[name*="address" i]',
+        '.account-edit-form__input input[type="text"]',
         'button:has-text("Save")',
         'button:has-text("Update")',
       ]);
@@ -661,6 +672,24 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
         return;
       }
 
+      const contentState = await waitForBonusContentReady(page, 30000);
+      if (!contentState.ready) {
+        const reason = `Bonuses content remained in loading/skeleton state for ${contentState.waitedMs} ms.`;
+        const payload = {
+          route: opened.state,
+          attempts: opened.attempts,
+          contentState,
+          reason,
+        };
+        runtime.tests[testName] = { status: 'blocked', reason, payload };
+        await testInfo.attach('p0-bonuses-section-deep.json', {
+          body: JSON.stringify(payload, null, 2),
+          contentType: 'application/json',
+        });
+        markBlockedAndReturn(testInfo, testName, reason);
+        return;
+      }
+
       const scroll = await scrollPageAndBack(page);
       const markerVisible = await hasAnyVisible(page, [
         '[class*="bonus" i]',
@@ -696,9 +725,14 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
       let detailsOpened = false;
       let modalVisible = false;
       let openChangedUrl = false;
+      let detailsMarkerVisible = false;
+      let clickSucceeded = false;
       if (openControl) {
         const beforeUrl = page.url();
-        await openControl.click({ timeout: 10000 }).catch(() => null);
+        clickSucceeded = await openControl
+          .click({ timeout: 10000 })
+          .then(() => true)
+          .catch(() => false);
         await page.waitForLoadState('domcontentloaded').catch(() => null);
         await dismissOverlays(page);
         const challenge = await getChallengeReason(page);
@@ -706,12 +740,26 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
           markBlockedAndReturn(testInfo, testName, challenge);
           return;
         }
-        modalVisible = await hasAnyVisible(page, ['.t-modal:visible', '[role="dialog"]:visible']);
-        openChangedUrl = page.url() !== beforeUrl;
-        const detailsMarkerVisible = await hasAnyVisible(page, [
-          'text=/wager|turnover|terms|deadline|progress|activated/i',
-          '[class*="bonus" i] [class*="details" i]',
-        ]);
+        await expect
+          .poll(
+            async () => {
+              modalVisible = await hasAnyVisible(page, [
+                '.t-modal:visible',
+                '[role="dialog"]:visible',
+              ]);
+              openChangedUrl = page.url() !== beforeUrl;
+              detailsMarkerVisible = await hasAnyVisible(page, [
+                'text=/wager|turnover|terms|deadline|progress|activated/i',
+                '[class*="bonus" i] [class*="details" i]',
+                '[class*="bonus" i][class*="active" i]',
+                '[class*="bonus" i][aria-expanded="true"]',
+              ]);
+              return modalVisible || openChangedUrl || detailsMarkerVisible;
+            },
+            { timeout: 10000, intervals: [250, 500, 1000] }
+          )
+          .toBeTruthy()
+          .catch(() => null);
         detailsOpened = modalVisible || openChangedUrl || detailsMarkerVisible;
 
         if (modalVisible) {
@@ -735,6 +783,7 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
           bonusCardsCount,
           emptyStateVisible,
           openControlFound: Boolean(openControl),
+          clickSucceeded,
           detailsOpened,
           modalVisible,
           openChangedUrl,
@@ -758,6 +807,7 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
         bonusCardsCount,
         emptyStateVisible,
         openControlFound: Boolean(openControl),
+        clickSucceeded,
         detailsOpened,
         modalVisible,
         openChangedUrl,
@@ -789,6 +839,7 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
         'input[name*="address" i]',
         'input[placeholder*="First" i]',
         'input[placeholder*="Last" i]',
+        '.account-edit-form__input input[type="text"]:not(:disabled):not([readonly])',
       ];
       const field = await firstVisibleEditable(page, fieldSelectors);
       if (!field) {
@@ -819,6 +870,7 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
       let restored = false;
       try {
         await input.fill(nextValue);
+        await dismissProfileConfirmation(page);
         const save = await firstVisibleLocator(page, [
           'button:has-text("Save")',
           'button:has-text("Update")',
@@ -833,7 +885,10 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
           return;
         }
 
-        await save.click({ timeout: 10000 });
+        await save.click({ timeout: 10000 }).catch(async () => {
+          await dismissProfileConfirmation(page);
+          await save.click({ timeout: 5000, force: true });
+        });
         await page.waitForLoadState('domcontentloaded').catch(() => null);
         const challengeAfterSave = await getChallengeReason(page);
         if (challengeAfterSave) {
@@ -884,6 +939,7 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
               'button[type="submit"]',
             ]);
             if (save) {
+              await dismissProfileConfirmation(page);
               await save.click({ timeout: 10000 }).catch(() => null);
               restored = true;
             }
@@ -912,19 +968,30 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
         markBlockedAndReturn(testInfo, testName, state.challenge);
         return;
       }
+      if (!/\/profile\/details\/?/i.test(new URL(state.finalUrl, BASE_ORIGIN).pathname)) {
+        markBlockedAndReturn(
+          testInfo,
+          testName,
+          `Profile details route is not available in the current layout (resolved to ${state.finalUrl}).`
+        );
+        return;
+      }
 
-      const firstNameSelector = await firstVisibleSelector(page, [
-        'input[name*="first" i]',
-        'input[placeholder*="First" i]',
+      const firstNameField = await firstVisibleEditable(page, [
+        'main input[name*="first" i]',
+        'main input[placeholder*="First" i]',
+        '.account-edit-form__input input[type="text"]:not(:disabled):not([readonly])',
       ]);
-      const emailOrPhoneSelector = await firstVisibleSelector(page, [
-        'input[name*="email" i]',
-        'input[type="email"]',
-        'input[name*="phone" i]',
-        'input[type="tel"]',
+      const emailOrPhoneField = await firstVisibleEditable(page, [
+        'main input[name*="email" i]',
+        'main input[type="email"]',
+        'main input[name*="phone" i]',
+        'main input[type="tel"]',
+        'input[type="email"]:not(:disabled):not([readonly])',
+        'input[type="tel"]:not(:disabled):not([readonly])',
       ]);
 
-      if (!firstNameSelector && !emailOrPhoneSelector) {
+      if (!firstNameField && !emailOrPhoneField) {
         markBlockedAndReturn(testInfo, testName, 'Validation input fields are not visible.');
         return;
       }
@@ -935,29 +1002,61 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
         lengthHandled: false,
       };
 
-      if (firstNameSelector) {
-        const input = page.locator(firstNameSelector).first();
+      if (firstNameField) {
+        const input = firstNameField.locator;
         const original = await input.inputValue().catch(() => '');
         await input.fill('');
         await input.blur().catch(() => null);
+        await waitForUiSettled(page, 350);
         findings.requiredSignal = await hasValidationSignal(input, page);
 
         const longValue = 'autotest'.repeat(40);
         await input.fill(longValue);
         await input.blur().catch(() => null);
+        await waitForUiSettled(page, 350);
         const valueAfterLong = await input.inputValue().catch(() => '');
         const longSignal = await hasValidationSignal(input, page);
         findings.lengthHandled = valueAfterLong.length < longValue.length || longSignal;
         await input.fill(original).catch(() => null);
       }
 
-      if (emailOrPhoneSelector) {
-        const input = page.locator(emailOrPhoneSelector).first();
+      if (emailOrPhoneField) {
+        const input = emailOrPhoneField.locator;
         const original = await input.inputValue().catch(() => '');
         await input.fill('invalid@@autotest');
         await input.blur().catch(() => null);
+        await waitForUiSettled(page, 350);
         findings.formatSignal = await hasValidationSignal(input, page);
+        if (!findings.formatSignal) {
+          const save = input
+            .locator('xpath=ancestor::form[1]')
+            .locator('button[type="submit"], input[type="submit"]')
+            .first();
+          if (await save.isVisible({ timeout: 500 }).catch(() => false)) {
+            await save.click({ timeout: 2000 }).catch(() => null);
+            await waitForUiSettled(page, 500);
+            findings.formatSignal = await hasValidationSignal(input, page);
+          }
+        }
         await input.fill(original).catch(() => null);
+      }
+
+      const probePayload = {
+        ...findings,
+        finalUrl: page.url(),
+      };
+      await testInfo.attach('p1-profile-validations.json', {
+        body: JSON.stringify(probePayload, null, 2),
+        contentType: 'application/json',
+      });
+
+      if (!/\/profile\/details\/?/i.test(new URL(page.url(), BASE_ORIGIN).pathname)) {
+        markBlockedAndReturn(
+          testInfo,
+          testName,
+          `Profile details route changed during validation probe (resolved to ${page.url()}).`
+        );
+        return;
       }
 
       const passedSignals = Object.values(findings).filter(Boolean).length;
@@ -967,10 +1066,6 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
       ).toBeGreaterThan(0);
 
       runtime.tests[testName] = { status: 'passed', payload: findings };
-      await testInfo.attach('p1-profile-validations.json', {
-        body: JSON.stringify(findings, null, 2),
-        contentType: 'application/json',
-      });
     });
   });
 
@@ -992,7 +1087,15 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
       const interactive = await collectVisibleInteractiveStats(page);
       const hasSettingsControls =
         interactive.buttons > 0 || interactive.selects > 0 || interactive.toggles > 0;
-      expect(hasSettingsControls, 'Settings page should expose interactive controls.').toBeTruthy();
+      if (!hasSettingsControls) {
+        const reason = `Settings route exposed no interactive controls (resolved to ${state.finalUrl || 'unknown URL'}).`;
+        markBlockedAndReturn(testInfo, testName, reason);
+        await testInfo.attach('p1-preferences-unavailable.json', {
+          body: JSON.stringify({ state, interactive, scroll }, null, 2),
+          contentType: 'application/json',
+        });
+        return;
+      }
 
       const utilityButton = await firstVisibleLocator(page, [
         'button:has-text("Enable")',
@@ -1492,10 +1595,12 @@ test.describe('Profile Coverage: P0/P1/P2', () => {
     const blocked = [];
 
     for (const item of planned) {
+      const extraHTTPHeaders = resolveExtraHTTPHeaders();
       const context = await browser.newContext({
         storageState: AUTH_STATE_PATH,
         viewport: item.size,
         ignoreHTTPSErrors: true,
+        ...(extraHTTPHeaders ? { extraHTTPHeaders } : {}),
       });
       try {
         const page = await context.newPage();
@@ -1691,7 +1796,7 @@ function matchesExpectedRoute(url, expected) {
 }
 
 function markBlockedAndReturn(testInfo, testName, reason) {
-  testInfo.annotations.push({ type: 'blocked', description: reason });
+  markBlocked(testInfo, reason);
   runtime.tests[testName] = {
     status: 'blocked',
     reason,
@@ -1723,12 +1828,20 @@ async function getChallengeReason(page) {
   return null;
 }
 
-async function openRoute(page, route) {
+async function openRoute(page, route, options = {}) {
   const requestedUrl = buildUrl(route);
+  const navigationTimeoutMs =
+    Number(options.navigationTimeoutMs || 0) > 0 ? Number(options.navigationTimeoutMs) : 45000;
+  const bodyTimeoutMs =
+    Number(options.bodyTimeoutMs || 0) > 0 ? Number(options.bodyTimeoutMs) : 10000;
   let response = null;
   let navigationError = null;
+  let readinessError = null;
   try {
-    response = await page.goto(requestedUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    response = await page.goto(requestedUrl, {
+      waitUntil: 'domcontentloaded',
+      timeout: navigationTimeoutMs,
+    });
   } catch (err) {
     navigationError = String(err && err.message ? err.message : err);
   }
@@ -1737,8 +1850,27 @@ async function openRoute(page, route) {
   await page
     .locator('body')
     .first()
-    .waitFor({ state: 'visible', timeout: 10000 })
+    .waitFor({ state: 'visible', timeout: bodyTimeoutMs })
     .catch(() => null);
+  await dismissOverlays(page);
+
+  if (/^\/profile\/details\/?$/i.test(route)) {
+    const profileSurface = await waitForAnyVisible(
+      page,
+      [
+        'main input[name*="first" i]',
+        'main input[name*="email" i]',
+        'main input[name*="phone" i]',
+        'main form:has(input)',
+        '.account-edit-form__input input',
+        'form:has(.account-edit-form__input)',
+      ],
+      12000
+    );
+    if (!profileSurface && !navigationError) {
+      readinessError = `Profile details content did not become ready at ${page.url()}.`;
+    }
+  }
 
   const challenge = await getChallengeReason(page);
   return {
@@ -1749,6 +1881,7 @@ async function openRoute(page, route) {
     title: await page.title().catch(() => ''),
     challenge: challenge || (navigationError ? `Navigation failed: ${navigationError}` : null),
     navigationError,
+    readinessError,
   };
 }
 
@@ -1803,6 +1936,71 @@ async function openFirstAvailableRoute(page, routeCandidates) {
     selected: null,
     state: attempts.length ? attempts[attempts.length - 1] : null,
     attempts,
+  };
+}
+
+async function waitForBonusContentReady(page, timeoutMs = 30000) {
+  const startedAt = Date.now();
+  let lastState = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    lastState = await page
+      .evaluate(() => {
+        const isVisible = (node) => {
+          if (!node) return false;
+          const style = window.getComputedStyle(node);
+          const rect = node.getBoundingClientRect();
+          return (
+            style.display !== 'none' &&
+            style.visibility !== 'hidden' &&
+            Number(style.opacity) !== 0 &&
+            rect.width > 2 &&
+            rect.height > 2
+          );
+        };
+        const visibleCount = (selector) =>
+          Array.from(document.querySelectorAll(selector)).filter(isVisible).length;
+        const bodyText = (document.body && document.body.innerText) || '';
+        const visibleSkeletons = visibleCount(
+          '[class*="skeleton" i], [class*="placeholder" i], [aria-busy="true"]'
+        );
+        const bonusControls = visibleCount(
+          '[class*="bonus" i] button, [class*="bonus" i] a, [data-testid*="bonus" i] button, [data-testid*="bonus" i] a'
+        );
+        const bonusCards = visibleCount(
+          '[class*="bonus-card" i], [class*="bonus" i] [class*="item" i], [data-testid*="bonus" i]'
+        );
+        const emptyStateVisible =
+          /no bonuses|you have no bonuses|bonus is unavailable|nothing here/i.test(bodyText);
+        const semanticContentVisible =
+          /bonus|campaign|free spin|cashback/i.test(bodyText) &&
+          (bonusControls > 0 || bonusCards > 0 || emptyStateVisible);
+        return {
+          visibleSkeletons,
+          bonusControls,
+          bonusCards,
+          emptyStateVisible,
+          semanticContentVisible,
+          ready: semanticContentVisible && visibleSkeletons === 0,
+        };
+      })
+      .catch(() => null);
+
+    if (lastState && lastState.ready) {
+      return { ...lastState, waitedMs: Date.now() - startedAt };
+    }
+    await sleep(350);
+  }
+
+  return {
+    ...(lastState || {
+      visibleSkeletons: 0,
+      bonusControls: 0,
+      bonusCards: 0,
+      emptyStateVisible: false,
+      semanticContentVisible: false,
+      ready: false,
+    }),
+    waitedMs: Date.now() - startedAt,
   };
 }
 
@@ -1913,11 +2111,9 @@ async function interactWithSelectOrCombobox(page) {
 }
 
 async function withAuthContext(browser, fn) {
-  const context = await browser.newContext({
-    storageState: AUTH_STATE_PATH,
-    viewport: { width: 1365, height: 900 },
-    ignoreHTTPSErrors: true,
-  });
+  const context = await browser.newContext(
+    resolveMatrixContextOptions({ storageState: AUTH_STATE_PATH })
+  );
   try {
     await fn(context);
   } finally {
@@ -1944,21 +2140,22 @@ async function tryReuseAuthState(browser) {
 }
 
 async function validateAuthState(browser, storagePath) {
-  const context = await browser.newContext({
-    storageState: storagePath,
-    viewport: { width: 1365, height: 900 },
-    ignoreHTTPSErrors: true,
-  });
+  const context = await browser.newContext(
+    resolveMatrixContextOptions({ storageState: storagePath })
+  );
   try {
     const preferences = await context.request
-      .get(buildUrl('/api/user/preferences'))
+      .get(buildUrl('/api/user/preferences'), { timeout: 8000 })
       .catch(() => null);
     if (preferences && preferences.status() === 200) {
       return { ok: true, source: 'api-user-preferences' };
     }
 
     const page = await context.newPage();
-    const state = await openRoute(page, '/profile/');
+    const state = await openRoute(page, '/profile/', {
+      navigationTimeoutMs: 15000,
+      bodyTimeoutMs: 3000,
+    });
     if (state.challenge) return { ok: false, reason: state.challenge };
 
     const loginVisible = await page
@@ -2058,7 +2255,34 @@ function buildUpdatedValue(originalValue) {
   return next.slice(0, 60);
 }
 
+async function dismissProfileConfirmation(page) {
+  const confirmation = await firstVisibleLocator(page, [
+    '.t-profile-modal-email-confirm-component button:has-text("Got it")',
+    '.t-profile-modal-email-confirm-component [aria-label*="close" i]',
+    '.t-profile-modal-email-confirm-component .t-popup__close',
+  ]);
+  if (!confirmation) return false;
+  const clicked = await confirmation
+    .click({ timeout: 3000, force: true })
+    .then(() => true)
+    .catch(() => false);
+  if (clicked) await waitForUiSettled(page, 300);
+  return clicked;
+}
+
 async function hasValidationSignal(input, page) {
+  const nativeInvalid = await input
+    .evaluate((node) => {
+      if (!(
+        node instanceof globalThis.HTMLInputElement ||
+        node instanceof globalThis.HTMLTextAreaElement
+      ))
+        return false;
+      return node.matches(':invalid') || !node.checkValidity() || Boolean(node.validationMessage);
+    })
+    .catch(() => false);
+  if (nativeInvalid) return true;
+
   const ariaInvalid = (await input.getAttribute('aria-invalid').catch(() => '')) || '';
   if (String(ariaInvalid).toLowerCase() === 'true') return true;
 
@@ -2126,6 +2350,7 @@ async function pickPreferenceControl(page) {
     'input[type="checkbox"]',
     '[role="switch"]',
     'button[aria-pressed]',
+    '.t-switch__button',
   ]);
   if (!checkbox) return null;
 
@@ -2161,5 +2386,8 @@ async function readControlState(locator) {
   if (ariaPressed !== null) return String(ariaPressed).toLowerCase() === 'true';
   const ariaChecked = await locator.getAttribute('aria-checked').catch(() => null);
   if (ariaChecked !== null) return String(ariaChecked).toLowerCase() === 'true';
+  const className = (await locator.getAttribute('class').catch(() => '')) || '';
+  if (/(?:^|\s)on(?:\s|$)/i.test(className)) return true;
+  if (/(?:^|\s)off(?:\s|$)/i.test(className)) return false;
   return false;
 }

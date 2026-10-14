@@ -24,6 +24,7 @@ module.exports = [
       'analyze/runs/**',
       'analyze/out/**',
       'projects/**',
+      'output/**',
       'Autotest report/**',
       'log/**',
       'qa-report.html',

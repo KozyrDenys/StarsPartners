@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 
 test.describe('Base URL generated smoke', () => {
   test('Page title is non-empty', async ({ page }) => {

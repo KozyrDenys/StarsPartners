@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const fs = require('fs');
 const path = require('path');
 const {
@@ -82,7 +82,7 @@ function pickPlayerCredentials() {
 
 function makeNewPassword() {
   const tag = Date.now().toString(36).slice(-6);
-  return `Pass2app@R${tag}9`;
+  return `QaReset!${tag}A9`;
 }
 
 async function attachJson(testInfo, name, payload) {

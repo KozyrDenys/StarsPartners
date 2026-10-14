@@ -11,18 +11,23 @@ concurrency:
   group: qa-ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   quality:
     if: ${{ github.event_name != 'pull_request' || !contains(github.actor, 'dependabot') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22
+          node-version: 24.20.0
           cache: npm
 
       - name: Install dependencies
@@ -59,12 +64,14 @@ jobs:
         mode: [desktop, mobile]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          node-version: 22
+          node-version: 24.20.0
           cache: npm
 
       - name: Install dependencies
@@ -97,7 +104,7 @@ jobs:
 
       - name: Upload QA artifacts (${{ matrix.brand.key }} | ${{ matrix.mode }})
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: qa-${{ matrix.brand.slug }}-${{ matrix.mode }}
           if-no-files-found: warn

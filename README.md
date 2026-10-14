@@ -47,8 +47,8 @@
 
 ## Требования
 
-1. Node.js LTS `22.x` (текущий пин: `22.22.2` в `.nvmrc`/`.node-version`; `20.x` поддерживается как fallback)
-2. npm `>=10`
+1. Node.js `24.x` LTS (текущий пин: `24.18.0` в `.nvmrc`/`.node-version`)
+2. npm `12.x`
 3. Установленные браузеры Playwright
 
 ## Быстрый старт
@@ -138,10 +138,12 @@ QA_PROJECT_SLUG=gt.bet
 npm run qa:doctor
 npm run qa:doctor:preflight
 npm run qa:audit:deep
-npm run qa:tools:install
+npm run qa:tools:install                 # core tools
+bash scripts/tools/install-qa-extras.sh mobile
+bash scripts/tools/install-qa-extras.sh performance
+bash scripts/tools/install-qa-extras.sh dev
 npm run qa:stealth:probe
 npm run qa:dashboard
-npm run qa:setup:java-allure
 npm run qa:all:smoke
 npm run qa:all:extended
 npm run qa:all:gt
@@ -151,6 +153,7 @@ npm run qa:all:nix
 npm run qa:all:starzino
 npm run qa:all:igo
 npm run qa:all:chacha
+npm run qa:all:casho
 # отдельные full-run команды по режимам (desktop/mobile) для каждого бренда
 npm run qa:all:gt:desktop
 npm run qa:all:gt:mobile
@@ -166,6 +169,8 @@ npm run qa:all:igo:desktop
 npm run qa:all:igo:mobile
 npm run qa:all:chacha:desktop
 npm run qa:all:chacha:mobile
+npm run qa:all:casho:desktop
+npm run qa:all:casho:mobile
 # полный прогон всех брендов отдельно по desktop и mobile
 npm run qa:all:brands:desktop
 npm run qa:all:brands:mobile
@@ -184,6 +189,11 @@ npm run qa:all:gt:mobile:providers
 # dry-run (проверка матрицы брендов/путей без запуска тестов)
 node scripts/qa-brand-run.js --brand=all --mode=desktop --dry-run=1
 node scripts/qa-brand-run.js --brand=all --mode=mobile --dry-run=1
+
+# Все перечисленные локальные brand-run команды (desktop/mobile, full/core/providers)
+# по умолчанию используют native Chrome + один persistent CDP context на бренд.
+# Старые изолированные Playwright contexts — только для сравнения/диагностики.
+PW_CDP_REUSE_CONTEXT=0 npm run qa:all:gt:desktop
 npm run qa:precheck:gt
 npm run qa:precheck:likes
 npm run qa:precheck:booms
@@ -208,7 +218,6 @@ npm run save:state:igo
 npm run save:state:chacha
 npm run qa:yq:version
 npm run qa:k6:version
-npm run qa:newman:version
 npm run qa:imagemagick:version
 
 # универсально через BASE_URL (любой бренд)
@@ -273,10 +282,8 @@ PW_PROVIDER_PROFILE=smoke npm run qa:all      # быстрый профиль (�
 PW_PROVIDER_PROFILE=extended npm run qa:all   # расширенная матрица провайдеров
 PW_PROVIDER_PROFILE=nightly npm run qa:all    # полный обход без лимита provider max
 
-# Allure results
-npm run qa:allure
-npm run qa:allure:generate
-npm run qa:allure:open
+# нативные Playwright HTML + JUnit + JSON reports
+npm run qa:report:native
 
 # Playwright UI / Trace
 npm run qa:ui
@@ -340,12 +347,6 @@ npm run qa:localization:all:desktop:full:shard2
 4. По пушу тега автоматически стартует `Release On Tag`.
 5. `Release On Tag` публикует GitHub Release с auto-generated release notes.
 6. Для ручной публикации существующего тега можно запустить `Release On Tag` через `workflow_dispatch` и передать `tag`.
-
-Если запускаете Allure не через npm scripts, добавьте Java в `PATH`:
-
-```bash
-export PATH="/opt/homebrew/opt/openjdk/bin:$PATH"
-```
 
 Docker-based security/perf слой:
 
@@ -522,39 +523,33 @@ PW_AI_REQUIRED=1 npm run qa:all
 npm run prepare
 ```
 
+Дополнительные проверки качества:
+
+```bash
+npm run env:check       # загрузка и проверка .env средствами Node.js
+npm run unit            # быстрые unit-тесты без браузера
+npm run unit:coverage   # unit-тесты со встроенным coverage Node.js
+npm run arch:check      # архитектурные границы и циклические зависимости
+npm run quality:strict  # полный статический quality gate
+```
+
 ## Дополнительные интеграции
 
 Установлены и готовы к подключению:
 
-1. BrowserStack (`browserstack-node-sdk`)  
+1. BrowserStack (`browserstack-node-sdk`)
    Команды:
    - `npm run qa:browserstack`
    - `npm run qa:browserstack:desktop`
    - `npm run qa:browserstack:mobile`
      Конфиг: `browserstack.yml`
 
-2. ReportPortal (`@reportportal/agent-js-playwright`)  
-   Команды:
-   - `npm run qa:reportportal`
-   - `npm run qa:reportportal:all`  
-     Конфиг: `reportportal.config.js`  
-     Нужно задать: `RP_ENDPOINT`, `RP_API_KEY` (или `RP_TOKEN`), `RP_PROJECT`.
-
-3. Pact Broker / can-i-deploy (`@pact-foundation/pact-node`)  
-   Команды:
-   - `npm run qa:pact:publish`
-   - `npm run qa:pact:can-i-deploy`  
-     Скрипты:
-   - `scripts/tools/pact-publish.js`
-   - `scripts/tools/pact-can-i-deploy.js`  
-     Папка пактов: `contracts/pacts/`.
-
-4. MailSlurp (`mailslurp-client`)  
+2. MailSlurp (`mailslurp-client`)
    Команда:
-   - `npm run qa:mailslurp:health`  
+   - `npm run qa:mailslurp:health`
      Нужен `MAILSLURP_API_KEY`.
 
-5. Sentry + OpenTelemetry  
+3. Sentry + OpenTelemetry
    Команды:
    - `npm run qa:telemetry:smoke`
    - `npm run qa:all:telemetry`  
@@ -563,20 +558,31 @@ npm run prepare
    - `scripts/telemetry-bootstrap.js`
    - `scripts/tools/telemetry-smoke.js`
 
-6. Grafana Alloy (дополнительно к Promtail/Loki)  
+4. Grafana Alloy + Loki/Grafana observability stack
    Команды:
-   - `npm run qa:observability:up:alloy`
-   - `npm run qa:observability:status:alloy`  
+   - `npm run qa:observability:up`
+   - `npm run qa:observability:status`
      Конфиг: `docker/observability/alloy-config.river`
 
-7. Cloudflare Turnstile test-mode (QA/staging)  
+5. Cloudflare Turnstile test-mode (QA/staging)
    Переменные добавлены в `.env.example`:
    - `CF_TURNSTILE_SITE_KEY`
    - `CF_TURNSTILE_SECRET_KEY`
    - `CF_TURNSTILE_TEST_MODE`
+   - `PW_QA_BYPASS_HEADER_NAME`
+   - `PW_QA_BYPASS_HEADER_VALUE`
+   - `PW_EXTRA_HTTP_HEADERS_JSON`
+   - `CF_ACCESS_CLIENT_ID`
+   - `CF_ACCESS_CLIENT_SECRET`
+
+   Для стабильных E2E-прогонов используйте Cloudflare skip/challenge-bypass rule на стороне
+   зоны: доверенный QA IP + секретный header. Playwright автоматически прокидывает header из
+   `PW_QA_BYPASS_HEADER_NAME/PW_QA_BYPASS_HEADER_VALUE` в стандартные browser contexts.
+   Если зона использует Cloudflare Access, задайте пару `CF_ACCESS_CLIENT_ID` и
+   `CF_ACCESS_CLIENT_SECRET`; runner автоматически отправит стандартные service-token headers.
 
 ## Безопасность
 
 1. Не храните реальные токены и секреты в git.
 2. Используйте `.env.example` как шаблон.
-3. Не коммитьте `storageState.json`, `test-results/`, `analyze/runs/`, `allure-results/`.
+3. Не коммитьте `storageState.json`, `test-results/`, `playwright-report/`, `analyze/runs/`.

@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "checkJs": true,
+    "noImplicitAny": false,
+    "strictNullChecks": false
+  },
+  "include": ["scripts/lib/**/*.js", "scripts/tools/validate-env.js", "unit/**/*.js"]
+}

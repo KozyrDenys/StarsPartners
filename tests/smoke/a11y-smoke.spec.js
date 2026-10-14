@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const AxeBuilder = require('@axe-core/playwright').default;
 const {
   assertNotCloudflare,

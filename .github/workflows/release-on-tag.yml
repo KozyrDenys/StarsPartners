@@ -20,9 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Resolve tag
         id: meta
@@ -30,12 +31,14 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
-            tag="${{ inputs.tag }}"
+            tag="${INPUTS_TAG}"
           else
             tag="${GITHUB_REF_NAME}"
           fi
           echo "tag=${tag}" >>"${GITHUB_OUTPUT}"
           echo "Release tag: ${tag}"
+        env:
+          INPUTS_TAG: ${{ inputs.tag }}
 
       - name: Verify tag exists
         shell: bash
@@ -45,7 +48,7 @@ jobs:
           git rev-parse "${{ steps.meta.outputs.tag }}" >/dev/null
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@5113cdc90fd4d541c801c55356214017bf5ae34b # v3
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.tag }}

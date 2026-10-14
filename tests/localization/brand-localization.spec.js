@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const LanguageDetect = require('languagedetect');
 const { franc } = require('franc');
 const {
@@ -45,10 +45,12 @@ const SHARED_PROJECT_ARTIFACTS_DIR = path.join(SHARED_PROJECT_ROOT_DIR, 'artifac
 const ARTIFACT_DIR = path.join(PROJECT_AUTOTEST_REPORT_DIR, 'localization');
 const AUTH_STATE_CANDIDATES = [
   process.env.PW_STORAGE_STATE || '',
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'auth-state.json'),
+  path.join(SHARED_PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   path.join(SHARED_PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(SHARED_PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(SHARED_PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),

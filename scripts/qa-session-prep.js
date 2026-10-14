@@ -1,6 +1,9 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
+const { loadProjectEnv } = require('./lib/env');
+
+loadProjectEnv();
 
 const BRAND_CATALOG = {
   gt: { key: 'gt', slug: 'gt.bet', baseUrl: 'https://gt.bet' },
@@ -10,10 +13,29 @@ const BRAND_CATALOG = {
   starzino: { key: 'starzino', slug: 'starzino.com', baseUrl: 'https://starzino.com' },
   igo: { key: 'igo', slug: 'igo.bet', baseUrl: 'https://igo.bet' },
   chacha: { key: 'chacha', slug: 'chacha.bet', baseUrl: 'https://chacha.bet' },
+  casho: { key: 'casho', slug: 'casho.bet', baseUrl: 'https://casho.bet' },
 };
 
-const DEFAULT_ORDER = ['gt', 'likes', 'booms', 'nix', 'starzino', 'igo', 'chacha'];
+const DEFAULT_ORDER = ['gt', 'likes', 'booms', 'nix', 'starzino', 'igo', 'chacha', 'casho'];
 const VALID_MODES = new Set(['desktop', 'mobile']);
+
+function getBrandSessionDefaults(brand, mode) {
+  const isSingleRouteWarmupBrand =
+    brand && ['booms', 'casho', 'chacha', 'igo', 'nix'].includes(brand.key);
+  if (!isSingleRouteWarmupBrand) {
+    return {
+      warmupRoutes: '/,/assets/,/casino/,/casino/recent/',
+      timeout: mode === 'mobile' ? '240' : '180',
+      warmupTimeout: mode === 'mobile' ? '90' : '75',
+    };
+  }
+
+  return {
+    warmupRoutes: '/',
+    timeout: mode === 'mobile' ? '300' : '240',
+    warmupTimeout: mode === 'mobile' ? '120' : '90',
+  };
+}
 
 function parseArgs(argv) {
   const args = {};
@@ -83,6 +105,7 @@ function runSaveState({ brand, mode, cwd, auto = false }) {
   ensureDir(paths.profileDir);
 
   const mobile = mode === 'mobile';
+  const sessionDefaults = getBrandSessionDefaults(brand, mode);
   const env = {
     ...process.env,
     BASE_URL: brand.baseUrl,
@@ -94,11 +117,11 @@ function runSaveState({ brand, mode, cwd, auto = false }) {
     PW_STORAGE_STATE: paths.storageState,
     PW_SAVE_STATE_PERSISTENT: process.env.PW_SAVE_STATE_PERSISTENT || '1',
     PW_SAVE_STATE_PROFILE_DIR: process.env.PW_SAVE_STATE_PROFILE_DIR || paths.profileDir,
-    PW_SAVE_STATE_TIMEOUT: process.env.PW_SAVE_STATE_TIMEOUT || (mobile ? '240' : '180'),
+    PW_SAVE_STATE_TIMEOUT: process.env.PW_SAVE_STATE_TIMEOUT || sessionDefaults.timeout,
     PW_SAVE_STATE_WARMUP_TIMEOUT:
-      process.env.PW_SAVE_STATE_WARMUP_TIMEOUT || (mobile ? '90' : '75'),
+      process.env.PW_SAVE_STATE_WARMUP_TIMEOUT || sessionDefaults.warmupTimeout,
     PW_SAVE_STATE_WARMUP_ROUTES:
-      process.env.PW_SAVE_STATE_WARMUP_ROUTES || '/,/assets/,/casino/,/casino/recent/',
+      process.env.PW_SAVE_STATE_WARMUP_ROUTES || sessionDefaults.warmupRoutes,
     PW_SAVE_STATE_WARMUP_STRICT: process.env.PW_SAVE_STATE_WARMUP_STRICT || '0',
     PW_SAVE_STATE_VIEWPORT: process.env.PW_SAVE_STATE_VIEWPORT || (mobile ? '390x844' : '1365x900'),
     PW_SAVE_STATE_IS_MOBILE: process.env.PW_SAVE_STATE_IS_MOBILE || (mobile ? '1' : '0'),

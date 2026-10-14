@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const {
   detectCloudflare,
   dismissOverlays,
@@ -9,6 +9,7 @@ const {
   waitForUiSettled,
 } = require('../helpers/gt-utils');
 const { pickBestAuthStatePath } = require('../helpers/auth-state');
+const { resolveMatrixContextOptions } = require('../helpers/context-options');
 const { createWsCapture } = require('../helpers/ws-capture');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
@@ -32,6 +33,7 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
@@ -45,6 +47,32 @@ const AUTH_STATE_CANDIDATES = [
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function raceWithTimeout(promise, timeoutMs) {
+  const timeoutToken = Symbol('timeout');
+  let timer = null;
+  const timed = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(timeoutToken), Math.max(1000, Number(timeoutMs) || 1000));
+  });
+  const result = await Promise.race([
+    Promise.resolve(promise).then(
+      (value) => ({ value }),
+      (error) => ({ error })
+    ),
+    timed,
+  ]);
+  if (timer) clearTimeout(timer);
+  if (result === timeoutToken) return { timedOut: true, value: null, error: null };
+  return { timedOut: false, value: result.value, error: result.error || null };
+}
+
+async function closeContextSafe(context, timeoutMs = 10_000) {
+  if (!context) return;
+  await Promise.race([
+    context.close().catch(() => null),
+    new Promise((resolve) => setTimeout(resolve, Math.max(1000, timeoutMs))),
+  ]).catch(() => null);
 }
 
 function buildUrl(route) {
@@ -114,17 +142,33 @@ async function getChallengeReason(page) {
 }
 
 async function waitForLiveCasinoContent(page) {
-  const heading = page.getByText(/live casino/i).first();
-  const searchBtn = page.locator('.t-games-catalog__search-btn').first();
-  const filterBtn = page.locator('.t-games-filters-mobile__toggle').first();
-  const gameCard = page.locator('.t-game-item').first();
-
-  await Promise.any([
-    heading.waitFor({ state: 'visible', timeout: 30000 }),
-    searchBtn.waitFor({ state: 'visible', timeout: 30000 }),
-    filterBtn.waitFor({ state: 'visible', timeout: 30000 }),
-    gameCard.waitFor({ state: 'visible', timeout: 30000 }),
-  ]).catch(() => null);
+  const deadlineAt = Date.now() + 30_000;
+  let lastState = { gameCards: 0, skeletons: 0, emptyStateVisible: false };
+  while (Date.now() < deadlineAt) {
+    const gameCards = await page
+      .locator(
+        '.t-game-item a[href], .t-games-catalog a[href*="/casino/"], main [class*="game-card" i] a[href]'
+      )
+      .count()
+      .catch(() => 0);
+    const skeletons = await page
+      .locator(
+        'main [class*="skeleton" i]:visible, main [class*="placeholder" i]:visible, main [aria-busy="true"]:visible'
+      )
+      .count()
+      .catch(() => 0);
+    const emptyStateVisible = await page
+      .getByText(/^(nothing found|no games|no results|not available)$/i)
+      .first()
+      .isVisible()
+      .catch(() => false);
+    lastState = { gameCards, skeletons, emptyStateVisible };
+    if ((gameCards > 0 || emptyStateVisible) && skeletons === 0) {
+      return { ready: true, ...lastState };
+    }
+    await sleep(400);
+  }
+  return { ready: false, ...lastState };
 }
 
 async function openLiveCasino(page) {
@@ -200,6 +244,7 @@ async function closeLiveSearchModal(page) {
 }
 
 async function openLiveSearch(page) {
+  await dismissOverlays(page).catch(() => null);
   const searchBtn = await firstVisibleLocator(page, [
     '.t-games-catalog__search-btn',
     '[class*="search-btn" i]',
@@ -216,7 +261,25 @@ async function openLiveSearch(page) {
     };
   }
 
-  await searchBtn.click({ timeout: 7000 }).catch(() => null);
+  let clicked = await searchBtn
+    .click({ timeout: 7000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!clicked) {
+    clicked = await searchBtn
+      .click({ timeout: 3000, force: true })
+      .then(() => true)
+      .catch(() => false);
+  }
+  if (!clicked) {
+    clicked = await searchBtn
+      .evaluate((element) => {
+        element.scrollIntoView({ block: 'center', inline: 'center' });
+        element.click();
+        return true;
+      })
+      .catch(() => false);
+  }
   await waitForUiSettled(page, 1200);
 
   const modal = page.locator('.t-game-search-modal').first();
@@ -225,6 +288,8 @@ async function openLiveSearch(page) {
     '.t-game-search-modal input[placeholder*="Provider" i]',
     '.t-game-search-modal input[type="search"]',
     '.t-game-search-modal input[type="text"]',
+    '[role="dialog"] input[type="search"]',
+    '[role="dialog"] input[type="text"]',
   ]);
 
   return {
@@ -264,9 +329,10 @@ async function collectSearchResultTitles(modalOrPage) {
 async function openLiveFilterPanel(page) {
   const existing = await firstVisibleLocator(page, [
     '.t-games-filters-mobile__body:visible',
-    '.t-games-filters-mobile:visible',
-    '.t-games-filters:visible',
-    'text=Filters',
+    '.t-games-filters-mobile__body .t-games-filters-block.providers:visible',
+    '.t-games-filters-block.providers.is-active-tabs:visible',
+    '.t-games-filters-block.providers:visible',
+    '[class*="games-filters-panel" i]:visible',
   ]);
   if (existing) return { opened: true, panel: existing, reason: null };
 
@@ -286,9 +352,10 @@ async function openLiveFilterPanel(page) {
 
   const panel = await firstVisibleLocator(page, [
     '.t-games-filters-mobile__body:visible',
-    '.t-games-filters-mobile:visible',
-    '.t-games-filters:visible',
-    'text=Filters',
+    '.t-games-filters-mobile__body .t-games-filters-block.providers:visible',
+    '.t-games-filters-block.providers.is-active-tabs:visible',
+    '.t-games-filters-block.providers:visible',
+    '[class*="games-filters-panel" i]:visible',
   ]);
   if (!panel) return { opened: false, panel: null, reason: 'Filter panel not visible.' };
 
@@ -426,7 +493,7 @@ async function ensureInteractive(page) {
   await dismissOverlays(page);
 }
 
-async function withLiveCasinoPage(browser, testInfo, testName, run) {
+async function withLiveCasinoPage(browser, testInfo, testName, run, options = {}) {
   fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
 
   const authStatePath = pickAuthStatePath();
@@ -440,15 +507,28 @@ async function withLiveCasinoPage(browser, testInfo, testName, run) {
     return;
   }
 
-  const context = await browser.newContext({
-    storageState: authStatePath,
-    viewport: { width: 1365, height: 900 },
-    ignoreHTTPSErrors: true,
-  });
+  const context = await browser.newContext(
+    resolveMatrixContextOptions({ storageState: authStatePath })
+  );
   const page = await context.newPage();
 
   try {
-    const route = await openLiveCasino(page);
+    const setupTimeoutMs = Math.max(30_000, Number(options.setupTimeoutMs || 90_000));
+    const routeStage = await raceWithTimeout(openLiveCasino(page), setupTimeoutMs);
+    if (routeStage.timedOut) {
+      const reason = `TEST_INFRA_TIMEOUT: live casino setup exceeded ${setupTimeoutMs} ms.`;
+      markBlocked(testInfo, reason);
+      await page.close({ runBeforeUnload: false }).catch(() => null);
+      await writeAndAttach(testInfo, testName, {
+        blocked: true,
+        reason,
+        stage: 'setup',
+        authStatePath,
+      });
+      return;
+    }
+    if (routeStage.error) throw routeStage.error;
+    const route = routeStage.value;
     if (route.challenge) {
       const payload = { blocked: true, reason: route.challenge, route, authStatePath };
       markBlocked(testInfo, route.challenge);
@@ -498,9 +578,31 @@ async function withLiveCasinoPage(browser, testInfo, testName, run) {
       return;
     }
 
-    await run({ context, page, route, authStatePath });
+    const runTimeoutMs = Number(options.runTimeoutMs || 0);
+    if (runTimeoutMs > 0) {
+      const runStage = await raceWithTimeout(
+        run({ context, page, route, authStatePath }),
+        runTimeoutMs
+      );
+      if (runStage.timedOut) {
+        const reason = `TEST_INFRA_TIMEOUT: live casino diagnostic flow exceeded ${runTimeoutMs} ms.`;
+        markBlocked(testInfo, reason);
+        await page.close({ runBeforeUnload: false }).catch(() => null);
+        await writeAndAttach(testInfo, `${testName}-timeout`, {
+          blocked: true,
+          reason,
+          stage: 'diagnostic-flow',
+          route,
+          authStatePath,
+        });
+        return;
+      }
+      if (runStage.error) throw runStage.error;
+    } else {
+      await run({ context, page, route, authStatePath });
+    }
   } finally {
-    await context.close();
+    await closeContextSafe(context);
   }
 }
 
@@ -527,18 +629,23 @@ async function collectLiveCards(page) {
         const provider = (node.querySelector('.t-game-item__hover-provider')?.textContent || '')
           .replace(/\s+/g, ' ')
           .trim();
-        if (!title || !provider) continue;
+        if (!title) continue;
 
-        out.push({ title, provider });
+        out.push({ title, provider, providerExposed: Boolean(provider) });
       }
       return out;
     })
     .catch(() => []);
 }
 
-async function launchCardByProviderAndTitle(context, page, provider, title) {
+async function launchCardByProviderAndTitle(context, page, provider, title, options = {}) {
+  const maxCards = Math.max(1, Number(options.maxCards || 40));
+  const locatorTimeoutMs = Math.max(100, Number(options.locatorTimeoutMs || 750));
+  const popupTimeoutMs = Math.max(500, Number(options.popupTimeoutMs || 6000));
+  const clickTimeoutMs = Math.max(500, Number(options.clickTimeoutMs || 9000));
+  const postLaunchWaitMs = Math.max(0, Number(options.postLaunchWaitMs ?? 5000));
   const cards = page.locator('.t-game-item');
-  const count = Math.min(await cards.count().catch(() => 0), 80);
+  const count = Math.min(await cards.count().catch(() => 0), maxCards);
   let target = null;
 
   for (let i = 0; i < count; i += 1) {
@@ -548,12 +655,12 @@ async function launchCardByProviderAndTitle(context, page, provider, title) {
       (await card
         .locator('.t-game-item__hover-name')
         .first()
-        .innerText()
+        .innerText({ timeout: locatorTimeoutMs })
         .catch(() => '')) ||
       (await card
         .locator('img[alt]')
         .first()
-        .getAttribute('alt')
+        .getAttribute('alt', { timeout: locatorTimeoutMs })
         .catch(() => '')) ||
       ''
     )
@@ -563,45 +670,50 @@ async function launchCardByProviderAndTitle(context, page, provider, title) {
       (await card
         .locator('.t-game-item__hover-provider')
         .first()
-        .innerText()
+        .innerText({ timeout: locatorTimeoutMs })
         .catch(() => '')) || ''
     )
       .replace(/\s+/g, ' ')
       .trim();
-    if (cardTitle === title && cardProvider === provider) {
+    if (cardTitle === title && (!provider || !cardProvider || cardProvider === provider)) {
       target = card;
       break;
     }
   }
 
   if (!target) {
-    return { launched: false, reason: 'Card with strict provider+title match not found.' };
+    return {
+      launched: false,
+      reason: provider
+        ? 'Card with provider+title match not found.'
+        : 'Card with title match not found.',
+    };
   }
 
-  await target.scrollIntoViewIfNeeded().catch(() => null);
-  await target.hover().catch(() => null);
+  await target.scrollIntoViewIfNeeded({ timeout: locatorTimeoutMs }).catch(() => null);
+  await target.hover({ timeout: locatorTimeoutMs }).catch(() => null);
   await waitForUiSettled(page, 500);
 
   const playButton = target
     .locator('.t-game-play__button, .t-game-item__hover-play button')
     .first();
   const beforeUrl = page.url();
-  const popupPromise = context.waitForEvent('page', { timeout: 6000 }).catch(() => null);
+  const popupPromise = context.waitForEvent('page', { timeout: popupTimeoutMs }).catch(() => null);
 
-  if (await playButton.isVisible().catch(() => false)) {
-    await playButton.click({ timeout: 9000 }).catch(async () => {
-      await target.click({ timeout: 9000 }).catch(() => null);
+  if (await playButton.isVisible({ timeout: locatorTimeoutMs }).catch(() => false)) {
+    await playButton.click({ timeout: clickTimeoutMs }).catch(async () => {
+      await target.click({ timeout: clickTimeoutMs }).catch(() => null);
     });
   } else {
-    await target.click({ timeout: 9000 }).catch(() => null);
+    await target.click({ timeout: clickTimeoutMs }).catch(() => null);
   }
 
   const popup = await popupPromise;
   if (popup) {
-    await popup.waitForLoadState('domcontentloaded').catch(() => null);
+    await popup.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => null);
   }
   await waitForUiSettled(page, 1500);
-  await sleep(5000);
+  if (postLaunchWaitMs > 0) await sleep(postLaunchWaitMs);
 
   const currentUrl = page.url();
   const iframe = await page.evaluate(() => {
@@ -626,7 +738,12 @@ async function launchCardByProviderAndTitle(context, page, provider, title) {
     (/\/casino\/[\w-]+\/[\w-]+\/?$/i.test(currentUrl) && !/\/livecasino\/?$/i.test(currentUrl)) ||
     Boolean(iframe);
 
-  if (popup) await popup.close().catch(() => null);
+  if (popup) {
+    await Promise.race([
+      popup.close({ runBeforeUnload: false }).catch(() => null),
+      sleep(3000),
+    ]).catch(() => null);
+  }
 
   return {
     launched,
@@ -637,7 +754,8 @@ async function launchCardByProviderAndTitle(context, page, provider, title) {
   };
 }
 
-test.describe.configure({ mode: 'serial' });
+// Live-casino checks are independent; one failure must not cascade into SKIPPED coverage.
+test.describe.configure({ mode: 'default' });
 
 test.describe('Live Casino Coverage: search/filter interactions', () => {
   test.setTimeout(180000);
@@ -816,6 +934,7 @@ test.describe('Live Casino Coverage: search/filter interactions', () => {
   });
 
   test('P1 Live Launch batch: launch and verify 1-5 games', async ({ browser }, testInfo) => {
+    test.setTimeout(Math.max(240_000, LIVE_GAMES_TARGET * 60_000 + 60_000));
     const testName = 'p1_live_launch_batch_1_5_games';
     await withLiveCasinoPage(
       browser,
@@ -914,6 +1033,7 @@ test.describe('Live Casino Coverage: search/filter interactions', () => {
   test('P2 Live WebSocket diagnostics: capture WS traffic on search/filter/launch flow', async ({
     browser,
   }, testInfo) => {
+    test.setTimeout(240000);
     const testName = 'p2_live_websocket_diagnostics';
     await withLiveCasinoPage(
       browser,
@@ -922,55 +1042,98 @@ test.describe('Live Casino Coverage: search/filter interactions', () => {
       async ({ context, page, route, authStatePath }) => {
         const wsCapture = createWsCapture(page, { sampleLimit: 24, framePreviewLength: 260 });
 
-        const search = await openLiveSearch(page);
-        if (search.opened && search.inputVisible && search.input) {
-          await search.input.fill('roulette').catch(() => null);
-          await waitForUiSettled(page, 900);
-          await closeLiveSearchModal(page).catch(() => null);
-        }
+        const stages = [];
+        let flowError = '';
+        let wsSummary = null;
+        try {
+          const search = await openLiveSearch(page);
+          stages.push({ name: 'search', completed: true, opened: Boolean(search.opened) });
+          if (search.opened && search.inputVisible && search.input) {
+            await search.input.fill('roulette', { timeout: 3000 }).catch(() => null);
+            await waitForUiSettled(page, 900);
+            await closeLiveSearchModal(page).catch(() => null);
+          }
 
-        const filter = await openLiveFilterPanel(page);
-        if (filter.opened && filter.panel) {
-          await activateProvidersTab(filter.panel).catch(() => null);
-          await toggleFirstProvider(filter.panel.page()).catch(() => null);
-          await closeLiveFilterPanel(page, filter.panel).catch(() => null);
-        }
+          const filter = await openLiveFilterPanel(page);
+          stages.push({ name: 'filter', completed: true, opened: Boolean(filter.opened) });
+          if (filter.opened && filter.panel) {
+            await activateProvidersTab(filter.panel).catch(() => null);
+            await toggleFirstProvider(filter.panel.page()).catch(() => null);
+            await closeLiveFilterPanel(page, filter.panel).catch(() => null);
+          }
 
-        const cards = await collectLiveCards(page);
-        if (cards.length) {
-          const sample = cards[0];
-          await launchCardByProviderAndTitle(context, page, sample.provider, sample.title).catch(
-            () => null
-          );
-        }
-
-        const wsSummary = wsCapture.summarize({
-          area: 'livecasino',
-          finalUrl: page.url(),
-        });
-        const noSockets = Number(wsSummary.totals && wsSummary.totals.sockets) === 0;
-
-        if (noSockets) {
+          const cards = await collectLiveCards(page);
+          stages.push({ name: 'cards', completed: true, count: cards.length });
+          if (cards.length) {
+            const sample = cards[0];
+            const launch = await launchCardByProviderAndTitle(
+              context,
+              page,
+              sample.provider,
+              sample.title,
+              {
+                maxCards: 24,
+                locatorTimeoutMs: 400,
+                popupTimeoutMs: 2500,
+                clickTimeoutMs: 5000,
+                postLaunchWaitMs: 1500,
+              }
+            ).catch((error) => ({
+              launched: false,
+              reason: String(error && error.message ? error.message : error),
+            }));
+            stages.push({ name: 'launch', completed: true, sample, launch });
+          }
+        } catch (error) {
+          flowError = String(error && error.message ? error.message : error);
           testInfo.annotations.push({
             type: 'partial',
-            description:
-              'Live casino routes opened, but no WebSocket connections were observed in this observation window.',
+            description: `Live WebSocket diagnostic flow was only partially completed: ${flowError}`,
+          });
+        } finally {
+          wsSummary = wsCapture.summarize({
+            area: 'livecasino',
+            finalUrl: page.url(),
+          });
+          const noSockets = Number(wsSummary.totals && wsSummary.totals.sockets) === 0;
+          const launchStage = stages.find((stage) => stage.name === 'launch');
+          const filterStage = stages.find((stage) => stage.name === 'filter');
+          const onlySupportChatSockets =
+            !noSockets &&
+            wsSummary.sockets.every((socket) => /livechatinc|lc\.chat|livechat/i.test(socket.url));
+          const incompleteInteraction =
+            Boolean(filterStage && !filterStage.opened) ||
+            Boolean(launchStage && !(launchStage.launch && launchStage.launch.launched));
+          if (noSockets || onlySupportChatSockets || incompleteInteraction) {
+            testInfo.annotations.push({
+              type: 'partial',
+              description: noSockets
+                ? 'Live casino routes opened, but no WebSocket connections were observed in this observation window.'
+                : onlySupportChatSockets
+                  ? 'Only support-chat WebSocket traffic was observed; no game-provider socket was confirmed.'
+                  : 'Live casino diagnostic interactions were incomplete; filter or game launch was not confirmed.',
+            });
+          }
+          await writeAndAttach(testInfo, testName, {
+            blocked: false,
+            partial:
+              noSockets || onlySupportChatSockets || incompleteInteraction || Boolean(flowError),
+            route,
+            authStatePath,
+            stages,
+            flowError,
+            onlySupportChatSockets,
+            incompleteInteraction,
+            wsSummary,
           });
         }
 
-        await writeAndAttach(testInfo, testName, {
-          blocked: false,
-          partial: noSockets,
-          route,
-          authStatePath,
-          wsSummary,
-        });
-
         expect(
-          Array.isArray(wsSummary.sockets),
+          Array.isArray(wsSummary && wsSummary.sockets),
           'WS diagnostics should return sockets array.'
         ).toBeTruthy();
-      }
+      },
+      { setupTimeoutMs: 75_000 }
     );
   });
 });

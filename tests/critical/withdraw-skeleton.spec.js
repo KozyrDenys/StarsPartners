@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const {
   closeModal,
   detectCloudflare,
@@ -10,6 +10,7 @@ const {
   waitForUiSettled,
 } = require('../helpers/gt-utils');
 const { pickBestAuthStatePath } = require('../helpers/auth-state');
+const { resolveMatrixContextOptions } = require('../helpers/context-options');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const BASE_ORIGIN = new URL(BASE_URL).origin;
@@ -24,6 +25,7 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
@@ -199,11 +201,9 @@ test('Withdraw skeleton: open withdraw surface and validate controls', async ({
     return;
   }
 
-  const context = await browser.newContext({
-    storageState: authStatePath,
-    viewport: { width: 1365, height: 900 },
-    ignoreHTTPSErrors: true,
-  });
+  const context = await browser.newContext(
+    resolveMatrixContextOptions({ storageState: authStatePath })
+  );
   const page = await context.newPage();
 
   const payload = {

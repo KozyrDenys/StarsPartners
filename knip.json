@@ -6,8 +6,6 @@
     "analyze/**/*.js",
     "analyze.js",
     "generate/**/*.js",
-    "generate-test.js",
-    "test.js",
     ".lighthouserc.js"
   ],
   "project": ["**/*.js"],
@@ -20,18 +18,8 @@
     "duplicates",
     "catalog"
   ],
-  "ignoreBinaries": ["yq", "k6", "magick"],
-  "ignoreDependencies": [
-    "dotenv",
-    "@stoplight/spectral-cli",
-    "allure-playwright",
-    "eslint-config-prettier",
-    "lighthouse",
-    "pixelmatch",
-    "pngjs",
-    "tsx",
-    "zod"
-  ],
+  "ignoreBinaries": ["yq", "k6", "magick", "osv-scanner"],
+  "ignoreDependencies": ["@stoplight/spectral-cli"],
   "ignoreIssues": {
     "tests/helpers/api-contract-checks.js": ["exports"],
     "tests/helpers/brand-capabilities.js": ["exports"],

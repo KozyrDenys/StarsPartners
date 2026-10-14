@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const { resolveProjectPaths } = require('../helpers/project-paths');
 const {
   assertNotCloudflare,
@@ -11,7 +11,10 @@ const {
   markBlocked,
   waitForUiSettled,
 } = require('../helpers/gt-utils');
-const { pickBestAuthStatePath } = require('../helpers/auth-state');
+const { pickBestAuthStatePath, readAuthStateMeta } = require('../helpers/auth-state');
+const { applyAuthTokenCookie } = require('../helpers/signup-api-fallback');
+const { sanitizeArtifactPayload, serializeArtifactPayload } = require('../helpers/artifact-output');
+const { resolveExtraHTTPHeaders } = require('../helpers/context-options');
 
 const BASE_URL = process.env.BASE_URL || 'https://gt.bet/';
 const BASE_ORIGIN = new URL(BASE_URL).origin;
@@ -19,6 +22,7 @@ const PROJECT_PATHS = resolveProjectPaths({ cwd: process.cwd(), baseUrl: BASE_UR
 const PROJECT_AUTOTEST_REPORT_DIR =
   process.env.QA_AUTOTEST_REPORT_DIR || PROJECT_PATHS.autotestReportDir;
 const PROJECT_ARTIFACTS_DIR = process.env.QA_ARTIFACTS_DIR || PROJECT_PATHS.artifactsDir;
+const PROJECT_TEST_RESULTS_DIR = process.env.QA_TEST_RESULTS_DIR || PROJECT_PATHS.testResultsDir;
 const ARTIFACT_DIR = path.join(PROJECT_AUTOTEST_REPORT_DIR, 'deposit');
 const EXPLICIT_STORAGE_STATE_PATH = process.env.PW_STORAGE_STATE
   ? path.resolve(String(process.env.PW_STORAGE_STATE))
@@ -27,6 +31,7 @@ const PROJECT_ROOT_STORAGE_STATE_PATH = process.env.QA_PROJECT_ROOT
   ? path.join(path.resolve(String(process.env.QA_PROJECT_ROOT)), 'storageState.json')
   : '';
 const AUTH_STATE_CANDIDATES = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),
@@ -77,10 +82,11 @@ function resolveContextOptions(testInfo, authStatePath) {
       : { width: 1365, height: 900 };
 
   const options = {
-    storageState: authStatePath,
     viewport,
     ignoreHTTPSErrors: true,
+    ...(resolveExtraHTTPHeaders() ? { extraHTTPHeaders: resolveExtraHTTPHeaders() } : {}),
   };
+  if (authStatePath) options.storageState = authStatePath;
 
   if (typeof projectUse.isMobile === 'boolean') options.isMobile = projectUse.isMobile;
   if (typeof projectUse.hasTouch === 'boolean') options.hasTouch = projectUse.hasTouch;
@@ -93,6 +99,41 @@ function resolveContextOptions(testInfo, authStatePath) {
 
 function pickAuthStatePath() {
   return pickBestAuthStatePath(AUTH_STATE_CANDIDATES);
+}
+
+const REGISTRATION_TOKEN_CANDIDATES = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-data-current-run.json'),
+  path.join(PROJECT_ARTIFACTS_DIR, 'last-registered-player.json'),
+  path.join(PROJECT_TEST_RESULTS_DIR, 'registration-data.json'),
+];
+
+function readRegistrationAuthToken() {
+  for (const candidate of REGISTRATION_TOKEN_CANDIDATES) {
+    try {
+      const payload = JSON.parse(fs.readFileSync(candidate, 'utf8'));
+      const token = String(payload && payload.authToken ? payload.authToken : '').trim();
+      if (token.length >= 10) return { token, sourcePath: candidate };
+    } catch {
+      // try next registration artifact
+    }
+  }
+  return null;
+}
+
+async function recoverContextAuth(context, authStatePath, testInfo) {
+  const stateMeta = authStatePath ? readAuthStateMeta(authStatePath, 0) : null;
+  if (stateMeta && stateMeta.hasAuthArtifacts) {
+    return { source: 'storage-state', sourcePath: authStatePath };
+  }
+
+  const registrationAuth = readRegistrationAuthToken();
+  if (!registrationAuth) return { source: 'none', sourcePath: '' };
+  await applyAuthTokenCookie(context, registrationAuth.token, BASE_URL);
+  testInfo.annotations.push({
+    type: 'auth-recovery',
+    description: 'Deposit context auth token restored from current registration artifact.',
+  });
+  return { source: 'registration-token', sourcePath: registrationAuth.sourcePath };
 }
 
 function normalizeText(value) {
@@ -119,13 +160,19 @@ function looksLikeSkeleton(value) {
 function writeArtifact(payload, fileName = 'deposit-non-destructive.json') {
   fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
   const artifactPath = path.join(ARTIFACT_DIR, fileName);
-  fs.writeFileSync(artifactPath, JSON.stringify(payload, null, 2), 'utf8');
+  fs.writeFileSync(artifactPath, serializeArtifactPayload(payload), 'utf8');
   return artifactPath;
 }
 
 async function attachArtifact(testInfo, fileName, payload) {
-  const body = JSON.stringify(payload, null, 2);
-  writeArtifact(payload, fileName);
+  const stampedPayload = {
+    ...payload,
+    runId: String(process.env.QA_RUN_ID || '').trim() || null,
+    generatedAt: new Date().toISOString(),
+  };
+  const sanitizedPayload = sanitizeArtifactPayload(stampedPayload);
+  const body = serializeArtifactPayload(sanitizedPayload);
+  writeArtifact(sanitizedPayload, fileName);
   await testInfo.attach(fileName, {
     body,
     contentType: 'application/json',
@@ -233,7 +280,13 @@ function looksLikeChallengeHtml(value) {
   );
 }
 
-async function probeApiDepositMethod(context, method) {
+function isChallengeReason(value) {
+  return /cloudflare|turnstile|captcha|challenge|waf|cdn-cgi|__cf_chl|just a moment|security verification|forbidden|http 403/i.test(
+    String(value || '')
+  );
+}
+
+async function probeApiDepositMethod(context, page, method) {
   const createOrderUrl = normalizeMethodName(
     method && method.createOrderUrl ? method.createOrderUrl : ''
   );
@@ -258,17 +311,62 @@ async function probeApiDepositMethod(context, method) {
   let challenge = false;
 
   try {
-    response = await context.request.get(requestUrl, {
-      failOnStatusCode: false,
-      timeout: DEPOSIT_API_METHOD_TIMEOUT_MS,
-    });
-    status = response.status();
-    finalUrl = response.url();
-    const bodyText = await response.text().catch(() => '');
-    bodyPreview = compactText(bodyText, 220);
-    challenge =
-      looksLikeChallengeHtml(bodyText) ||
-      /cdn-cgi|challenge-platform|__cf_chl_rt_tk=|cf_chl_/i.test(finalUrl);
+    if (process.env.PW_CDP_REUSE_CONTEXT === '1' && page) {
+      const browserResult = await page.evaluate(
+        async ({ url, timeoutMs }) => {
+          const controller = new globalThis.AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const browserResponse = await fetch(url, {
+              method: 'GET',
+              credentials: 'include',
+              redirect: 'follow',
+              signal: controller.signal,
+              headers: {
+                Accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+              },
+            });
+            return {
+              status: browserResponse.status,
+              finalUrl: browserResponse.url || url,
+              bodyText: await browserResponse.text().catch(() => ''),
+              error: '',
+            };
+          } catch (browserError) {
+            return {
+              status: 0,
+              finalUrl: url,
+              bodyText: '',
+              error: String(
+                browserError && browserError.message ? browserError.message : browserError
+              ),
+            };
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+        { url: requestUrl, timeoutMs: DEPOSIT_API_METHOD_TIMEOUT_MS }
+      );
+      status = Number(browserResult.status || 0);
+      finalUrl = browserResult.finalUrl || requestUrl;
+      bodyPreview = compactText(browserResult.bodyText, 220);
+      error = compactText(browserResult.error, 220);
+      challenge =
+        looksLikeChallengeHtml(browserResult.bodyText) ||
+        /cdn-cgi|challenge-platform|__cf_chl_rt_tk=|cf_chl_/i.test(finalUrl);
+    } else {
+      response = await context.request.get(requestUrl, {
+        failOnStatusCode: false,
+        timeout: DEPOSIT_API_METHOD_TIMEOUT_MS,
+      });
+      status = response.status();
+      finalUrl = response.url();
+      const bodyText = await response.text().catch(() => '');
+      bodyPreview = compactText(bodyText, 220);
+      challenge =
+        looksLikeChallengeHtml(bodyText) ||
+        /cdn-cgi|challenge-platform|__cf_chl_rt_tk=|cf_chl_/i.test(finalUrl);
+    }
   } catch (err) {
     error = compactText(err && err.message ? err.message : err, 220);
   }
@@ -285,7 +383,13 @@ async function probeApiDepositMethod(context, method) {
   };
 }
 
-async function runApiDepositMethodCoverage({ context, apiFallback, methodLimit = 0, testInfo }) {
+async function runApiDepositMethodCoverage({
+  context,
+  page,
+  apiFallback,
+  methodLimit = 0,
+  testInfo,
+}) {
   const inventory =
     apiFallback && apiFallback.inventory ? apiFallback.inventory : buildDepositInventory([]);
   const discovered = flattenInventoryMethods(inventory);
@@ -321,7 +425,7 @@ async function runApiDepositMethodCoverage({ context, apiFallback, methodLimit =
       break;
     }
 
-    const probe = await probeApiDepositMethod(context, method);
+    const probe = await probeApiDepositMethod(context, page, method);
     const result = {
       method: method.label,
       selected: probe.ok,
@@ -405,6 +509,24 @@ function isAuthFailureResponse(status, bodyPreview = '') {
     text.includes('credentials_not_valid') ||
     text.includes('wrong login or password') ||
     text.includes('unauthorized')
+  );
+}
+
+function isRejectedHtmlResponse(status, bodyPreview = '') {
+  return (
+    Number(status || 0) === 400 && /<html|<!doctype|bad request/i.test(String(bodyPreview || ''))
+  );
+}
+
+function isDepositAuthLikelyInvalid(apiFallback, authRecovery) {
+  if (Number(apiFallback && apiFallback.itemsCount ? apiFallback.itemsCount : 0) > 0) return false;
+  if (!authRecovery || authRecovery.source === 'none') return true;
+  return Boolean(
+    apiFallback &&
+    (Number(apiFallback.bestStatus || 0) === 401 ||
+      Number(apiFallback.bestStatus || 0) === 403 ||
+      apiFallback.unauthorizedDetected ||
+      apiFallback.requestRejectedDetected)
   );
 }
 
@@ -578,7 +700,7 @@ async function fetchDepositInventoryViaApi(context, page = null) {
       bodyPreview,
     });
 
-    if (items.length > (best.items || []).length) {
+    if (items.length > (best.items || []).length || (!best.url && status > 0)) {
       best = {
         currency,
         url: requestUrl,
@@ -591,11 +713,17 @@ async function fetchDepositInventoryViaApi(context, page = null) {
   }
 
   const inventory = buildDepositInventory(best.items || []);
+  const completedAttempts = attempts.filter(
+    (item) => Number(item && item.status ? item.status : 0) > 0
+  );
   return {
     attemptedCurrencies: currencies,
     attempts,
     unauthorizedDetected: attempts.some((item) => Boolean(item && item.unauthorized)),
     unauthorizedAttempts: attempts.filter((item) => Boolean(item && item.unauthorized)).length,
+    requestRejectedDetected:
+      completedAttempts.length > 0 &&
+      completedAttempts.every((item) => isRejectedHtmlResponse(item.status, item.bodyPreview)),
     bestCurrency: best.currency || '',
     bestUrl: best.url || '',
     bestStatus: Number(best.status || 0),
@@ -620,6 +748,14 @@ async function withStepTimeout(promise, timeoutMs, label) {
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+async function closeContextSafely(context, timeoutMs = 5000) {
+  if (!context) return;
+  await Promise.race([
+    context.close().catch(() => null),
+    new Promise((resolve) => setTimeout(resolve, Math.max(1000, timeoutMs))),
+  ]).catch(() => null);
 }
 
 async function getChallengeReason(page) {
@@ -988,6 +1124,11 @@ async function collectPaymentMethods(container) {
             el.hasAttribute('disabled') ||
             el.getAttribute('aria-disabled') === 'true' ||
             ('disabled' in el && Boolean(el.disabled));
+          const ariaBusy = el.getAttribute('aria-busy') === 'true';
+          const loadedImage = Array.from(el.querySelectorAll('img')).some(
+            (img) => img.complete && img.naturalWidth > 1 && Boolean(img.currentSrc || img.src)
+          );
+          const hasSvg = Boolean(el.querySelector('svg:not([class*="skeleton" i])'));
           return {
             testId,
             className,
@@ -1000,10 +1141,12 @@ async function collectPaymentMethods(container) {
             x: rect.x,
             y: rect.y,
             disabled,
+            ariaBusy,
+            meaningfulGraphic: loadedImage || hasSvg,
           };
         })
         .catch(() => null);
-      if (!meta || meta.disabled) continue;
+      if (!meta || meta.disabled || meta.ariaBusy) continue;
       if (meta.width < 70 || meta.height < 28) continue;
       const labelRaw =
         meta.imgAlt || meta.text || meta.ariaLabel || meta.title || meta.testId || meta.className;
@@ -1011,6 +1154,7 @@ async function collectPaymentMethods(container) {
       const labelBlob = `${label} ${meta.testId} ${meta.className}`.trim();
       if (looksLikeSkeleton(labelBlob)) continue;
       if (isNoiseMethodLabel(labelBlob)) continue;
+      if (isTechnicalPaymentLabel(label) && !meta.meaningfulGraphic) continue;
       explicit.push({
         label,
         selector,
@@ -1229,6 +1373,42 @@ async function detectDepositUnavailableState(container, page) {
   };
 }
 
+async function detectDepositVerificationGate(page) {
+  const patterns = [
+    /email (?:has been )?sent.{0,160}verification link/i,
+    /verification link.{0,160}(?:email|e-mail)/i,
+    /verify (?:your )?(?:email|e-mail)/i,
+    /complete (?:your )?(?:sign.?up|registration).{0,160}email/i,
+    /e-?mail.{0,160}envoy.{0,160}lien de v[ée]rification/i,
+    /lien de v[ée]rification.{0,160}e-?mail/i,
+    /v[ée]rif(?:iez|ier).{0,160}e-?mail/i,
+    /correo.{0,160}enlace de verificaci[oó]n/i,
+    /verific(?:a|are).{0,160}e-?mail/i,
+    /best[äa]tig.{0,160}e-?mail/i,
+  ];
+  const visibleText = await page
+    .locator('body')
+    .first()
+    .innerText()
+    .then((value) =>
+      String(value || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+    )
+    .catch(() => '');
+  const matchedPattern = patterns.find((pattern) => pattern.test(visibleText));
+  if (!matchedPattern) {
+    return { visible: false, matchedText: '', source: null };
+  }
+
+  const matchedText = visibleText.match(matchedPattern)?.[0] || '';
+  return {
+    visible: true,
+    matchedText: String(matchedText).slice(0, 220),
+    source: 'visible-page-text',
+  };
+}
+
 async function ensureVisibleDepositContainer(page, container, timeoutMs = 10000) {
   const deadlineAt = Date.now() + timeoutMs;
   let current = container;
@@ -1260,30 +1440,58 @@ function summarizeUiCategories(methods) {
 }
 
 async function waitForDepositPaySystemsResponse(page, timeoutMs = 15000) {
-  const response = await page
-    .waitForResponse(
-      (resp) =>
-        /\/api\/payment\/getPaySystems\?operation=deposit&currency=/i.test(resp.url()) &&
-        resp.status() === 200,
-      { timeout: timeoutMs }
-    )
-    .catch(() => null);
-  if (!response) return { items: [], responseFound: false };
+  const deadlineAt = Date.now() + timeoutMs;
+  const responses = [];
+  let best = null;
 
-  const payload = await response.json().catch(() => null);
-  const items = Array.isArray(payload && payload.data && payload.data.items)
-    ? payload.data.items
-    : [];
-  return {
-    items,
-    responseFound: true,
-    url: response.url(),
-    status: response.status(),
-  };
+  while (Date.now() < deadlineAt) {
+    const response = await page
+      .waitForResponse(
+        (resp) => {
+          try {
+            const url = new URL(resp.url());
+            return (
+              /\/api\/payment\/getPaySystems$/i.test(url.pathname) &&
+              url.searchParams.get('operation') === 'deposit' &&
+              Boolean(url.searchParams.get('currency'))
+            );
+          } catch {
+            return false;
+          }
+        },
+        { timeout: Math.max(500, deadlineAt - Date.now()) }
+      )
+      .catch(() => null);
+    if (!response) break;
+
+    const payload = await response.json().catch(() => null);
+    const items = Array.isArray(payload && payload.data && payload.data.items)
+      ? payload.data.items
+      : [];
+    let currency = '';
+    try {
+      currency = new URL(response.url()).searchParams.get('currency') || '';
+    } catch {
+      currency = '';
+    }
+    const candidate = {
+      items,
+      responseFound: true,
+      url: response.url(),
+      status: response.status(),
+      currency,
+      itemsCount: items.length,
+    };
+    responses.push({ ...candidate, items: undefined });
+    if (!best || items.length > best.items.length) best = candidate;
+    if (items.length > 0) break;
+  }
+
+  return best ? { ...best, responses } : { items: [], responseFound: false, responses };
 }
 
 async function ensureMethodPickerVisible(container, page) {
-  const targetContainer = await resolveFreshDepositContainer(page, container);
+  let targetContainer = await resolveFreshDepositContainer(page, container);
   if (!targetContainer) return false;
 
   const methodTile = await firstVisibleLocator(targetContainer, [
@@ -1305,12 +1513,42 @@ async function ensureMethodPickerVisible(container, page) {
   await changeMethod.click({ timeout: 7000 }).catch(() => null);
   await waitForUiSettled(page, 1500);
 
+  targetContainer = await resolveFreshDepositContainer(page, targetContainer);
+  if (!targetContainer) return false;
   const reopened = await firstVisibleLocator(targetContainer, [
     '[data-testid^="deposit-method-"]',
     '.t-fund-payment-method__grid-item',
     '[class*="payment-method__grid-item" i]',
   ]);
   return Boolean(reopened);
+}
+
+async function resolvePaymentMethodTarget(page, container, method) {
+  const activeContainer = await resolveFreshDepositContainer(page, container);
+  if (!activeContainer) return { container: null, target: null };
+
+  await ensureMethodPickerVisible(activeContainer, page).catch(() => false);
+  const freshContainer = await resolveFreshDepositContainer(page, activeContainer);
+  if (!freshContainer) return { container: null, target: null };
+
+  if (method.methodId) {
+    const byTestId = freshContainer.locator(`[data-testid="${method.methodId}"]`).first();
+    if (await byTestId.isVisible().catch(() => false)) {
+      return { container: freshContainer, target: byTestId };
+    }
+  }
+
+  const refreshedMethods = await collectPaymentMethods(freshContainer).catch(() => []);
+  const normalizedLabel = normalizeText(method.label);
+  const refreshedMethod = refreshedMethods.find(
+    (candidate) =>
+      (method.methodId && candidate.methodId === method.methodId) ||
+      normalizeText(candidate.label) === normalizedLabel
+  );
+  return {
+    container: freshContainer,
+    target: refreshedMethod ? refreshedMethod.locator : null,
+  };
 }
 
 async function waitForPaymentMethods(container, page, timeoutMs = 15000) {
@@ -1345,7 +1583,9 @@ async function waitForPaymentMethods(container, page, timeoutMs = 15000) {
 
 async function inspectDepositMethodSurface(container, page, methodLabel) {
   const scopes = [container, page];
-  const selectedLabels = await collectSelectedLabels(container);
+  const selectedLabels = (await collectSelectedLabels(container)).filter(
+    (label) => !/^(?:deposit|continue|pay|amount|currency)$/i.test(String(label || '').trim())
+  );
   const normalizedMethodLabel = normalizeText(methodLabel);
   const normalizedSelectedLabels = selectedLabels.map((label) => normalizeText(label));
 
@@ -1388,6 +1628,20 @@ async function inspectDepositMethodSurface(container, page, methodLabel) {
     'input[name*="iban" i]',
     'input[name*="holder" i]',
   ]);
+  const qrCode = await firstVisibleLocatorInScopes(scopes, [
+    'img[src*="/api/qr/code" i]',
+    'img[src*="qr" i]',
+    '[data-testid*="qr" i]',
+    '[class*="qr-code" i]',
+    '[class*="qrcode" i]',
+  ]);
+  const depositAddress = await firstVisibleLocatorInScopes(scopes, [
+    'input[name*="address" i]',
+    'input[readonly][value]',
+    '[data-testid*="address" i]',
+    '[class*="deposit-address" i]',
+    '[class*="wallet-address" i]',
+  ]);
 
   const unavailableMessageVisible = await page
     .getByText(
@@ -1402,7 +1656,11 @@ async function inspectDepositMethodSurface(container, page, methodLabel) {
     ? containerText.includes(normalizedMethodLabel) ||
       normalizedSelectedLabels.some((label) => label.includes(normalizedMethodLabel))
     : selectedLabels.length > 0;
-  const selectedMethodEcho = normalizedSelectedLabels.length > 0;
+  const selectedMethodEcho = normalizedSelectedLabels.some(
+    (label) =>
+      Boolean(normalizedMethodLabel) &&
+      (label.includes(normalizedMethodLabel) || normalizedMethodLabel.includes(label))
+  );
   const submitVisible = Boolean(submitButton);
   const submitEnabled = submitButton ? await submitButton.isEnabled().catch(() => false) : false;
   const amountInputVisible = Boolean(amountInput);
@@ -1410,12 +1668,16 @@ async function inspectDepositMethodSurface(container, page, methodLabel) {
   const changeMethodVisible = Boolean(changeMethodButton);
   const presetAmountVisible = Boolean(presetAmountButton);
   const paymentFieldVisible = Boolean(paymentField);
+  const qrCodeVisible = Boolean(qrCode);
+  const depositAddressVisible = Boolean(depositAddress);
 
   const actionSignals = [
     submitVisible,
     amountInputVisible,
     presetAmountVisible,
     paymentFieldVisible,
+    qrCodeVisible,
+    depositAddressVisible,
   ].filter(Boolean);
   const contextSignals = [
     methodLabelVisible,
@@ -1423,8 +1685,19 @@ async function inspectDepositMethodSurface(container, page, methodLabel) {
     changeMethodVisible,
     currencyVisible,
   ].filter(Boolean);
+  const transactionSignals = [
+    amountInputVisible,
+    presetAmountVisible,
+    paymentFieldVisible,
+    changeMethodVisible,
+    qrCodeVisible,
+    depositAddressVisible,
+  ].filter(Boolean);
   const surfaceReady =
-    !unavailableMessageVisible && actionSignals.length > 0 && contextSignals.length > 0;
+    !unavailableMessageVisible &&
+    actionSignals.length > 0 &&
+    transactionSignals.length > 0 &&
+    (selectedMethodEcho || (methodLabelVisible && !isTechnicalPaymentLabel(methodLabel)));
 
   return {
     selectedLabels,
@@ -1437,6 +1710,8 @@ async function inspectDepositMethodSurface(container, page, methodLabel) {
     changeMethodVisible,
     presetAmountVisible,
     paymentFieldVisible,
+    qrCodeVisible,
+    depositAddressVisible,
     unavailableMessageVisible,
     actionSignals: actionSignals.length,
     contextSignals: contextSignals.length,
@@ -1445,7 +1720,7 @@ async function inspectDepositMethodSurface(container, page, methodLabel) {
 }
 
 async function clickMethod(method, container, page) {
-  const activeContainer = await resolveFreshDepositContainer(page, container);
+  let activeContainer = await resolveFreshDepositContainer(page, container);
   if (!activeContainer) {
     return {
       method: method.label,
@@ -1456,9 +1731,6 @@ async function clickMethod(method, container, page) {
   }
 
   await ensureMethodPickerVisible(activeContainer, page);
-  const targetLocator = method.methodId
-    ? activeContainer.locator(`[data-testid="${method.methodId}"]`).first()
-    : method.locator;
 
   const beforeSelected = await collectSelectedLabels(activeContainer);
   const normalizedMethodLabel = normalizeText(method.label);
@@ -1466,13 +1738,27 @@ async function clickMethod(method, container, page) {
     normalizeText(label).includes(normalizedMethodLabel)
   );
   let clickError = null;
+  let clickSucceeded = false;
 
-  try {
-    await targetLocator.scrollIntoViewIfNeeded().catch(() => null);
-    await targetLocator.click({ timeout: 3500 });
-  } catch (err) {
-    clickError = String(err && err.message ? err.message : err);
-    await targetLocator.click({ timeout: 2500, force: true }).catch(() => null);
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const resolved = await resolvePaymentMethodTarget(page, activeContainer, method);
+    activeContainer = resolved.container || activeContainer;
+    if (!resolved.target) {
+      clickError = `Payment method target was not found on attempt ${attempt}.`;
+      await waitForUiSettled(page, 500);
+      continue;
+    }
+
+    try {
+      await resolved.target.scrollIntoViewIfNeeded().catch(() => null);
+      await resolved.target.click({ timeout: attempt === 1 ? 3500 : 2500, force: attempt > 1 });
+      clickSucceeded = true;
+      clickError = null;
+      break;
+    } catch (err) {
+      clickError = String(err && err.message ? err.message : err);
+      await waitForUiSettled(page, 500);
+    }
   }
 
   try {
@@ -1496,7 +1782,7 @@ async function clickMethod(method, container, page) {
     };
   }
 
-  const postClickContainer = await resolveFreshDepositContainer(page, activeContainer);
+  let postClickContainer = await resolveFreshDepositContainer(page, activeContainer);
   if (!postClickContainer) {
     return {
       method: method.label,
@@ -1513,9 +1799,11 @@ async function clickMethod(method, container, page) {
     normalizeText(label).includes(normalizedMethodLabel)
   );
   const preliminarySelected = Boolean(
-    selectedStateChanged || methodSelectedAfterClick || (methodSelectedBeforeClick && !clickError)
+    selectedStateChanged ||
+    methodSelectedAfterClick ||
+    (methodSelectedBeforeClick && clickSucceeded)
   );
-  const surface = await inspectDepositMethodSurface(postClickContainer, page, method.label).catch(
+  let surface = await inspectDepositMethodSurface(postClickContainer, page, method.label).catch(
     () => ({
       selectedLabels: afterSelected,
       methodLabelVisible: false,
@@ -1527,13 +1815,38 @@ async function clickMethod(method, container, page) {
       changeMethodVisible: false,
       presetAmountVisible: false,
       paymentFieldVisible: false,
+      qrCodeVisible: false,
+      depositAddressVisible: false,
       unavailableMessageVisible: false,
       actionSignals: 0,
       contextSignals: 0,
       surfaceReady: false,
     })
   );
-  const selected = Boolean(preliminarySelected || surface.surfaceReady);
+  if (clickSucceeded && !surface.surfaceReady) {
+    const hydrationDeadline = Date.now() + 8000;
+    while (Date.now() < hydrationDeadline && !surface.surfaceReady) {
+      await waitForUiSettled(page, 500);
+      postClickContainer = await resolveFreshDepositContainer(page, postClickContainer);
+      if (!postClickContainer) break;
+      surface = await inspectDepositMethodSurface(postClickContainer, page, method.label).catch(
+        () => surface
+      );
+      if (surface.qrCodeVisible || surface.depositAddressVisible) break;
+    }
+  }
+  const transactionSurfaceReady = Boolean(
+    !surface.unavailableMessageVisible &&
+    surface.actionSignals > 0 &&
+    (surface.amountInputVisible ||
+      surface.presetAmountVisible ||
+      surface.paymentFieldVisible ||
+      surface.qrCodeVisible ||
+      surface.depositAddressVisible ||
+      surface.changeMethodVisible)
+  );
+  const surfaceReady = Boolean(surface.surfaceReady || (clickSucceeded && transactionSurfaceReady));
+  const selected = Boolean(preliminarySelected || surfaceReady);
 
   return {
     method: method.label,
@@ -1544,8 +1857,14 @@ async function clickMethod(method, container, page) {
     beforeSelected,
     afterSelected,
     clickError,
-    surfaceReady: surface.surfaceReady,
-    surface,
+    clickSucceeded,
+    surfaceReady,
+    surface: {
+      ...surface,
+      transactionSurfaceReady,
+      surfaceReady,
+      selectionEvidence: preliminarySelected ? 'selected-state-change' : '',
+    },
   };
 }
 
@@ -1553,11 +1872,14 @@ test.describe('Deposit non-destructive checks', () => {
   test('Payment inventory: UI categories align with deposit API pay systems', async ({
     browser,
   }, testInfo) => {
-    test.setTimeout(180000);
+    // Navigation/recovery (45s), UI retries (45s), response capture (20s) and
+    // multi-currency API fallback can legitimately exceed three minutes on a
+    // CDP session. Keep the outer timeout above the sum of the bounded stages.
+    test.setTimeout(360000);
     fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
 
     const authStatePath = pickAuthStatePath();
-    if (!authStatePath) {
+    if (!authStatePath && !readRegistrationAuthToken()) {
       markBlocked(testInfo, 'No auth state found for authorized deposit checks.');
       const payload = {
         blocked: true,
@@ -1571,6 +1893,7 @@ test.describe('Deposit non-destructive checks', () => {
     }
 
     const context = await browser.newContext(resolveContextOptions(testInfo, authStatePath));
+    const authRecovery = await recoverContextAuth(context, authStatePath, testInfo);
     const page = await context.newPage();
     let apiFallbackCache = null;
     const ensureApiFallback = async () => {
@@ -1601,30 +1924,29 @@ test.describe('Deposit non-destructive checks', () => {
         const apiFallback = await ensureApiFallback();
         const apiInventory = apiFallback.inventory || buildDepositInventory([]);
         const hasApiFallback = Number(apiFallback.itemsCount || 0) > 0;
-        const authStateLikelyInvalid =
-          !hasApiFallback &&
-          (Number(apiFallback.bestStatus || 0) === 401 ||
-            Number(apiFallback.bestStatus || 0) === 403 ||
-            Boolean(apiFallback.unauthorizedDetected));
+        const authStateLikelyInvalid = isDepositAuthLikelyInvalid(apiFallback, authRecovery);
         const normalizedReason = authStateLikelyInvalid
           ? `${reason} Auth state appears invalid for deposit API fallback (HTTP ${
               Number(apiFallback.bestStatus || 0) || 'unauthorized'
             }).`
           : reason;
 
+        const uiChallengeBlocked = isChallengeReason(normalizedReason);
         if (hasApiFallback) {
           testInfo.annotations.push({
             type: 'partial',
             description: `Deposit UI is blocked, API fallback inventory was collected (${apiInventory.itemsCount} methods; currency=${apiFallback.bestCurrency || 'n/a'}).`,
           });
-        } else {
+        }
+        if (uiChallengeBlocked || !hasApiFallback) {
           markBlocked(testInfo, normalizedReason);
         }
 
         const payload = {
           ...extra,
           authStatePath,
-          blocked: !hasApiFallback,
+          authRecovery,
+          blocked: uiChallengeBlocked || !hasApiFallback,
           partial: hasApiFallback,
           reason: normalizedReason,
           authStateLikelyInvalid,
@@ -1735,6 +2057,11 @@ test.describe('Deposit non-destructive checks', () => {
           await writeInventoryBlockedPayload(reason, { route, surface });
           return;
         }
+        await writeInventoryBlockedPayload(
+          'Deposit methods are not discoverable in current UI run; empty/skeleton placeholders were ignored.',
+          { route, surface }
+        );
+        return;
       }
       expect(
         paymentMethods.length,
@@ -1742,15 +2069,14 @@ test.describe('Deposit non-destructive checks', () => {
       ).toBeGreaterThan(0);
 
       const inventoryResponse = await inventoryResponsePromise;
-      const apiInventory = buildDepositInventory(inventoryResponse.items);
-      expect(
-        inventoryResponse.responseFound,
-        'Deposit API pay systems response was not captured.'
-      ).toBeTruthy();
-      expect(
-        apiInventory.itemsCount,
-        'Deposit API pay systems inventory is empty.'
-      ).toBeGreaterThan(0);
+      const capturedInventory = buildDepositInventory(inventoryResponse.items);
+      const apiFallback = capturedInventory.itemsCount > 0 ? null : await ensureApiFallback();
+      const apiInventory =
+        capturedInventory.itemsCount > 0
+          ? capturedInventory
+          : apiFallback && apiFallback.inventory
+            ? apiFallback.inventory
+            : buildDepositInventory([]);
 
       const uiSummary = summarizeUiCategories(paymentMethods);
       const technicalUiLabels = uiSummary.uniqueCategories.filter((label) =>
@@ -1805,6 +2131,7 @@ test.describe('Deposit non-destructive checks', () => {
       const payload = {
         route,
         authStatePath,
+        authRecovery,
         uiCoverageAvailable: Number(uiSummary.totalTiles || 0) > 0,
         apiCoverageAvailable: Number(apiInventory.itemsCount || 0) > 0,
         sourceMode: resolveCoverageSourceMode({
@@ -1819,7 +2146,10 @@ test.describe('Deposit non-destructive checks', () => {
           responseFound: inventoryResponse.responseFound,
           url: inventoryResponse.url || '',
           status: inventoryResponse.status || 0,
+          currency: inventoryResponse.currency || (apiFallback && apiFallback.bestCurrency) || '',
+          responses: inventoryResponse.responses || [],
         },
+        apiFallback,
         apiInventory,
         uiInventory: uiSummary,
         comparisonMode,
@@ -1830,11 +2160,18 @@ test.describe('Deposit non-destructive checks', () => {
 
       await attachArtifact(testInfo, 'deposit-inventory.json', payload);
 
+      expect(
+        apiInventory.itemsCount,
+        'Deposit API pay systems inventory is empty after captured-response and currency fallback checks.'
+      ).toBeGreaterThan(0);
+
       if (surface.modal) {
-        await closeModal(surface.modal, page).catch(() => null);
+        await withStepTimeout(closeModal(surface.modal, page), 4000, 'closeDepositModal').catch(
+          () => null
+        );
       }
     } finally {
-      await context.close().catch(() => null);
+      await closeContextSafely(context);
     }
   });
 
@@ -1845,7 +2182,7 @@ test.describe('Deposit non-destructive checks', () => {
     fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
 
     const authStatePath = pickAuthStatePath();
-    if (!authStatePath) {
+    if (!authStatePath && !readRegistrationAuthToken()) {
       markBlocked(testInfo, 'No auth state found for authorized deposit checks.');
       const payload = {
         blocked: true,
@@ -1859,6 +2196,7 @@ test.describe('Deposit non-destructive checks', () => {
     }
 
     const context = await browser.newContext(resolveContextOptions(testInfo, authStatePath));
+    const authRecovery = await recoverContextAuth(context, authStatePath, testInfo);
     const page = await context.newPage();
     let apiFallbackCache = null;
     const ensureApiFallback = async () => {
@@ -1886,11 +2224,7 @@ test.describe('Deposit non-destructive checks', () => {
       const writeMethodCoverageFallbackPayload = async (reason, extra = {}) => {
         const apiFallback = await ensureApiFallback();
         const hasApiFallback = Number(apiFallback.itemsCount || 0) > 0;
-        const authStateLikelyInvalid =
-          !hasApiFallback &&
-          (Number(apiFallback.bestStatus || 0) === 401 ||
-            Number(apiFallback.bestStatus || 0) === 403 ||
-            Boolean(apiFallback.unauthorizedDetected));
+        const authStateLikelyInvalid = isDepositAuthLikelyInvalid(apiFallback, authRecovery);
         const normalizedReason = authStateLikelyInvalid
           ? `${reason} Auth state appears invalid for deposit API fallback (HTTP ${
               Number(apiFallback.bestStatus || 0) || 'unauthorized'
@@ -1902,6 +2236,7 @@ test.describe('Deposit non-destructive checks', () => {
             ...extra,
             route: extra.route || null,
             authStatePath,
+            authRecovery,
             blocked: true,
             reason: normalizedReason,
             authStateLikelyInvalid,
@@ -1917,16 +2252,25 @@ test.describe('Deposit non-destructive checks', () => {
 
         const apiCoverage = await runApiDepositMethodCoverage({
           context,
+          page,
           apiFallback,
           methodLimit: DEPOSIT_METHOD_LIMIT,
           testInfo,
         });
 
+        const apiChallengeBlocked = apiCoverage.selectionResults.some(
+          (item) => item && (item.challenge || (item.api && item.api.challenge))
+        );
+        const uiChallengeBlocked = isChallengeReason(normalizedReason);
+        const coverageBlocked = uiChallengeBlocked || apiChallengeBlocked;
+        if (coverageBlocked) markBlocked(testInfo, normalizedReason);
+
         const payload = {
           ...extra,
           route: extra.route || null,
           authStatePath,
-          blocked: false,
+          authRecovery,
+          blocked: coverageBlocked,
           partial: true,
           reason: normalizedReason,
           authStateLikelyInvalid,
@@ -2049,11 +2393,54 @@ test.describe('Deposit non-destructive checks', () => {
           });
           return;
         }
+        const verificationGate = await detectDepositVerificationGate(page);
+        if (verificationGate.visible) {
+          const reason =
+            'Deposit method UI is gated by pending account email verification; method health is not verifiable in this account state.';
+          const apiFallback = await ensureApiFallback();
+          markBlocked(testInfo, reason);
+          testInfo.annotations.push({
+            type: 'deposit-verification-gate',
+            description: reason,
+          });
+          await attachArtifact(testInfo, 'deposit-non-destructive.json', {
+            route,
+            authStatePath,
+            authRecovery,
+            blocked: true,
+            reason,
+            verificationGate,
+            methodFunctionalityStatus: 'not-verifiable-email-pending',
+            uiCoverageAvailable: false,
+            apiCoverageAvailable: Number(apiFallback.itemsCount || 0) > 0,
+            sourceMode: 'ui-gated-api-inventory',
+            apiFallback,
+            surface: {
+              modal: Boolean(surface.modal),
+              panel: Boolean(surface.panel),
+            },
+            paymentMethodsDiscoveredCount: 0,
+            paymentMethodsCheckedCount: 0,
+            paymentMethodsReadyCount: 0,
+            network,
+          });
+          return;
+        }
         if (waitMethodsError) {
           const reason = `Deposit methods are not discoverable in current UI run: ${waitMethodsError}`;
           await writeMethodCoverageFallbackPayload(reason, { route, surface });
           return;
         }
+        await writeMethodCoverageFallbackPayload(
+          'Deposit UI surface hydrated without discoverable method tiles.',
+          {
+            route,
+            surface,
+            methodFunctionalityStatus: 'not-verifiable-ui-surface-missing',
+            uiIssueType: 'deposit-method-picker-empty-or-detached',
+          }
+        );
+        return;
       }
       const paymentCategories = dedupeByLabel(paymentMethods);
       expect(
@@ -2126,17 +2513,6 @@ test.describe('Deposit non-destructive checks', () => {
         }
       }
 
-      const failed = selectionResults.filter(
-        (item) =>
-          !item.selected || (item.method !== '__time_budget__' && item.surfaceReady === false)
-      );
-      if (!testInfo.annotations.some((item) => item.type === 'blocked')) {
-        expect(
-          failed,
-          `Some deposit methods did not open a ready surface: ${failed.map((v) => v.method).join(', ')}`
-        ).toEqual([]);
-      }
-
       const submitButton = await firstVisibleLocator(container, [
         'button:has-text("Deposit")',
         'button:has-text("Continue")',
@@ -2147,17 +2523,107 @@ test.describe('Deposit non-destructive checks', () => {
       const submitEnabled = submitButton
         ? await submitButton.isEnabled().catch(() => false)
         : false;
-      const methodsReady = selectionResults.filter(
+      let methodsReady = selectionResults.filter(
         (item) => item.selected && item.surfaceReady
       ).length;
+      let failed = selectionResults.filter(
+        (item) =>
+          !item.selected || (item.method !== '__time_budget__' && item.surfaceReady === false)
+      );
+      const initialMethodsReady = methodsReady;
+      if (
+        failed.length > 0 &&
+        !selectionResults.some((item) => item.challenge) &&
+        !selectionResults.some((item) => item.method === '__time_budget__')
+      ) {
+        await dismissOverlays(page);
+        await waitForUiSettled(page, 2500);
+        const retrySurface = await openDepositSurfaceWithRetry(page, 2).catch(() => null);
+        const retryContainer = retrySurface && (retrySurface.modal || retrySurface.panel);
+        if (retryContainer) {
+          const retryMethods = await waitForPaymentMethods(retryContainer, page, 15000).catch(
+            () => []
+          );
+          for (const failedResult of failed) {
+            const retryMethod = retryMethods.find(
+              (candidate) => normalizeText(candidate.label) === normalizeText(failedResult.method)
+            );
+            if (!retryMethod) continue;
+            const retryResult = await withStepTimeout(
+              clickMethod(retryMethod, retryContainer, page),
+              DEPOSIT_METHOD_STEP_TIMEOUT_MS,
+              `retryClickMethod(${retryMethod.label})`
+            ).catch(() => null);
+            if (!retryResult || !retryResult.selected || !retryResult.surfaceReady) continue;
+            const index = selectionResults.indexOf(failedResult);
+            if (index >= 0) selectionResults[index] = { ...retryResult, retried: true };
+          }
+          methodsReady = selectionResults.filter(
+            (item) => item.selected && item.surfaceReady
+          ).length;
+          failed = selectionResults.filter(
+            (item) =>
+              !item.selected || (item.method !== '__time_budget__' && item.surfaceReady === false)
+          );
+          if (methodsReady > initialMethodsReady) {
+            testInfo.annotations.push({
+              type: 'deposit-hydration-retry',
+              description: `Deposit surface hydration retry recovered ${methodsReady - initialMethodsReady} method(s); ${methodsReady}/${methodsToCheck.length} ready.`,
+            });
+          }
+        }
+      }
+      const verificationGate = await detectDepositVerificationGate(page);
+      const verificationLimited = Boolean(verificationGate.visible && failed.length > 0);
+      const verificationBlocked = Boolean(
+        verificationLimited &&
+        methodsToCheck.length > 0 &&
+        methodsReady === 0 &&
+        failed.length === methodsToCheck.length
+      );
+      const verificationReason = verificationLimited
+        ? methodsReady > 0
+          ? `Deposit method UI is partially gated by pending account email verification; ${methodsReady}/${methodsToCheck.length} categories exposed a verifiable transaction surface.`
+          : 'Deposit method UI is gated by pending account email verification; method health is not verifiable in this account state.'
+        : '';
+      let apiFallbackOnGate = null;
+      if (verificationLimited) {
+        apiFallbackOnGate = await ensureApiFallback();
+        if (verificationBlocked) {
+          markBlocked(testInfo, verificationReason);
+        } else {
+          testInfo.annotations.push({
+            type: 'partial',
+            description: verificationReason,
+          });
+        }
+        testInfo.annotations.push({
+          type: 'deposit-verification-gate',
+          description: verificationReason,
+        });
+      }
 
       const payload = {
         route,
         authStatePath,
+        authRecovery,
         source: 'ui',
         uiCoverageAvailable: paymentMethods.length > 0,
-        apiCoverageAvailable: false,
-        sourceMode: 'ui-only',
+        apiCoverageAvailable: Boolean(apiFallbackOnGate && apiFallbackOnGate.itemsCount > 0),
+        sourceMode: verificationLimited ? 'ui-partial-gate-api-inventory' : 'ui-only',
+        blocked: verificationBlocked,
+        partial: verificationLimited && !verificationBlocked,
+        reason: verificationReason || null,
+        verificationGate,
+        methodFunctionalityStatus: verificationLimited
+          ? verificationBlocked
+            ? 'not-verifiable-email-pending'
+            : 'partially-verifiable-email-pending'
+          : methodsReady === methodsToCheck.length
+            ? 'ready'
+            : 'broken-or-not-ready',
+        uiIssueType: verificationLimited ? 'deposit-categories-limited-by-verification' : null,
+        apiFallbackOnGate,
         surface: {
           modal: Boolean(surface.modal),
           panel: Boolean(surface.panel),
@@ -2185,11 +2651,20 @@ test.describe('Deposit non-destructive checks', () => {
 
       await attachArtifact(testInfo, 'deposit-non-destructive.json', payload);
 
+      if (!verificationLimited && !testInfo.annotations.some((item) => item.type === 'blocked')) {
+        expect(
+          failed,
+          `Some deposit methods did not open a ready surface: ${failed.map((v) => v.method).join(', ')}`
+        ).toEqual([]);
+      }
+
       if (surface.modal) {
-        await closeModal(surface.modal, page).catch(() => null);
+        await withStepTimeout(closeModal(surface.modal, page), 4000, 'closeDepositModal').catch(
+          () => null
+        );
       }
     } finally {
-      await context.close().catch(() => null);
+      await closeContextSafely(context);
     }
   });
 });

@@ -1,4 +1,4 @@
-const { test, expect } = require('@playwright/test');
+const { test, expect } = require('../fixtures/qa-test');
 const fs = require('fs');
 const path = require('path');
 const {
@@ -25,6 +25,7 @@ const CURRENT_RUN_PLAYER_PATH = path.join(
 const VOLATILE_PLAYER_PATH = path.join(PROJECT_TEST_RESULTS_DIR, 'registration-data.json');
 const MANUAL_READY_PLAYER_PATH = path.join(PROJECT_ARTIFACTS_DIR, 'last-manual-login-player.json');
 const AUTH_STATE_OUTPUT_PATHS = [
+  path.join(PROJECT_ARTIFACTS_DIR, 'registration-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'profile-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'site-coverage-auth-state.json'),
   path.join(PROJECT_ARTIFACTS_DIR, 'button-sweep-auth-state.json'),

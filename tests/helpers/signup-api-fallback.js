@@ -576,6 +576,7 @@ function isSignupTurnstileBlockedError(error) {
   return (
     message.includes('signup turnstile token not issued') ||
     message.includes('signup captcha gate') ||
+    message.includes('signup form not actionable') ||
     (message.includes('cloudflare challenge detected') && message.includes('signup'))
   );
 }
