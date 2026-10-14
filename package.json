@@ -291,7 +291,7 @@
     "eslint": "^10.11.0",
     "eslint-plugin-playwright": "^2.12.0",
     "husky": "^9.1.7",
-    "knip": "^6.37.0",
+    "knip": "^6.41.0",
     "languagedetect": "^2.0.0",
     "lint-staged": "^17.5.1",
     "mailslurp-client": "^17.4.0",
