@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
 
       - name: Audit GitHub Actions
-        uses: zizmorcore/zizmor-action@70fb788f84895a7701f5643d103d587e460b5c99 # v0.6.3
+        uses: zizmorcore/zizmor-action@a818f16177a5395fc11d3c73577caabaa7119391 # v0.9.1
         with:
           version: '1.30.0'
           collect: workflows
